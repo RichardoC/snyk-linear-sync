@@ -1,6 +1,9 @@
 package model
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type FindingStatus string
 
@@ -15,6 +18,7 @@ type Finding struct {
 	Fingerprint       string
 	SnykIssueID       string
 	SnykIssueKey      string
+	CreatedAt         time.Time
 	ProjectID         string
 	ProjectName       string
 	ProjectOrigin     string
@@ -55,6 +59,7 @@ type ExistingIssue struct {
 	URL         string
 	Title       string
 	Description string
+	DueDate     string
 	StateID     string
 	StateName   string
 	Fingerprint string
@@ -65,6 +70,7 @@ type DesiredIssue struct {
 	Fingerprint string
 	Title       string
 	Description string
+	DueDate     string
 	State       IssueState
 	Priority    int
 }

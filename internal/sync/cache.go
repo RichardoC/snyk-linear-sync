@@ -8,7 +8,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-03-11-ui-links-source-location-v1"
+const metadataSchemaVersion = "2026-03-11-ui-links-source-location-due-dates-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
@@ -19,6 +19,7 @@ func desiredIssueHash(desired model.DesiredIssue) string {
 		desired.Fingerprint,
 		desired.Title,
 		normalizeDescriptionForCompare(desired.Description),
+		desired.DueDate,
 		string(desired.State),
 		fmt.Sprintf("%d", desired.Priority),
 	)
@@ -29,6 +30,7 @@ func existingIssueHash(existing model.ExistingIssue) string {
 		existing.Fingerprint,
 		existing.Title,
 		normalizeDescriptionForCompare(existing.Description),
+		existing.DueDate,
 		normalizeWorkflowStateName(existing.StateName),
 		fmt.Sprintf("%d", existing.Priority),
 	)
@@ -61,6 +63,7 @@ func nextLinearHashes(desiredByFingerprint map[string]model.DesiredIssue, existi
 			Fingerprint: existing.Fingerprint,
 			Title:       existing.Title,
 			Description: existing.Description,
+			DueDate:     existing.DueDate,
 			State:       model.StateDone,
 			Priority:    existing.Priority,
 		}

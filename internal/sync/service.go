@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -137,7 +138,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	snykHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
-		desired := desiredIssue(finding)
+		desired := desiredIssue(s.cfg.Linear.Due, finding)
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 	}
@@ -224,6 +225,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				Fingerprint: existing.Fingerprint,
 				Title:       existing.Title,
 				Description: existing.Description,
+				DueDate:     existing.DueDate,
 				State:       model.StateDone,
 				Priority:    existing.Priority,
 			}
@@ -385,11 +387,12 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 	}
 }
 
-func desiredIssue(finding model.Finding) model.DesiredIssue {
+func desiredIssue(dueCfg config.DueDateConfig, finding model.Finding) model.DesiredIssue {
 	return model.DesiredIssue{
 		Fingerprint: finding.Fingerprint,
 		Title:       issueTitle(finding),
 		Description: issueDescription(finding),
+		DueDate:     issueDueDate(dueCfg, finding),
 		State:       issueState(finding.Status),
 		Priority:    issuePriority(finding.Severity),
 	}
@@ -502,11 +505,39 @@ func issuePriority(severity string) int {
 	}
 }
 
+func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
+	if finding.CreatedAt.IsZero() {
+		return ""
+	}
+
+	createdAtUTC := finding.CreatedAt.UTC()
+	createdDate := time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
+
+	var days int
+	switch issuePriority(finding.Severity) {
+	case 1:
+		days = dueCfg.CriticalDays
+	case 2:
+		days = dueCfg.HighDays
+	case 3:
+		days = dueCfg.MediumDays
+	case 4:
+		days = dueCfg.LowDays
+	default:
+		return ""
+	}
+
+	return createdDate.AddDate(0, 0, days).Format(time.DateOnly)
+}
+
 func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {
 	if existing.Title != desired.Title {
 		return true
 	}
 	if normalizeDescriptionForCompare(existing.Description) != normalizeDescriptionForCompare(desired.Description) {
+		return true
+	}
+	if desired.DueDate != "" && existing.DueDate != desired.DueDate {
 		return true
 	}
 	if normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State)) {

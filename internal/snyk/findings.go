@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 
@@ -174,10 +175,15 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 			project := projectDetails[projectID]
 			issueKey := coalesce(issue.Attributes.Key, firstProblemID(issue.Attributes.Problems), issue.ID)
 			source := sourceLocation(issue.Attributes.Coordinates)
+			createdAt, err := parseIssueCreatedAt(issue.Attributes.CreatedAt)
+			if err != nil {
+				return nil, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
+			}
 			finding := model.Finding{
 				Fingerprint:       model.Fingerprint(projectID, issue.ID),
 				SnykIssueID:       issue.ID,
 				SnykIssueKey:      issueKey,
+				CreatedAt:         createdAt,
 				ProjectID:         projectID,
 				ProjectName:       project.Name,
 				ProjectOrigin:     project.Origin,
@@ -336,6 +342,18 @@ func extractCursor(raw string) (string, error) {
 		return "", fmt.Errorf("parse pagination link %q: %w", raw, err)
 	}
 	return parsed.Query().Get("starting_after"), nil
+}
+
+func parseIssueCreatedAt(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("missing created_at")
+	}
+	createdAt, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return createdAt, nil
 }
 
 func mapStatus(issue issueAttributes) model.FindingStatus {

@@ -18,6 +18,7 @@ github.com/RichardoC/snyk-linear-sync
 - Updates existing Linear issues when managed fields change.
 - Moves stale issues to the configured resolved state when the finding is no longer present.
 - Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
+- Sets Linear due dates from Snyk issue creation time using configurable per-severity offsets.
 
 The fingerprint format is:
 
@@ -116,6 +117,7 @@ Each managed issue contains:
 - project and issue identifiers
 - package/version details when available
 - repository and source-location details when available
+- due date calculated from Snyk issue creation time and severity
 - hidden metadata block
 - human-readable `Fingerprint:` line
 
@@ -138,6 +140,13 @@ Changing or removing that block can cause duplicate issues or prevent updates fr
 - ignored -> `Cancelled`
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
+
+Default due date offsets:
+
+- critical -> 15 days after Snyk `created_at`
+- high -> 30 days after Snyk `created_at`
+- medium -> 45 days after Snyk `created_at`
+- low -> 90 days after Snyk `created_at`
 
 ## Cache Behavior
 
@@ -176,6 +185,10 @@ Optional:
 - `LINEAR_STATE_BACKLOG`
 - `LINEAR_STATE_DONE`
 - `LINEAR_STATE_CANCELLED`
+- `LINEAR_DUE_DAYS_CRITICAL`
+- `LINEAR_DUE_DAYS_HIGH`
+- `LINEAR_DUE_DAYS_MEDIUM`
+- `LINEAR_DUE_DAYS_LOW`
 - `SYNC_WORKERS`
 - `SNYK_HTTP_CONCURRENCY`
 - `LINEAR_HTTP_CONCURRENCY`

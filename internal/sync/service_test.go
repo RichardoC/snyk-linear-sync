@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/RichardoC/snyk-linear-sync/internal/cache"
 	"github.com/RichardoC/snyk-linear-sync/internal/config"
@@ -57,6 +58,14 @@ func (f *fakeCache) Save(_ context.Context, snapshot cache.Snapshot) error {
 
 func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
 		Sync: config.SyncConfig{
 			Workers: 1,
 		},
@@ -75,6 +84,7 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 				Severity:    "high",
 				Status:      model.FindingOpen,
 				IssueURL:    "https://example.test/issue-1",
+				CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
 			},
 			{
 				Fingerprint: "snyk:project-b:issue-2",
@@ -85,6 +95,7 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 				Severity:    "low",
 				Status:      model.FindingIgnored,
 				IssueURL:    "https://example.test/issue-2",
+				CreatedAt:   time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC),
 			},
 		},
 	}
@@ -131,11 +142,22 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 	if len(linear.updated) != 2 {
 		t.Fatalf("updated = %d, want 2", len(linear.updated))
 	}
+	if linear.created[0].DueDate != "2026-04-01" {
+		t.Fatalf("created due date = %q, want %q", linear.created[0].DueDate, "2026-04-01")
+	}
 }
 
 func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 	cfg := config.Config{
 		Cache: config.CacheConfig{},
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
 		Sync: config.SyncConfig{
 			Workers: 1,
 		},
@@ -156,15 +178,17 @@ func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 				Status:       model.FindingOpen,
 				IssueURL:     "https://app.snyk.io/org/example/project/project-a#issue-SNYK-ISSUE-1",
 				IssueAPIURL:  "https://api.snyk.io/rest/orgs/example/issues/issue-1?version=2024-10-15",
+				CreatedAt:    time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
 			},
 		},
 	}
-	desired := desiredIssue(snyk.findings[0])
+	desired := desiredIssue(cfg.Linear.Due, snyk.findings[0])
 	existing := model.ExistingIssue{
 		ID:          "existing-1",
 		Identifier:  "SEC-1",
 		Title:       desired.Title,
 		Description: desired.Description,
+		DueDate:     desired.DueDate,
 		StateName:   "Todo",
 		Fingerprint: desired.Fingerprint,
 		Priority:    desired.Priority,
@@ -203,17 +227,63 @@ func TestNeedsUpdateUsesCaseInsensitiveLabels(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:       "title",
 		Description: "description",
+		DueDate:     "2026-04-01",
 		StateName:   "Todo",
 		Priority:    2,
 	}
 	desired := model.DesiredIssue{
 		Title:       "title",
 		Description: "description",
+		DueDate:     "2026-04-01",
 		State:       model.StateTodo,
 		Priority:    2,
 	}
 
 	if needsUpdate(existing, desired) {
 		t.Fatal("needsUpdate() = true, want false")
+	}
+}
+
+func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
+	dueCfg := config.DueDateConfig{
+		CriticalDays: 15,
+		HighDays:     30,
+		MediumDays:   45,
+		LowDays:      90,
+	}
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectName: "Project A",
+		Severity:    "critical",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 11, 23, 30, 0, 0, time.FixedZone("minus0500", -5*60*60)),
+	}
+
+	desired := desiredIssue(dueCfg, finding)
+
+	if desired.DueDate != "2026-03-27" {
+		t.Fatalf("desired due date = %q, want %q", desired.DueDate, "2026-03-27")
+	}
+}
+
+func TestNeedsUpdateIncludesDueDate(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-04-01",
+		StateName:   "Todo",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-04-15",
+		State:       model.StateTodo,
+		Priority:    2,
+	}
+
+	if !needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = false, want true")
 	}
 }

@@ -24,6 +24,18 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if cfg.Linear.States.Todo != defaultLinearTodoState {
 		t.Fatalf("Todo state = %q, want %q", cfg.Linear.States.Todo, defaultLinearTodoState)
 	}
+	if cfg.Linear.Due.CriticalDays != defaultCriticalDueDays {
+		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, defaultCriticalDueDays)
+	}
+	if cfg.Linear.Due.HighDays != defaultHighDueDays {
+		t.Fatalf("High due days = %d, want %d", cfg.Linear.Due.HighDays, defaultHighDueDays)
+	}
+	if cfg.Linear.Due.MediumDays != defaultMediumDueDays {
+		t.Fatalf("Medium due days = %d, want %d", cfg.Linear.Due.MediumDays, defaultMediumDueDays)
+	}
+	if cfg.Linear.Due.LowDays != defaultLowDueDays {
+		t.Fatalf("Low due days = %d, want %d", cfg.Linear.Due.LowDays, defaultLowDueDays)
+	}
 	if cfg.Sync.Workers != defaultWorkerCount {
 		t.Fatalf("Workers = %d, want %d", cfg.Sync.Workers, defaultWorkerCount)
 	}
@@ -72,6 +84,7 @@ func TestLoadEnvFile(t *testing.T) {
 		"SNYK_ORG_ID=org-id # comment\n" +
 		"LINEAR_API_KEY=linear-key\n" +
 		"LINEAR_TEAM_ID=team-id\n" +
+		"LINEAR_DUE_DAYS_CRITICAL=20\n" +
 		"SNYK_OAUTH_SCOPES='scope-a, scope-b'\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
@@ -93,6 +106,9 @@ func TestLoadEnvFile(t *testing.T) {
 	}
 	if cfg.Linear.TeamID != "team-id" {
 		t.Fatalf("TeamID = %q, want %q", cfg.Linear.TeamID, "team-id")
+	}
+	if cfg.Linear.Due.CriticalDays != 20 {
+		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, 20)
 	}
 	if len(cfg.Snyk.Scopes) != 2 || cfg.Snyk.Scopes[0] != "scope-a" || cfg.Snyk.Scopes[1] != "scope-b" {
 		t.Fatalf("Scopes = %#v, want [scope-a scope-b]", cfg.Snyk.Scopes)

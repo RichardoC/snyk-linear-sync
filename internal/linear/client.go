@@ -113,6 +113,7 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 			TeamId:      c.teamID(),
 			StateId:     &stateID,
 			Priority:    &priority,
+			DueDate:     timelessDatePtr(issue.DueDate),
 		}
 		op.Var(fmt.Sprintf("input%d", i), input)
 	}
@@ -157,6 +158,7 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 			Description: &description,
 			StateId:     &stateID,
 			Priority:    &priority,
+			DueDate:     timelessDatePtr(update.Desired.DueDate),
 		}
 		op.Var(fmt.Sprintf("id%d", i), update.Existing.ID)
 		op.Var(fmt.Sprintf("input%d", i), input)
@@ -280,6 +282,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
       description
       url
       priority
+      dueDate
       state {
         id
         name
@@ -303,6 +306,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 					Description *string `json:"description"`
 					URL         string  `json:"url"`
 					Priority    int     `json:"priority"`
+					DueDate     *string `json:"dueDate"`
 					State       struct {
 						ID   string `json:"id"`
 						Name string `json:"name"`
@@ -329,6 +333,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 				StateName:   issue.State.Name,
 				Description: description,
 				Priority:    issue.Priority,
+				DueDate:     deref(issue.DueDate),
 				Fingerprint: extractFingerprint(description),
 			}
 			issues = append(issues, existing)
@@ -433,6 +438,14 @@ func deref(value *string) string {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func timelessDatePtr(value string) *linearapi.TimelessDate {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	date := linearapi.TimelessDate(value)
+	return &date
 }
 
 func isLikelyUUID(value string) bool {

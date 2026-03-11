@@ -33,7 +33,7 @@ It is not responsible for:
 
 - writing back to Snyk
 - preserving arbitrary manual edits inside the managed section of the Linear description
-- syncing labels, comments, or custom fields beyond the currently managed issue body, title, priority, and workflow state
+- syncing labels, comments, or custom fields beyond the currently managed issue body, title, priority, due date, and workflow state
 
 ## Identity Model
 
@@ -62,6 +62,7 @@ Update the Linear issue when managed fields differ:
 
 - title
 - description
+- due date
 - priority
 - mapped state
 
@@ -104,6 +105,14 @@ The current workflow mapping is:
 - `ignored` -> `Cancelled`
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
+
+Due dates are derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear.
+Default offsets are:
+
+- critical: 15 days
+- high: 30 days
+- medium: 45 days
+- low: 90 days
 
 ## Performance Model
 

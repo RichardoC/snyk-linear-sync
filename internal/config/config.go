@@ -17,6 +17,10 @@ const (
 	defaultLinearBacklogState   = "Backlog"
 	defaultLinearDoneState      = "Done"
 	defaultLinearCancelledState = "Cancelled"
+	defaultCriticalDueDays      = 15
+	defaultHighDueDays          = 30
+	defaultMediumDueDays        = 45
+	defaultLowDueDays           = 90
 	defaultWorkerCount          = 16
 	defaultSnykConcurrency      = 6
 	defaultLinearConcurrency    = 8
@@ -55,6 +59,7 @@ type LinearConfig struct {
 	APIKey string
 	TeamID string
 	States StateConfig
+	Due    DueDateConfig
 }
 
 type StateConfig struct {
@@ -62,6 +67,13 @@ type StateConfig struct {
 	Backlog   string
 	Done      string
 	Cancelled string
+}
+
+type DueDateConfig struct {
+	CriticalDays int
+	HighDays     int
+	MediumDays   int
+	LowDays      int
 }
 
 type SyncConfig struct {
@@ -113,6 +125,12 @@ func Load(args []string) (Config, error) {
 				Done:      getEnv("LINEAR_STATE_DONE", defaultLinearDoneState),
 				Cancelled: getEnv("LINEAR_STATE_CANCELLED", defaultLinearCancelledState),
 			},
+			Due: DueDateConfig{
+				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
+				HighDays:     getEnvInt("LINEAR_DUE_DAYS_HIGH", defaultHighDueDays),
+				MediumDays:   getEnvInt("LINEAR_DUE_DAYS_MEDIUM", defaultMediumDueDays),
+				LowDays:      getEnvInt("LINEAR_DUE_DAYS_LOW", defaultLowDueDays),
+			},
 		},
 		Sync: SyncConfig{
 			Workers:           getEnvInt("SYNC_WORKERS", defaultWorkerCount),
@@ -160,6 +178,18 @@ func (c Config) Validate() error {
 	}
 	if c.Sync.LinearConcurrency <= 0 {
 		errs = append(errs, fmt.Errorf("LINEAR_HTTP_CONCURRENCY must be > 0, got %d", c.Sync.LinearConcurrency))
+	}
+	if c.Linear.Due.CriticalDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_DUE_DAYS_CRITICAL must be > 0, got %d", c.Linear.Due.CriticalDays))
+	}
+	if c.Linear.Due.HighDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_DUE_DAYS_HIGH must be > 0, got %d", c.Linear.Due.HighDays))
+	}
+	if c.Linear.Due.MediumDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_DUE_DAYS_MEDIUM must be > 0, got %d", c.Linear.Due.MediumDays))
+	}
+	if c.Linear.Due.LowDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_DUE_DAYS_LOW must be > 0, got %d", c.Linear.Due.LowDays))
 	}
 
 	if len(errs) > 0 {
