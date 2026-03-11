@@ -1,0 +1,208 @@
+package config
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/joho/godotenv"
+)
+
+const (
+	defaultSnykRegion           = "SNYK-US-01"
+	defaultLinearTodoState      = "Todo"
+	defaultLinearBacklogState   = "Backlog"
+	defaultLinearDoneState      = "Done"
+	defaultLinearCancelledState = "Cancelled"
+	defaultWorkerCount          = 16
+	defaultSnykConcurrency      = 6
+	defaultLinearConcurrency    = 8
+	defaultErrorLogFile         = "logs/snyk-linear-sync-errors.log"
+	defaultCacheDBFile          = "data/snyk-linear-sync-cache.db"
+)
+
+type Config struct {
+	DryRun bool
+
+	Log    LogConfig
+	Cache  CacheConfig
+	Snyk   SnykConfig
+	Linear LinearConfig
+	Sync   SyncConfig
+}
+
+type LogConfig struct {
+	ErrorFile string
+}
+
+type CacheConfig struct {
+	DBFile      string
+	BypassCache bool
+}
+
+type SnykConfig struct {
+	Region       string
+	ClientID     string
+	ClientSecret string
+	OrgID        string
+	Scopes       []string
+}
+
+type LinearConfig struct {
+	APIKey string
+	TeamID string
+	States StateConfig
+}
+
+type StateConfig struct {
+	Todo      string
+	Backlog   string
+	Done      string
+	Cancelled string
+}
+
+type SyncConfig struct {
+	Workers           int
+	SnykConcurrency   int
+	LinearConcurrency int
+}
+
+func Load(args []string) (Config, error) {
+	fs := flag.NewFlagSet("snyk-linear-sync", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
+	bypassCache := fs.Bool("bypass-cache", false, "ignore the SQLite sync cache and fetch/compare everything directly")
+	envFile := fs.String("env-file", "", "load configuration from a dotenv-style file before reading the process environment")
+
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	if strings.TrimSpace(*envFile) != "" {
+		path := strings.TrimSpace(*envFile)
+		if err := godotenv.Overload(path); err != nil {
+			return Config{}, fmt.Errorf("load env file %q: %w", path, err)
+		}
+	}
+
+	cfg := Config{
+		DryRun: *dryRun,
+		Log: LogConfig{
+			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
+		},
+		Cache: CacheConfig{
+			DBFile:      getEnv("CACHE_DB_FILE", defaultCacheDBFile),
+			BypassCache: *bypassCache,
+		},
+		Snyk: SnykConfig{
+			Region:       getEnv("SNYK_REGION", defaultSnykRegion),
+			ClientID:     os.Getenv("SNYK_CLIENT_ID"),
+			ClientSecret: os.Getenv("SNYK_CLIENT_SECRET"),
+			OrgID:        os.Getenv("SNYK_ORG_ID"),
+			Scopes:       splitCSV(os.Getenv("SNYK_OAUTH_SCOPES")),
+		},
+		Linear: LinearConfig{
+			APIKey: os.Getenv("LINEAR_API_KEY"),
+			TeamID: os.Getenv("LINEAR_TEAM_ID"),
+			States: StateConfig{
+				Todo:      getEnv("LINEAR_STATE_TODO", defaultLinearTodoState),
+				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
+				Done:      getEnv("LINEAR_STATE_DONE", defaultLinearDoneState),
+				Cancelled: getEnv("LINEAR_STATE_CANCELLED", defaultLinearCancelledState),
+			},
+		},
+		Sync: SyncConfig{
+			Workers:           getEnvInt("SYNC_WORKERS", defaultWorkerCount),
+			SnykConcurrency:   getEnvInt("SNYK_HTTP_CONCURRENCY", defaultSnykConcurrency),
+			LinearConcurrency: getEnvInt("LINEAR_HTTP_CONCURRENCY", defaultLinearConcurrency),
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+
+	return cfg, nil
+}
+
+func (c Config) Validate() error {
+	var errs []error
+
+	if c.Snyk.ClientID == "" {
+		errs = append(errs, errors.New("SNYK_CLIENT_ID is required"))
+	}
+	if c.Snyk.ClientSecret == "" {
+		errs = append(errs, errors.New("SNYK_CLIENT_SECRET is required"))
+	}
+	if c.Snyk.OrgID == "" {
+		errs = append(errs, errors.New("SNYK_ORG_ID is required"))
+	}
+	if c.Linear.APIKey == "" {
+		errs = append(errs, errors.New("LINEAR_API_KEY is required"))
+	}
+	if c.Linear.TeamID == "" {
+		errs = append(errs, errors.New("LINEAR_TEAM_ID is required"))
+	}
+	if strings.TrimSpace(c.Log.ErrorFile) == "" {
+		errs = append(errs, errors.New("ERROR_LOG_FILE must not be empty"))
+	}
+	if strings.TrimSpace(c.Cache.DBFile) == "" {
+		errs = append(errs, errors.New("CACHE_DB_FILE must not be empty"))
+	}
+	if c.Sync.Workers <= 0 {
+		errs = append(errs, fmt.Errorf("SYNC_WORKERS must be > 0, got %d", c.Sync.Workers))
+	}
+	if c.Sync.SnykConcurrency <= 0 {
+		errs = append(errs, fmt.Errorf("SNYK_HTTP_CONCURRENCY must be > 0, got %d", c.Sync.SnykConcurrency))
+	}
+	if c.Sync.LinearConcurrency <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_HTTP_CONCURRENCY must be > 0, got %d", c.Sync.LinearConcurrency))
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
+func getEnv(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+
+	return n
+}
+
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+
+	return out
+}

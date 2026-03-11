@@ -1,0 +1,100 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestLoadDefaultsAndValidation(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Snyk.Region != defaultSnykRegion {
+		t.Fatalf("Region = %q, want %q", cfg.Snyk.Region, defaultSnykRegion)
+	}
+	if cfg.Linear.States.Todo != defaultLinearTodoState {
+		t.Fatalf("Todo state = %q, want %q", cfg.Linear.States.Todo, defaultLinearTodoState)
+	}
+	if cfg.Sync.Workers != defaultWorkerCount {
+		t.Fatalf("Workers = %d, want %d", cfg.Sync.Workers, defaultWorkerCount)
+	}
+	if cfg.Cache.DBFile != defaultCacheDBFile {
+		t.Fatalf("Cache DB file = %q, want %q", cfg.Cache.DBFile, defaultCacheDBFile)
+	}
+	if cfg.Cache.BypassCache {
+		t.Fatal("BypassCache = true, want false")
+	}
+}
+
+func TestLoadRequiresCredentials(t *testing.T) {
+	for _, key := range []string{
+		"SNYK_CLIENT_ID",
+		"SNYK_CLIENT_SECRET",
+		"SNYK_ORG_ID",
+		"LINEAR_API_KEY",
+		"LINEAR_TEAM_ID",
+	} {
+		t.Setenv(key, "")
+	}
+
+	if _, err := Load(nil); err == nil {
+		t.Fatal("Load() error = nil, want validation error")
+	}
+}
+
+func TestSplitCSV(t *testing.T) {
+	got := splitCSV("  a, b ,,c ")
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("splitCSV() len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitCSV()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLoadEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := "export SNYK_CLIENT_ID='client-id'\n" +
+		"SNYK_CLIENT_SECRET=\"client-secret\"\n" +
+		"SNYK_ORG_ID=org-id # comment\n" +
+		"LINEAR_API_KEY=linear-key\n" +
+		"LINEAR_TEAM_ID=team-id\n" +
+		"SNYK_OAUTH_SCOPES='scope-a, scope-b'\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := Load([]string{"--env-file", path})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Snyk.ClientID != "client-id" {
+		t.Fatalf("ClientID = %q, want %q", cfg.Snyk.ClientID, "client-id")
+	}
+	if cfg.Snyk.ClientSecret != "client-secret" {
+		t.Fatalf("ClientSecret = %q, want %q", cfg.Snyk.ClientSecret, "client-secret")
+	}
+	if cfg.Linear.APIKey != "linear-key" {
+		t.Fatalf("APIKey = %q, want %q", cfg.Linear.APIKey, "linear-key")
+	}
+	if cfg.Linear.TeamID != "team-id" {
+		t.Fatalf("TeamID = %q, want %q", cfg.Linear.TeamID, "team-id")
+	}
+	if len(cfg.Snyk.Scopes) != 2 || cfg.Snyk.Scopes[0] != "scope-a" || cfg.Snyk.Scopes[1] != "scope-b" {
+		t.Fatalf("Scopes = %#v, want [scope-a scope-b]", cfg.Snyk.Scopes)
+	}
+}
