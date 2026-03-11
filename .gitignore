@@ -13,4 +13,4 @@ logs/
 data/
 
 # binary
-snyk-linear-sync
+/snyk-linear-sync
