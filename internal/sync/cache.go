@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/addt/snyk-linear-sync/internal/model"
+	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
 const metadataSchemaVersion = "2026-03-11-ui-links-source-location-v1"

@@ -4,6 +4,12 @@
 
 This project exists to keep Linear aligned with Snyk.
 
+Canonical module path:
+
+```text
+github.com/RichardoC/snyk-linear-sync
+```
+
 The intended outcome is:
 
 - every relevant Snyk finding has a corresponding Linear issue

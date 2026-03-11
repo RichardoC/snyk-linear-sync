@@ -9,7 +9,7 @@ import (
 
 	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 
-	"github.com/addt/snyk-linear-sync/internal/model"
+	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
 type projectRef struct {

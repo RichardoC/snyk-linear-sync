@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/addt/snyk-linear-sync/internal/cache"
-	"github.com/addt/snyk-linear-sync/internal/config"
-	"github.com/addt/snyk-linear-sync/internal/model"
+	"github.com/RichardoC/snyk-linear-sync/internal/cache"
+	"github.com/RichardoC/snyk-linear-sync/internal/config"
+	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
 type fakeSnyk struct {

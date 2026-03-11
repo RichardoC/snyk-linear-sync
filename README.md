@@ -2,6 +2,12 @@
 
 Sync Snyk findings into Linear issues.
 
+Repo:
+
+```text
+github.com/RichardoC/snyk-linear-sync
+```
+
 ## What It Does
 
 - Authenticates to Snyk with OAuth client credentials.
@@ -21,6 +27,21 @@ snyk:<project-id>:<issue-id>
 
 ## Running
 
+Quickstart without cloning:
+
+Create a local `.env`, then run directly from the repo path:
+
+```bash
+go run github.com/RichardoC/snyk-linear-sync/cmd/snyk-linear-sync@latest --env-file .env --dry-run
+```
+
+Or install the binary:
+
+```bash
+go install github.com/RichardoC/snyk-linear-sync/cmd/snyk-linear-sync@latest
+snyk-linear-sync --env-file .env --dry-run
+```
+
 Default usage is to pass a dotenv file explicitly:
 
 ```bash
@@ -39,6 +60,12 @@ Normal run:
 
 ```bash
 go run ./cmd/snyk-linear-sync --env-file .env
+```
+
+Installed binary:
+
+```bash
+snyk-linear-sync --env-file .env
 ```
 
 Bypass cache:
