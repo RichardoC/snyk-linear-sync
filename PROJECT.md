@@ -94,6 +94,7 @@ It includes:
 - repository details
 - source file and region details for code findings
 - GitHub source file and commit links when `SOURCE_PROVIDER=github`
+- GitHub project target file links when `SOURCE_PROVIDER=github` and no precise source location is available
 - metadata block
 - human-readable fingerprint line
 
@@ -109,6 +110,7 @@ Linear may rewrite parts of the description body when rendering or storing markd
 - `github` renders public GitHub links for:
   - source files, pinned to the reported commit
   - source commits
+  - project target files, pinned to the reported branch/reference when no source commit/file is available
 
 If repository, file, or commit data is missing, the sync falls back to plain text.
 

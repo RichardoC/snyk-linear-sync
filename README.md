@@ -122,6 +122,7 @@ Each managed issue contains:
 - package/version details when available
 - repository and source-location details when available
 - GitHub source file and commit links when `SOURCE_PROVIDER=github` and the finding includes repository, file, and commit data
+- GitHub project target file links when `SOURCE_PROVIDER=github` and Snyk provides repository, branch/reference, and target file data but not a precise source location
 - due date calculated from Snyk issue creation time and severity
 - hidden metadata block
 - human-readable `Fingerprint:` line
@@ -146,6 +147,7 @@ Use `SOURCE_PROVIDER` to control source-link rendering:
 - `github` renders source file and commit links to public GitHub
 
 For `github`, the file link is commit-pinned and includes line anchors when Snyk provides line numbers.
+If Snyk does not provide a source file/commit but does provide `Repository + Project reference + Project target file`, the sync links the project target file in GitHub without line anchors.
 
 ## Managed Label
 

@@ -452,6 +452,9 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 
 	desired := desiredIssue(cfg, finding)
 
+	if !strings.Contains(desired.Description, "Repository: [owner/repo](https://github.com/owner/repo)") {
+		t.Fatalf("description missing GitHub repository link: %s", desired.Description)
+	}
 	if !strings.Contains(desired.Description, "[src/main.go (line 10:2 to 12:8)](https://github.com/owner/repo/blob/abc123/src/main.go#L10-L12)") {
 		t.Fatalf("description missing GitHub source file link: %s", desired.Description)
 	}
@@ -460,6 +463,33 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 	}
 	if !strings.Contains(desired.Description, "managed_label: snyk-automation") {
 		t.Fatalf("description missing managed label metadata: %s", desired.Description)
+	}
+}
+
+func TestDesiredIssueAddsGitHubProjectTargetFileLinkWhenNoSourceLocationExists(t *testing.T) {
+	cfg := config.Config{
+		Source: config.SourceConfig{
+			Provider: "github",
+		},
+	}
+	finding := model.Finding{
+		Fingerprint:       "snyk:project-a:issue-1",
+		SnykIssueID:       "issue-1",
+		ProjectID:         "project-a",
+		ProjectName:       "Project A",
+		IssueTitle:        "Open issue",
+		Severity:          "high",
+		Status:            model.FindingOpen,
+		IssueAPIURL:       "https://api.example.test/issue-1",
+		Repository:        "owner/repo",
+		ProjectReference:  "main",
+		ProjectTargetFile: "apps/backend/Dockerfile.dev",
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if !strings.Contains(desired.Description, "Project target file: [apps/backend/Dockerfile.dev](https://github.com/owner/repo/blob/main/apps/backend/Dockerfile.dev)") {
+		t.Fatalf("description missing GitHub project target file link: %s", desired.Description)
 	}
 }
 
@@ -501,6 +531,27 @@ func TestNeedsUpdateIncludesDueDate(t *testing.T) {
 		Title:       "title",
 		Description: "description",
 		DueDate:     "2026-04-15",
+		State:       model.StateTodo,
+		Priority:    2,
+	}
+
+	if !needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = false, want true")
+	}
+}
+
+func TestNeedsUpdateDetectsLinkOnlyDescriptionChange(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "Repository: owner/repo",
+		DueDate:     "2026-04-01",
+		StateName:   "Todo",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:       "title",
+		Description: "Repository: [owner/repo](https://github.com/owner/repo)",
+		DueDate:     "2026-04-01",
 		State:       model.StateTodo,
 		Priority:    2,
 	}

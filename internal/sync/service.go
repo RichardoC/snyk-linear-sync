@@ -45,7 +45,7 @@ const (
 	createBatchSize  = 10
 )
 
-var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?[^)\n]+(?:>)?\)`)
+var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?:>)?\)`)
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
@@ -422,6 +422,7 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 
 	sourceFileLabel, sourceFileURL := sourceFileLink(sourceCfg, finding)
 	sourceCommitURL := sourceCommitLink(sourceCfg, finding)
+	repositoryURL := repositoryLink(sourceCfg, finding)
 
 	lines := []string{
 		fmt.Sprintf("Snyk issue: %s", issueURL),
@@ -435,13 +436,14 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 	}
 
 	if finding.Repository != "" {
-		lines = append(lines, fmt.Sprintf("Repository: %s", finding.Repository))
+		if repositoryURL != "" {
+			lines = append(lines, fmt.Sprintf("Repository: [%s](%s)", finding.Repository, repositoryURL))
+		} else {
+			lines = append(lines, fmt.Sprintf("Repository: %s", finding.Repository))
+		}
 	}
 	if finding.ProjectReference != "" {
 		lines = append(lines, fmt.Sprintf("Project reference: %s", finding.ProjectReference))
-	}
-	if finding.ProjectTargetFile != "" {
-		lines = append(lines, fmt.Sprintf("Project target file: %s", finding.ProjectTargetFile))
 	}
 	if finding.ProjectOrigin != "" {
 		lines = append(lines, fmt.Sprintf("Project origin: %s", finding.ProjectOrigin))
@@ -467,6 +469,12 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 			lines = append(lines, fmt.Sprintf("Source file: [%s](%s)", sourceFileLabel, sourceFileURL))
 		} else {
 			lines = append(lines, fmt.Sprintf("Source file: %s", finding.SourceFile))
+		}
+	} else if finding.ProjectTargetFile != "" {
+		if targetFileURL := projectTargetFileLink(sourceCfg, finding); targetFileURL != "" {
+			lines = append(lines, fmt.Sprintf("Project target file: [%s](%s)", finding.ProjectTargetFile, targetFileURL))
+		} else {
+			lines = append(lines, fmt.Sprintf("Project target file: %s", finding.ProjectTargetFile))
 		}
 	}
 	if finding.SourceLineStart > 0 && sourceFileURL == "" {
@@ -613,7 +621,7 @@ func fingerprintProjectID(fingerprint string) (string, bool) {
 
 func normalizeDescriptionForCompare(description string) string {
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
-	description = linearAutoLinkPattern.ReplaceAllString(description, "$1")
+	description = linearAutoLinkPattern.ReplaceAllString(description, "[$1]($2)")
 	description = markdownEscapePattern.ReplaceAllString(description, "$1")
 	description = strings.ReplaceAll(description, "DO NOT EDIT OR REMOVE THIS BLOCK. Used by snyk-linear-sync for deduplication.", "__SNYK_LINEAR_METADATA_WARNING__")
 	description = strings.ReplaceAll(description, "DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.", "__SNYK_LINEAR_METADATA_WARNING__")
@@ -654,6 +662,38 @@ func sourceCommitLink(sourceCfg config.SourceConfig, finding model.Finding) stri
 		Scheme: "https",
 		Host:   "github.com",
 		Path:   fmt.Sprintf("/%s/commit/%s", finding.Repository, finding.SourceCommitID),
+	}
+	return link.String()
+}
+
+func projectTargetFileLink(sourceCfg config.SourceConfig, finding model.Finding) string {
+	if sourceCfg.Provider != "github" {
+		return ""
+	}
+	if strings.TrimSpace(finding.Repository) == "" || strings.TrimSpace(finding.ProjectReference) == "" || strings.TrimSpace(finding.ProjectTargetFile) == "" {
+		return ""
+	}
+
+	link := &url.URL{
+		Scheme: "https",
+		Host:   "github.com",
+		Path:   fmt.Sprintf("/%s/blob/%s/%s", finding.Repository, finding.ProjectReference, finding.ProjectTargetFile),
+	}
+	return link.String()
+}
+
+func repositoryLink(sourceCfg config.SourceConfig, finding model.Finding) string {
+	if sourceCfg.Provider != "github" {
+		return ""
+	}
+	if strings.TrimSpace(finding.Repository) == "" {
+		return ""
+	}
+
+	link := &url.URL{
+		Scheme: "https",
+		Host:   "github.com",
+		Path:   fmt.Sprintf("/%s", finding.Repository),
 	}
 	return link.String()
 }
