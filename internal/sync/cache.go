@@ -8,7 +8,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-03-11-ui-links-source-location-due-dates-v1"
+const metadataSchemaVersion = "2026-03-13-source-provider-managed-label-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
@@ -21,6 +21,7 @@ func desiredIssueHash(desired model.DesiredIssue) string {
 		normalizeDescriptionForCompare(desired.Description),
 		desired.DueDate,
 		string(desired.State),
+		normalizeLabelName(desired.ManagedLabel),
 		fmt.Sprintf("%d", desired.Priority),
 	)
 }
@@ -32,6 +33,8 @@ func existingIssueHash(existing model.ExistingIssue) string {
 		normalizeDescriptionForCompare(existing.Description),
 		existing.DueDate,
 		normalizeWorkflowStateName(existing.StateName),
+		normalizeLabelName(existing.ManagedLabel),
+		fmt.Sprintf("%t", hasLabelNamed(existing.Labels, existing.ManagedLabel)),
 		fmt.Sprintf("%d", existing.Priority),
 	)
 }
@@ -60,12 +63,13 @@ func nextLinearHashes(desiredByFingerprint map[string]model.DesiredIssue, existi
 		}
 
 		resolved := model.DesiredIssue{
-			Fingerprint: existing.Fingerprint,
-			Title:       existing.Title,
-			Description: existing.Description,
-			DueDate:     existing.DueDate,
-			State:       model.StateDone,
-			Priority:    existing.Priority,
+			Fingerprint:  existing.Fingerprint,
+			Title:        existing.Title,
+			Description:  existing.Description,
+			DueDate:      existing.DueDate,
+			State:        model.StateDone,
+			ManagedLabel: existing.ManagedLabel,
+			Priority:     existing.Priority,
 		}
 		if needsUpdate(existing, resolved) {
 			out[fingerprint] = desiredIssueHash(resolved)

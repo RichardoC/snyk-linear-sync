@@ -33,7 +33,7 @@ It is not responsible for:
 
 - writing back to Snyk
 - preserving arbitrary manual edits inside the managed section of the Linear description
-- syncing labels, comments, or custom fields beyond the currently managed issue body, title, priority, due date, and workflow state
+- syncing comments or custom fields beyond the currently managed issue body, title, priority, due date, workflow state, and managed automation label
 
 ## Identity Model
 
@@ -65,6 +65,7 @@ Update the Linear issue when managed fields differ:
 - due date
 - priority
 - mapped state
+- managed automation label
 
 ### Resolve
 
@@ -92,10 +93,41 @@ It includes:
 - package/version details
 - repository details
 - source file and region details for code findings
+- GitHub source file and commit links when `SOURCE_PROVIDER=github`
 - metadata block
 - human-readable fingerprint line
 
+The metadata block also records the managed automation label name when label management is enabled.
+
 Linear may rewrite parts of the description body when rendering or storing markdown. The sync therefore normalizes known Linear formatting changes during compare and cache hashing.
+
+## Source Hosting
+
+`SOURCE_PROVIDER` controls how source references are rendered.
+
+- `unknown` leaves source references as plain text
+- `github` renders public GitHub links for:
+  - source files, pinned to the reported commit
+  - source commits
+
+If repository, file, or commit data is missing, the sync falls back to plain text.
+
+## Managed Label
+
+`LINEAR_MANAGED_LABEL` controls the label this tool manages on synced issues.
+
+- default: `snyk-automation`
+- `off`: disables label management
+- any other value: the exact Linear label name to manage
+
+Behavior:
+
+- the configured managed label is added to new synced issues
+- unrelated existing labels are preserved
+- if the configured managed label changes, the old managed label is removed and the new one is applied
+- if label management is disabled, the previously managed label is removed
+
+The configured label must already exist in Linear. If it does not, the run fails with a clear operator-facing error.
 
 ## State Mapping
 
@@ -166,6 +198,7 @@ After any code change, run:
 ```bash
 go fix ./...
 go test ./...
+go vet ./...
 ```
 
 Use a normal run for day-to-day sync:

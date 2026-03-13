@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -143,7 +144,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	snykHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
-		desired := desiredIssue(s.cfg.Linear.Due, finding)
+		desired := desiredIssue(s.cfg, finding)
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 	}
@@ -224,12 +225,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 			desiredState := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs)
 			resolved := model.DesiredIssue{
-				Fingerprint: existing.Fingerprint,
-				Title:       existing.Title,
-				Description: existing.Description,
-				DueDate:     existing.DueDate,
-				State:       desiredState,
-				Priority:    existing.Priority,
+				Fingerprint:  existing.Fingerprint,
+				Title:        existing.Title,
+				Description:  upsertManagedMetadata(existing.Description, existing.Fingerprint, s.cfg.Linear.Labels.Managed),
+				DueDate:      existing.DueDate,
+				State:        desiredState,
+				ManagedLabel: s.cfg.Linear.Labels.Managed,
+				Priority:     existing.Priority,
 			}
 			if needsUpdate(existing, resolved) {
 				resolveBatch = append(resolveBatch, model.IssueUpdate{Existing: existing, Desired: resolved})
@@ -389,14 +391,15 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 	}
 }
 
-func desiredIssue(dueCfg config.DueDateConfig, finding model.Finding) model.DesiredIssue {
+func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 	return model.DesiredIssue{
-		Fingerprint: finding.Fingerprint,
-		Title:       issueTitle(finding),
-		Description: issueDescription(finding),
-		DueDate:     issueDueDate(dueCfg, finding),
-		State:       issueState(finding.Status),
-		Priority:    issuePriority(finding.Severity),
+		Fingerprint:  finding.Fingerprint,
+		Title:        issueTitle(finding),
+		Description:  issueDescription(cfg.Source, cfg.Linear.Labels.Managed, finding),
+		DueDate:      issueDueDate(cfg.Linear.Due, finding),
+		State:        issueState(finding.Status),
+		ManagedLabel: cfg.Linear.Labels.Managed,
+		Priority:     issuePriority(finding.Severity),
 	}
 }
 
@@ -411,11 +414,14 @@ func issueTitle(finding model.Finding) string {
 	return fmt.Sprintf("Snyk: %s %s in %s", strings.ToLower(finding.Severity), base, finding.ProjectName)
 }
 
-func issueDescription(finding model.Finding) string {
+func issueDescription(sourceCfg config.SourceConfig, managedLabel string, finding model.Finding) string {
 	issueURL := finding.IssueURL
 	if issueURL == "" {
 		issueURL = finding.IssueAPIURL
 	}
+
+	sourceFileLabel, sourceFileURL := sourceFileLink(sourceCfg, finding)
+	sourceCommitURL := sourceCommitLink(sourceCfg, finding)
 
 	lines := []string{
 		fmt.Sprintf("Snyk issue: %s", issueURL),
@@ -457,26 +463,38 @@ func issueDescription(finding model.Finding) string {
 		lines = append(lines, fmt.Sprintf("Introduced through: %s", finding.IntroducedThrough))
 	}
 	if finding.SourceFile != "" {
-		lines = append(lines, fmt.Sprintf("Source file: %s", finding.SourceFile))
+		if sourceFileURL != "" {
+			lines = append(lines, fmt.Sprintf("Source file: [%s](%s)", sourceFileLabel, sourceFileURL))
+		} else {
+			lines = append(lines, fmt.Sprintf("Source file: %s", finding.SourceFile))
+		}
 	}
-	if finding.SourceLineStart > 0 {
+	if finding.SourceLineStart > 0 && sourceFileURL == "" {
 		lines = append(lines, fmt.Sprintf("Source region: %s", sourceRegionString(finding)))
 	}
 	if finding.SourceCommitID != "" {
-		lines = append(lines, fmt.Sprintf("Source commit: %s", finding.SourceCommitID))
+		if sourceCommitURL != "" {
+			lines = append(lines, fmt.Sprintf("Source commit: [%s](%s)", finding.SourceCommitID, sourceCommitURL))
+		} else {
+			lines = append(lines, fmt.Sprintf("Source commit: %s", finding.SourceCommitID))
+		}
 	}
 
-	lines = append(lines, "", metadataBlock(finding.Fingerprint), fmt.Sprintf("Fingerprint: %s", finding.Fingerprint))
+	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabel), fmt.Sprintf("Fingerprint: %s", finding.Fingerprint))
 	return strings.Join(lines, "\n")
 }
 
-func metadataBlock(fingerprint string) string {
-	return strings.Join([]string{
+func metadataBlock(fingerprint, managedLabel string) string {
+	lines := []string{
 		"<!-- snyk-linear-sync",
 		"DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.",
 		fmt.Sprintf("fingerprint: %s", fingerprint),
-		"-->",
-	}, "\n")
+	}
+	if strings.TrimSpace(managedLabel) != "" {
+		lines = append(lines, fmt.Sprintf("managed_label: %s", managedLabel))
+	}
+	lines = append(lines, "-->")
+	return strings.Join(lines, "\n")
 }
 
 func issueState(status model.FindingStatus) model.IssueState {
@@ -548,6 +566,9 @@ func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool 
 	if existing.Priority != desired.Priority {
 		return true
 	}
+	if managedLabelUpdateNeeded(existing, desired.ManagedLabel) {
+		return true
+	}
 	return false
 }
 
@@ -599,6 +620,54 @@ func normalizeDescriptionForCompare(description string) string {
 	return description
 }
 
+func sourceFileLink(sourceCfg config.SourceConfig, finding model.Finding) (string, string) {
+	if sourceCfg.Provider != "github" {
+		return "", ""
+	}
+	if strings.TrimSpace(finding.Repository) == "" || strings.TrimSpace(finding.SourceFile) == "" || strings.TrimSpace(finding.SourceCommitID) == "" {
+		return "", ""
+	}
+
+	link := &url.URL{
+		Scheme:   "https",
+		Host:     "github.com",
+		Path:     fmt.Sprintf("/%s/blob/%s/%s", finding.Repository, finding.SourceCommitID, finding.SourceFile),
+		Fragment: githubLineAnchor(finding),
+	}
+
+	label := finding.SourceFile
+	if finding.SourceLineStart > 0 {
+		label = fmt.Sprintf("%s (%s)", finding.SourceFile, sourceRegionString(finding))
+	}
+	return label, link.String()
+}
+
+func sourceCommitLink(sourceCfg config.SourceConfig, finding model.Finding) string {
+	if sourceCfg.Provider != "github" {
+		return ""
+	}
+	if strings.TrimSpace(finding.Repository) == "" || strings.TrimSpace(finding.SourceCommitID) == "" {
+		return ""
+	}
+
+	link := &url.URL{
+		Scheme: "https",
+		Host:   "github.com",
+		Path:   fmt.Sprintf("/%s/commit/%s", finding.Repository, finding.SourceCommitID),
+	}
+	return link.String()
+}
+
+func githubLineAnchor(finding model.Finding) string {
+	if finding.SourceLineStart <= 0 {
+		return ""
+	}
+	if finding.SourceLineEnd > finding.SourceLineStart {
+		return fmt.Sprintf("L%d-L%d", finding.SourceLineStart, finding.SourceLineEnd)
+	}
+	return fmt.Sprintf("L%d", finding.SourceLineStart)
+}
+
 func normalizeWorkflowStateName(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	switch value {
@@ -607,6 +676,63 @@ func normalizeWorkflowStateName(value string) string {
 	default:
 		return value
 	}
+}
+
+func managedLabelUpdateNeeded(existing model.ExistingIssue, desiredManagedLabel string) bool {
+	existingManagedLabel := normalizeLabelName(existing.ManagedLabel)
+	desiredManagedLabel = normalizeLabelName(desiredManagedLabel)
+
+	switch {
+	case desiredManagedLabel == "":
+		return existingManagedLabel != "" && hasLabelNamed(existing.Labels, existingManagedLabel)
+	case desiredManagedLabel != existingManagedLabel:
+		if !hasLabelNamed(existing.Labels, desiredManagedLabel) {
+			return true
+		}
+		return existingManagedLabel != "" && hasLabelNamed(existing.Labels, existingManagedLabel)
+	default:
+		return !hasLabelNamed(existing.Labels, desiredManagedLabel)
+	}
+}
+
+func upsertManagedMetadata(description, fingerprint, managedLabel string) string {
+	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
+	block := metadataBlock(fingerprint, managedLabel)
+
+	start := strings.Index(description, metadataHeaderStart())
+	if start >= 0 {
+		if relEnd := strings.Index(description[start:], "-->"); relEnd >= 0 {
+			end := start + relEnd + len("-->")
+			description = strings.TrimSpace(description[:start] + block + description[end:])
+			return description
+		}
+	}
+
+	if description == "" {
+		return strings.Join([]string{block, fmt.Sprintf("Fingerprint: %s", fingerprint)}, "\n")
+	}
+	return strings.TrimSpace(strings.Join([]string{description, "", block, fmt.Sprintf("Fingerprint: %s", fingerprint)}, "\n"))
+}
+
+func metadataHeaderStart() string {
+	return "<!-- snyk-linear-sync"
+}
+
+func hasLabelNamed(labels []model.IssueLabel, name string) bool {
+	name = normalizeLabelName(name)
+	if name == "" {
+		return false
+	}
+	for _, label := range labels {
+		if normalizeLabelName(label.Name) == name {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeLabelName(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func linearHashesByFingerprint(issues []model.ExistingIssue) map[string]string {

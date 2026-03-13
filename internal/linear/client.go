@@ -27,11 +27,12 @@ type Client struct {
 	gql *gqlclient.Client
 	log *slog.Logger
 
-	mu           sync.RWMutex
-	resolvedTeam string
-	statesByName map[string]string
-	statesByType map[string]string
-	blockedUntil time.Time
+	mu             sync.RWMutex
+	resolvedTeam   string
+	statesByName   map[string]string
+	statesByType   map[string]string
+	managedLabelID string
+	blockedUntil   time.Time
 }
 
 func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Client {
@@ -58,6 +59,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error
 		return nil, err
 	}
 	if err := c.loadStates(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.loadManagedLabel(ctx); err != nil {
 		return nil, err
 	}
 	return c.loadIssues(ctx)
@@ -96,6 +100,15 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	if len(desired) == 0 {
 		return nil
 	}
+	if err := c.resolveTeam(ctx); err != nil {
+		return err
+	}
+	if err := c.ensureStatesLoaded(ctx); err != nil {
+		return err
+	}
+	if err := c.loadManagedLabel(ctx); err != nil {
+		return err
+	}
 
 	op := gqlclient.NewOperation(createIssuesMutation(len(desired)))
 	for i, issue := range desired {
@@ -113,6 +126,7 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 			TeamId:      c.teamID(),
 			StateId:     &stateID,
 			Priority:    &priority,
+			LabelIds:    c.createLabelIDs(issue),
 			DueDate:     timelessDatePtr(issue.DueDate),
 		}
 		op.Var(fmt.Sprintf("input%d", i), input)
@@ -142,6 +156,15 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 	if len(updates) == 0 {
 		return nil
 	}
+	if err := c.resolveTeam(ctx); err != nil {
+		return err
+	}
+	if err := c.ensureStatesLoaded(ctx); err != nil {
+		return err
+	}
+	if err := c.loadManagedLabel(ctx); err != nil {
+		return err
+	}
 
 	op := gqlclient.NewOperation(updateIssuesMutation(len(updates)))
 	for i, update := range updates {
@@ -153,11 +176,16 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		title := update.Desired.Title
 		description := update.Desired.Description
 		priority := int32(update.Desired.Priority)
+		labelIDs, err := c.desiredLabelIDs(update.Existing, update.Desired)
+		if err != nil {
+			return err
+		}
 		input := linearapi.IssueUpdateInput{
 			Title:       &title,
 			Description: &description,
 			StateId:     &stateID,
 			Priority:    &priority,
+			LabelIds:    labelIDs,
 			DueDate:     timelessDatePtr(update.Desired.DueDate),
 		}
 		op.Var(fmt.Sprintf("id%d", i), update.Existing.ID)
@@ -287,6 +315,12 @@ query existingIssues($filter: IssueFilter!, $after: String) {
         id
         name
       }
+      labels {
+        nodes {
+          id
+          name
+        }
+      }
     }
     pageInfo {
       hasNextPage
@@ -311,6 +345,12 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 						ID   string `json:"id"`
 						Name string `json:"name"`
 					} `json:"state"`
+					Labels struct {
+						Nodes []struct {
+							ID   string `json:"id"`
+							Name string `json:"name"`
+						} `json:"nodes"`
+					} `json:"labels"`
 				} `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool    `json:"hasNextPage"`
@@ -324,17 +364,26 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 
 		for _, issue := range resp.Issues.Nodes {
 			description := deref(issue.Description)
+			labels := make([]model.IssueLabel, 0, len(issue.Labels.Nodes))
+			for _, label := range issue.Labels.Nodes {
+				labels = append(labels, model.IssueLabel{
+					ID:   label.ID,
+					Name: label.Name,
+				})
+			}
 			existing := model.ExistingIssue{
-				ID:          issue.ID,
-				Identifier:  issue.Identifier,
-				Title:       issue.Title,
-				URL:         issue.URL,
-				StateID:     issue.State.ID,
-				StateName:   issue.State.Name,
-				Description: description,
-				Priority:    issue.Priority,
-				DueDate:     deref(issue.DueDate),
-				Fingerprint: extractFingerprint(description),
+				ID:           issue.ID,
+				Identifier:   issue.Identifier,
+				Title:        issue.Title,
+				URL:          issue.URL,
+				StateID:      issue.State.ID,
+				StateName:    issue.State.Name,
+				Description:  description,
+				Priority:     issue.Priority,
+				DueDate:      deref(issue.DueDate),
+				Fingerprint:  extractFingerprint(description),
+				ManagedLabel: extractManagedLabel(description),
+				Labels:       labels,
 			}
 			issues = append(issues, existing)
 		}
@@ -429,6 +478,171 @@ func extractFingerprint(description string) string {
 	return ""
 }
 
+func extractManagedLabel(description string) string {
+	for line := range strings.SplitSeq(description, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(trimmed, "managed_label:"); ok {
+			return strings.TrimSpace(after)
+		}
+	}
+	return ""
+}
+
+func (c *Client) ensureStatesLoaded(ctx context.Context) error {
+	c.mu.RLock()
+	loaded := len(c.statesByName) > 0 || len(c.statesByType) > 0
+	c.mu.RUnlock()
+	if loaded {
+		return nil
+	}
+	return c.loadStates(ctx)
+}
+
+func (c *Client) loadManagedLabel(ctx context.Context) error {
+	managedLabel := strings.TrimSpace(c.cfg.Labels.Managed)
+	if managedLabel == "" {
+		c.mu.Lock()
+		c.managedLabelID = ""
+		c.mu.Unlock()
+		return nil
+	}
+
+	c.mu.RLock()
+	if c.managedLabelID != "" {
+		c.mu.RUnlock()
+		return nil
+	}
+	c.mu.RUnlock()
+
+	var after *string
+	var teamMatches []string
+	var globalMatches []string
+	for {
+		op := gqlclient.NewOperation(`
+query managedIssueLabels($name: String!, $after: String) {
+  issueLabels(first: 100, after: $after, filter: { name: { eqIgnoreCase: $name } }) {
+    nodes {
+      id
+      name
+      team {
+        id
+      }
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}`)
+		op.Var("name", managedLabel)
+		op.Var("after", after)
+
+		var resp struct {
+			IssueLabels struct {
+				Nodes []struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+					Team *struct {
+						ID string `json:"id"`
+					} `json:"team"`
+				} `json:"nodes"`
+				PageInfo struct {
+					HasNextPage bool    `json:"hasNextPage"`
+					EndCursor   *string `json:"endCursor"`
+				} `json:"pageInfo"`
+			} `json:"issueLabels"`
+		}
+		if err := c.execute(ctx, op, &resp); err != nil {
+			return fmt.Errorf("fetch Linear labels: %w", err)
+		}
+
+		for _, label := range resp.IssueLabels.Nodes {
+			if !strings.EqualFold(label.Name, managedLabel) {
+				continue
+			}
+			switch {
+			case label.Team != nil && label.Team.ID == c.teamID():
+				teamMatches = append(teamMatches, label.ID)
+			case label.Team == nil:
+				globalMatches = append(globalMatches, label.ID)
+			}
+		}
+
+		if !resp.IssueLabels.PageInfo.HasNextPage || resp.IssueLabels.PageInfo.EndCursor == nil {
+			break
+		}
+		after = resp.IssueLabels.PageInfo.EndCursor
+	}
+
+	var resolved string
+	switch {
+	case len(teamMatches) == 1:
+		resolved = teamMatches[0]
+	case len(teamMatches) > 1:
+		return fmt.Errorf("managed Linear label %q is ambiguous for team %s; keep only one matching label", managedLabel, c.teamRef())
+	case len(globalMatches) == 1:
+		resolved = globalMatches[0]
+	case len(globalMatches) > 1:
+		return fmt.Errorf("managed Linear label %q is ambiguous across workspace labels; keep only one matching label", managedLabel)
+	default:
+		return fmt.Errorf("managed Linear label %q was not found; create the label in Linear or set LINEAR_MANAGED_LABEL=off", managedLabel)
+	}
+
+	c.mu.Lock()
+	c.managedLabelID = resolved
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
+	if strings.TrimSpace(desired.ManagedLabel) == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.managedLabelID == "" {
+		return nil
+	}
+	return []string{c.managedLabelID}
+}
+
+func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue) ([]string, error) {
+	out := make([]string, 0, len(existing.Labels)+1)
+	seen := make(map[string]struct{}, len(existing.Labels)+1)
+	previousManaged := normalizeLabelName(existing.ManagedLabel)
+	desiredManaged := normalizeLabelName(desired.ManagedLabel)
+
+	for _, label := range existing.Labels {
+		normalized := normalizeLabelName(label.Name)
+		if previousManaged != "" && normalized == previousManaged {
+			continue
+		}
+		if desiredManaged != "" && normalized == desiredManaged {
+			continue
+		}
+		if _, exists := seen[label.ID]; exists {
+			continue
+		}
+		out = append(out, label.ID)
+		seen[label.ID] = struct{}{}
+	}
+
+	if desiredManaged == "" {
+		return out, nil
+	}
+
+	c.mu.RLock()
+	managedLabelID := c.managedLabelID
+	c.mu.RUnlock()
+	if managedLabelID == "" {
+		return nil, fmt.Errorf("managed Linear label %q was not resolved", desired.ManagedLabel)
+	}
+	if _, exists := seen[managedLabelID]; !exists {
+		out = append(out, managedLabelID)
+	}
+	return out, nil
+}
+
 func deref(value *string) string {
 	if value == nil {
 		return ""
@@ -484,6 +698,10 @@ func stateType(state model.IssueState) string {
 	default:
 		return ""
 	}
+}
+
+func normalizeLabelName(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func createIssuesMutation(size int) string {

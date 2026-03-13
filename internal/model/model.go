@@ -49,6 +49,11 @@ type SnykSnapshot struct {
 	ProjectIDs map[string]struct{}
 }
 
+type IssueLabel struct {
+	ID   string
+	Name string
+}
+
 type IssueState string
 
 const (
@@ -59,25 +64,28 @@ const (
 )
 
 type ExistingIssue struct {
-	ID          string
-	Identifier  string
-	URL         string
-	Title       string
-	Description string
-	DueDate     string
-	StateID     string
-	StateName   string
-	Fingerprint string
-	Priority    int
+	ID           string
+	Identifier   string
+	URL          string
+	Title        string
+	Description  string
+	DueDate      string
+	StateID      string
+	StateName    string
+	Fingerprint  string
+	ManagedLabel string
+	Labels       []IssueLabel
+	Priority     int
 }
 
 type DesiredIssue struct {
-	Fingerprint string
-	Title       string
-	Description string
-	DueDate     string
-	State       IssueState
-	Priority    int
+	Fingerprint  string
+	Title        string
+	Description  string
+	DueDate      string
+	State        IssueState
+	ManagedLabel string
+	Priority     int
 }
 
 type IssueUpdate struct {
@@ -87,4 +95,13 @@ type IssueUpdate struct {
 
 func Fingerprint(projectID, issueID string) string {
 	return fmt.Sprintf("snyk:%s:%s", projectID, issueID)
+}
+
+func (i ExistingIssue) HasLabel(name string) bool {
+	for _, label := range i.Labels {
+		if label.Name == name {
+			return true
+		}
+	}
+	return false
 }

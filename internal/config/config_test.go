@@ -21,8 +21,14 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if cfg.Snyk.Region != defaultSnykRegion {
 		t.Fatalf("Region = %q, want %q", cfg.Snyk.Region, defaultSnykRegion)
 	}
+	if cfg.Source.Provider != defaultSourceProvider {
+		t.Fatalf("Source provider = %q, want %q", cfg.Source.Provider, defaultSourceProvider)
+	}
 	if cfg.Linear.States.Todo != defaultLinearTodoState {
 		t.Fatalf("Todo state = %q, want %q", cfg.Linear.States.Todo, defaultLinearTodoState)
+	}
+	if cfg.Linear.Labels.Managed != defaultManagedLabel {
+		t.Fatalf("Managed label = %q, want %q", cfg.Linear.Labels.Managed, defaultManagedLabel)
 	}
 	if cfg.Linear.Due.CriticalDays != defaultCriticalDueDays {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, defaultCriticalDueDays)
@@ -84,6 +90,8 @@ func TestLoadEnvFile(t *testing.T) {
 		"SNYK_ORG_ID=org-id # comment\n" +
 		"LINEAR_API_KEY=linear-key\n" +
 		"LINEAR_TEAM_ID=team-id\n" +
+		"SOURCE_PROVIDER=github\n" +
+		"LINEAR_MANAGED_LABEL=off\n" +
 		"LINEAR_DUE_DAYS_CRITICAL=20\n" +
 		"SNYK_OAUTH_SCOPES='scope-a, scope-b'\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -106,6 +114,12 @@ func TestLoadEnvFile(t *testing.T) {
 	}
 	if cfg.Linear.TeamID != "team-id" {
 		t.Fatalf("TeamID = %q, want %q", cfg.Linear.TeamID, "team-id")
+	}
+	if cfg.Source.Provider != "github" {
+		t.Fatalf("Source provider = %q, want %q", cfg.Source.Provider, "github")
+	}
+	if cfg.Linear.Labels.Managed != "" {
+		t.Fatalf("Managed label = %q, want empty", cfg.Linear.Labels.Managed)
 	}
 	if cfg.Linear.Due.CriticalDays != 20 {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, 20)

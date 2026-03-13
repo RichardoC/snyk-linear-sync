@@ -14,8 +14,10 @@ github.com/RichardoC/snyk-linear-sync
 - Reads all projects in one configured Snyk org.
 - Normalizes Snyk findings into one Linear issue per `project + issue`.
 - Stores a stable fingerprint in a hidden metadata block in the Linear issue description.
+- Optionally renders GitHub source file and commit links when source hosting is configured as `github`.
 - Creates missing Linear issues.
 - Updates existing Linear issues when managed fields change.
+- Ensures a configurable managed label is applied to all managed issues, unless label management is explicitly turned off.
 - Moves stale issues to the configured resolved state when the finding is no longer present but the Snyk project still exists.
 - Cancels managed Linear issues when their Snyk project no longer exists, such as after project deletion.
 - Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
@@ -85,11 +87,6 @@ Required after code changes:
 ```bash
 go fix ./...
 go test ./...
-```
-
-Additional useful check:
-
-```bash
 go vet ./...
 ```
 
@@ -110,9 +107,10 @@ This project is designed to work with:
 
 - `Read`
 - `Create issues`
-- `Create comments`
+- `Update issues`
 
-It does not require label creation or label update permissions.
+It does not require label creation permissions.
+If `LINEAR_MANAGED_LABEL` is enabled, the configured label must already exist in Linear.
 
 ## Managed Linear Description
 
@@ -123,6 +121,7 @@ Each managed issue contains:
 - project and issue identifiers
 - package/version details when available
 - repository and source-location details when available
+- GitHub source file and commit links when `SOURCE_PROVIDER=github` and the finding includes repository, file, and commit data
 - due date calculated from Snyk issue creation time and severity
 - hidden metadata block
 - human-readable `Fingerprint:` line
@@ -133,10 +132,37 @@ The metadata block is required for deduplication and safe updates:
 <!-- snyk-linear-sync
 DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.
 fingerprint: snyk:proj-123:issue-456
+managed_label: snyk-automation
 -->
 ```
 
 Changing or removing that block can cause duplicate issues or prevent updates from matching the correct Linear issue.
+
+## Source Links
+
+Use `SOURCE_PROVIDER` to control source-link rendering:
+
+- `unknown` keeps plain-text source file and commit fields
+- `github` renders source file and commit links to public GitHub
+
+For `github`, the file link is commit-pinned and includes line anchors when Snyk provides line numbers.
+
+## Managed Label
+
+`LINEAR_MANAGED_LABEL` controls the automation label applied to managed issues:
+
+- default: `snyk-automation`
+- set to another label name to use that label instead
+- set to `off` to disable label management
+
+When label management is enabled, the sync:
+
+- adds the configured label to newly created managed issues
+- preserves unrelated existing labels
+- removes the previously managed label if the configured label changes
+- removes the previously managed label if label management is turned off
+
+If the configured label does not exist in Linear, the run fails with a clear message telling the operator to create the label or disable label management.
 
 ## State Mapping
 
@@ -194,10 +220,12 @@ Optional:
 - `--env-file`
 - `SNYK_REGION`
 - `SNYK_OAUTH_SCOPES`
+- `SOURCE_PROVIDER`
 - `LINEAR_STATE_TODO`
 - `LINEAR_STATE_BACKLOG`
 - `LINEAR_STATE_DONE`
 - `LINEAR_STATE_CANCELLED`
+- `LINEAR_MANAGED_LABEL`
 - `LINEAR_DUE_DAYS_CRITICAL`
 - `LINEAR_DUE_DAYS_HIGH`
 - `LINEAR_DUE_DAYS_MEDIUM`

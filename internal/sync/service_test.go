@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,7 +198,7 @@ func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 			},
 		},
 	}
-	desired := desiredIssue(cfg.Linear.Due, snyk.snapshot.Findings[0])
+	desired := desiredIssue(cfg, snyk.snapshot.Findings[0])
 	existing := model.ExistingIssue{
 		ID:          "existing-1",
 		Identifier:  "SEC-1",
@@ -393,11 +394,15 @@ func desiredStates(desired []model.DesiredIssue) []model.IssueState {
 }
 
 func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
-	dueCfg := config.DueDateConfig{
-		CriticalDays: 15,
-		HighDays:     30,
-		MediumDays:   45,
-		LowDays:      90,
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
 	}
 	finding := model.Finding{
 		Fingerprint: "snyk:project-a:issue-1",
@@ -408,10 +413,79 @@ func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
 		CreatedAt:   time.Date(2026, time.March, 11, 23, 30, 0, 0, time.FixedZone("minus0500", -5*60*60)),
 	}
 
-	desired := desiredIssue(dueCfg, finding)
+	desired := desiredIssue(cfg, finding)
 
 	if desired.DueDate != "2026-03-27" {
 		t.Fatalf("desired due date = %q, want %q", desired.DueDate, "2026-03-27")
+	}
+}
+
+func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
+	cfg := config.Config{
+		Source: config.SourceConfig{
+			Provider: "github",
+		},
+		Linear: config.LinearConfig{
+			Labels: config.LabelConfig{
+				Managed: "snyk-automation",
+			},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint:       "snyk:project-a:issue-1",
+		SnykIssueID:       "issue-1",
+		SnykIssueKey:      "ISSUE-1",
+		ProjectID:         "project-a",
+		ProjectName:       "Project A",
+		IssueTitle:        "Open issue",
+		Severity:          "high",
+		Status:            model.FindingOpen,
+		IssueAPIURL:       "https://api.example.test/issue-1",
+		Repository:        "owner/repo",
+		SourceFile:        "src/main.go",
+		SourceCommitID:    "abc123",
+		SourceLineStart:   10,
+		SourceColumnStart: 2,
+		SourceLineEnd:     12,
+		SourceColumnEnd:   8,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if !strings.Contains(desired.Description, "[src/main.go (line 10:2 to 12:8)](https://github.com/owner/repo/blob/abc123/src/main.go#L10-L12)") {
+		t.Fatalf("description missing GitHub source file link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "[abc123](https://github.com/owner/repo/commit/abc123)") {
+		t.Fatalf("description missing GitHub source commit link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "managed_label: snyk-automation") {
+		t.Fatalf("description missing managed label metadata: %s", desired.Description)
+	}
+}
+
+func TestNeedsUpdateDetectsManagedLabelChange(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:        "title",
+		Description:  "description",
+		DueDate:      "2026-04-01",
+		StateName:    "Todo",
+		ManagedLabel: "old-label",
+		Labels: []model.IssueLabel{
+			{ID: "label-1", Name: "old-label"},
+		},
+		Priority: 2,
+	}
+	desired := model.DesiredIssue{
+		Title:        "title",
+		Description:  "description",
+		DueDate:      "2026-04-01",
+		State:        model.StateTodo,
+		ManagedLabel: "new-label",
+		Priority:     2,
+	}
+
+	if !needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = false, want true")
 	}
 }
 

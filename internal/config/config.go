@@ -13,10 +13,12 @@ import (
 
 const (
 	defaultSnykRegion           = "SNYK-US-01"
+	defaultSourceProvider       = "unknown"
 	defaultLinearTodoState      = "Todo"
 	defaultLinearBacklogState   = "Backlog"
 	defaultLinearDoneState      = "Done"
 	defaultLinearCancelledState = "Cancelled"
+	defaultManagedLabel         = "snyk-automation"
 	defaultCriticalDueDays      = 15
 	defaultHighDueDays          = 30
 	defaultMediumDueDays        = 45
@@ -34,6 +36,7 @@ type Config struct {
 	Log    LogConfig
 	Cache  CacheConfig
 	Snyk   SnykConfig
+	Source SourceConfig
 	Linear LinearConfig
 	Sync   SyncConfig
 }
@@ -55,10 +58,15 @@ type SnykConfig struct {
 	Scopes       []string
 }
 
+type SourceConfig struct {
+	Provider string
+}
+
 type LinearConfig struct {
 	APIKey string
 	TeamID string
 	States StateConfig
+	Labels LabelConfig
 	Due    DueDateConfig
 }
 
@@ -67,6 +75,10 @@ type StateConfig struct {
 	Backlog   string
 	Done      string
 	Cancelled string
+}
+
+type LabelConfig struct {
+	Managed string
 }
 
 type DueDateConfig struct {
@@ -116,6 +128,9 @@ func Load(args []string) (Config, error) {
 			OrgID:        os.Getenv("SNYK_ORG_ID"),
 			Scopes:       splitCSV(os.Getenv("SNYK_OAUTH_SCOPES")),
 		},
+		Source: SourceConfig{
+			Provider: normalizeSourceProvider(getEnv("SOURCE_PROVIDER", defaultSourceProvider)),
+		},
 		Linear: LinearConfig{
 			APIKey: os.Getenv("LINEAR_API_KEY"),
 			TeamID: os.Getenv("LINEAR_TEAM_ID"),
@@ -124,6 +139,9 @@ func Load(args []string) (Config, error) {
 				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
 				Done:      getEnv("LINEAR_STATE_DONE", defaultLinearDoneState),
 				Cancelled: getEnv("LINEAR_STATE_CANCELLED", defaultLinearCancelledState),
+			},
+			Labels: LabelConfig{
+				Managed: normalizeManagedLabel(getEnv("LINEAR_MANAGED_LABEL", defaultManagedLabel)),
 			},
 			Due: DueDateConfig{
 				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
@@ -163,6 +181,11 @@ func (c Config) Validate() error {
 	}
 	if c.Linear.TeamID == "" {
 		errs = append(errs, errors.New("LINEAR_TEAM_ID is required"))
+	}
+	switch c.Source.Provider {
+	case "unknown", "github":
+	default:
+		errs = append(errs, fmt.Errorf("SOURCE_PROVIDER must be one of unknown, github; got %q", c.Source.Provider))
 	}
 	if strings.TrimSpace(c.Log.ErrorFile) == "" {
 		errs = append(errs, errors.New("ERROR_LOG_FILE must not be empty"))
@@ -235,4 +258,22 @@ func splitCSV(raw string) []string {
 	}
 
 	return out
+}
+
+func normalizeSourceProvider(raw string) string {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return defaultSourceProvider
+	}
+	return value
+}
+
+func normalizeManagedLabel(raw string) string {
+	value := strings.TrimSpace(raw)
+	switch strings.ToLower(value) {
+	case "", "off", "false", "disabled", "none":
+		return ""
+	default:
+		return value
+	}
 }
