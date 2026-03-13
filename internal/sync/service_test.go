@@ -434,14 +434,16 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 	finding := model.Finding{
 		Fingerprint:       "snyk:project-a:issue-1",
 		SnykIssueID:       "issue-1",
-		SnykIssueKey:      "ISSUE-1",
+		SnykIssueKey:      "SNYK-CODE-ISSUE-1",
 		ProjectID:         "project-a",
 		ProjectName:       "Project A",
-		IssueTitle:        "Open issue",
+		IssueTitle:        "Path Traversal",
 		Severity:          "high",
 		Status:            model.FindingOpen,
 		IssueAPIURL:       "https://api.example.test/issue-1",
+		IssueURL:          "https://app.example.test/issue-1",
 		Repository:        "owner/repo",
+		ProjectReference:  "main",
 		SourceFile:        "src/main.go",
 		SourceCommitID:    "abc123",
 		SourceLineStart:   10,
@@ -452,14 +454,29 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 
 	desired := desiredIssue(cfg, finding)
 
+	if desired.Title != "Snyk: [high] owner/repo: Path Traversal in main.go" {
+		t.Fatalf("title = %q, want %q", desired.Title, "Snyk: [high] owner/repo: Path Traversal in main.go")
+	}
+	if !strings.Contains(desired.Description, "## Path Traversal [HIGH]") {
+		t.Fatalf("description missing heading: %s", desired.Description)
+	}
 	if !strings.Contains(desired.Description, "Repository: [owner/repo](https://github.com/owner/repo)") {
 		t.Fatalf("description missing GitHub repository link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "Ref: `main` at [`abc123`](https://github.com/owner/repo/commit/abc123)") {
+		t.Fatalf("description missing ref line: %s", desired.Description)
 	}
 	if !strings.Contains(desired.Description, "[src/main.go (line 10:2 to 12:8)](https://github.com/owner/repo/blob/abc123/src/main.go#L10-L12)") {
 		t.Fatalf("description missing GitHub source file link: %s", desired.Description)
 	}
-	if !strings.Contains(desired.Description, "[abc123](https://github.com/owner/repo/commit/abc123)") {
-		t.Fatalf("description missing GitHub source commit link: %s", desired.Description)
+	if !strings.Contains(desired.Description, "Snyk: [Open issue](https://app.example.test/issue-1)") {
+		t.Fatalf("description missing Snyk link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "API: [Issue details](https://api.example.test/issue-1)") {
+		t.Fatalf("description missing API link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "Status: `open`") {
+		t.Fatalf("description missing status line: %s", desired.Description)
 	}
 	if !strings.Contains(desired.Description, "managed_label: snyk-automation") {
 		t.Fatalf("description missing managed label metadata: %s", desired.Description)
@@ -476,20 +493,52 @@ func TestDesiredIssueAddsGitHubProjectTargetFileLinkWhenNoSourceLocationExists(t
 		Fingerprint:       "snyk:project-a:issue-1",
 		SnykIssueID:       "issue-1",
 		ProjectID:         "project-a",
-		ProjectName:       "Project A",
-		IssueTitle:        "Open issue",
-		Severity:          "high",
+		ProjectName:       "owner/repo(main):apps/backend/Dockerfile.dev",
+		IssueTitle:        "Integer Overflow or Wraparound",
+		Severity:          "critical",
 		Status:            model.FindingOpen,
+		IssueURL:          "https://app.example.test/issue-1",
 		IssueAPIURL:       "https://api.example.test/issue-1",
 		Repository:        "owner/repo",
 		ProjectReference:  "main",
 		ProjectTargetFile: "apps/backend/Dockerfile.dev",
+		PackageName:       "zlib/zlib1g",
+		SnykIssueKey:      "SNYK-DEBIAN-ZLIB-1",
 	}
 
 	desired := desiredIssue(cfg, finding)
 
-	if !strings.Contains(desired.Description, "Project target file: [apps/backend/Dockerfile.dev](https://github.com/owner/repo/blob/main/apps/backend/Dockerfile.dev)") {
+	if desired.Title != "Snyk: [critical] owner/repo: Integer Overflow or Wraparound in zlib/zlib1g" {
+		t.Fatalf("title = %q, want %q", desired.Title, "Snyk: [critical] owner/repo: Integer Overflow or Wraparound in zlib/zlib1g")
+	}
+	if !strings.Contains(desired.Description, "Repository: [owner/repo](https://github.com/owner/repo)") {
+		t.Fatalf("description missing repository link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "Ref: `main`") {
+		t.Fatalf("description missing ref line: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "Target file: [apps/backend/Dockerfile.dev](https://github.com/owner/repo/blob/main/apps/backend/Dockerfile.dev)") {
 		t.Fatalf("description missing GitHub project target file link: %s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "Package: `zlib/zlib1g`") {
+		t.Fatalf("description missing package line: %s", desired.Description)
+	}
+}
+
+func TestIssueTitleUsesReferenceForNonGitHubTargetFileFindings(t *testing.T) {
+	finding := model.Finding{
+		IssueTitle:        "Use of Default Credentials",
+		Severity:          "critical",
+		ProjectOrigin:     "kubernetes",
+		ProjectReference:  "ghcr.io/berriai/litellm-database",
+		ProjectTargetFile: "/app/pyproject.toml",
+		PackageName:       "mlflow",
+	}
+
+	title := issueTitle(finding)
+
+	if title != "Snyk: [critical] ghcr.io/berriai/litellm-database: Use of Default Credentials in mlflow" {
+		t.Fatalf("title = %q, want %q", title, "Snyk: [critical] ghcr.io/berriai/litellm-database: Use of Default Credentials in mlflow")
 	}
 }
 

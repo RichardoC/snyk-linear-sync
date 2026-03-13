@@ -116,14 +116,13 @@ If `LINEAR_MANAGED_LABEL` is enabled, the configured label must already exist in
 
 Each managed issue contains:
 
-- Snyk UI link
-- Snyk API link
-- project and issue identifiers
+- a heading with vulnerability title and severity
+- repo, ref, and file or target-file context near the top
+- Snyk UI and API links grouped together
 - package/version details when available
-- repository and source-location details when available
-- GitHub source file and commit links when `SOURCE_PROVIDER=github` and the finding includes repository, file, and commit data
+- project and issue identifiers lower in the body
+- GitHub repository, source file, and commit links when `SOURCE_PROVIDER=github` and the finding includes repository, file, and commit data
 - GitHub project target file links when `SOURCE_PROVIDER=github` and Snyk provides repository, branch/reference, and target file data but not a precise source location
-- due date calculated from Snyk issue creation time and severity
 - hidden metadata block
 - human-readable `Fingerprint:` line
 
@@ -144,10 +143,32 @@ Changing or removing that block can cause duplicate issues or prevent updates fr
 Use `SOURCE_PROVIDER` to control source-link rendering:
 
 - `unknown` keeps plain-text source file and commit fields
-- `github` renders source file and commit links to public GitHub
+- `github` renders repository, source file, and commit links to public GitHub
 
 For `github`, the file link is commit-pinned and includes line anchors when Snyk provides line numbers.
 If Snyk does not provide a source file/commit but does provide `Repository + Project reference + Project target file`, the sync links the project target file in GitHub without line anchors.
+
+## Issue Format
+
+The synced issue body is optimized for fast developer triage:
+
+- heading first: vulnerability title plus severity
+- repo, ref, and file or target file immediately below
+- Snyk UI and API links grouped together
+- package and fix context next
+- project and issue IDs lower in the body for debugging and API work
+
+The synced title includes the most useful source context when Snyk provides it:
+
+- repository for code and repository-backed findings
+- branch/image/reference for non-GitHub target-file findings such as Kubernetes or container scans
+
+The subject portion then uses this preference:
+
+1. source file basename
+2. package name
+3. project target file
+4. project name
 
 ## Managed Label
 

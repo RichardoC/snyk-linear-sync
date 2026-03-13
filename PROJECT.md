@@ -82,21 +82,36 @@ If multiple Linear issues share the same fingerprint, the sync treats that as a 
 
 ## Description Strategy
 
-The Linear issue description is intentionally structured.
+The Linear issue description is intentionally structured for fast triage first, deep debugging second.
 
 It includes:
 
+- heading with vulnerability title and severity
+- repository context near the top
+- branch/reference and commit context when available
+- source file or project target file context near the top
 - human-usable Snyk UI link
 - Snyk REST API link
+- package/version details
 - project identifiers
 - issue identifiers
-- package/version details
-- repository details
-- source file and region details for code findings
+- GitHub repository links when `SOURCE_PROVIDER=github`
 - GitHub source file and commit links when `SOURCE_PROVIDER=github`
 - GitHub project target file links when `SOURCE_PROVIDER=github` and no precise source location is available
 - metadata block
 - human-readable fingerprint line
+
+The synced title is also structured for scanability. It includes the best available source context:
+
+- repository for code and repository-backed findings
+- branch/image/reference for non-GitHub target-file findings such as Kubernetes or container scans
+
+The subject portion then uses this preference:
+
+1. source file basename
+2. package name
+3. project target file
+4. project name
 
 The metadata block also records the managed automation label name when label management is enabled.
 
@@ -108,6 +123,7 @@ Linear may rewrite parts of the description body when rendering or storing markd
 
 - `unknown` leaves source references as plain text
 - `github` renders public GitHub links for:
+  - repositories
   - source files, pinned to the reported commit
   - source commits
   - project target files, pinned to the reported branch/reference when no source commit/file is available

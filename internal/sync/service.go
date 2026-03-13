@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -404,14 +405,20 @@ func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 }
 
 func issueTitle(finding model.Finding) string {
-	base := strings.TrimSpace(finding.PackageName)
-	if base == "" {
-		base = strings.TrimSpace(finding.IssueTitle)
+	contextLabel := issueTitleContext(finding)
+	severity := strings.ToLower(strings.TrimSpace(finding.Severity))
+	title := strings.TrimSpace(finding.IssueTitle)
+	subject := issueTitleSubject(finding)
+	if contextLabel == "" {
+		if subject == "" {
+			return fmt.Sprintf("Snyk: [%s] %s", severity, title)
+		}
+		return fmt.Sprintf("Snyk: [%s] %s in %s", severity, title, subject)
 	}
-	if base == "" {
-		base = finding.SnykIssueID
+	if subject == "" {
+		return fmt.Sprintf("Snyk: [%s] %s: %s", severity, contextLabel, title)
 	}
-	return fmt.Sprintf("Snyk: %s %s in %s", strings.ToLower(finding.Severity), base, finding.ProjectName)
+	return fmt.Sprintf("Snyk: [%s] %s: %s in %s", severity, contextLabel, title, subject)
 }
 
 func issueDescription(sourceCfg config.SourceConfig, managedLabel string, finding model.Finding) string {
@@ -423,16 +430,10 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 	sourceFileLabel, sourceFileURL := sourceFileLink(sourceCfg, finding)
 	sourceCommitURL := sourceCommitLink(sourceCfg, finding)
 	repositoryURL := repositoryLink(sourceCfg, finding)
+	targetFileURL := projectTargetFileLink(sourceCfg, finding)
 
 	lines := []string{
-		fmt.Sprintf("Snyk issue: %s", issueURL),
-		fmt.Sprintf("Snyk API issue: %s", finding.IssueAPIURL),
-		fmt.Sprintf("Project: %s (%s)", finding.ProjectName, finding.ProjectID),
-		fmt.Sprintf("Issue ID: %s", finding.SnykIssueID),
-		fmt.Sprintf("Issue key: %s", finding.SnykIssueKey),
-		fmt.Sprintf("Title: %s", finding.IssueTitle),
-		fmt.Sprintf("Severity: %s", finding.Severity),
-		fmt.Sprintf("Status: %s", finding.Status),
+		fmt.Sprintf("## %s [%s]", strings.TrimSpace(finding.IssueTitle), strings.ToUpper(strings.TrimSpace(finding.Severity))),
 	}
 
 	if finding.Repository != "" {
@@ -443,53 +444,106 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 		}
 	}
 	if finding.ProjectReference != "" {
-		lines = append(lines, fmt.Sprintf("Project reference: %s", finding.ProjectReference))
-	}
-	if finding.ProjectOrigin != "" {
-		lines = append(lines, fmt.Sprintf("Project origin: %s", finding.ProjectOrigin))
+		refLine := fmt.Sprintf("Ref: `%s`", finding.ProjectReference)
+		if sourceCommitURL != "" {
+			refLine += fmt.Sprintf(" at [`%s`](%s)", shortCommit(finding.SourceCommitID), sourceCommitURL)
+		} else if finding.SourceCommitID != "" {
+			refLine += fmt.Sprintf(" at `%s`", shortCommit(finding.SourceCommitID))
+		}
+		lines = append(lines, refLine)
+	} else if finding.SourceCommitID != "" {
+		if sourceCommitURL != "" {
+			lines = append(lines, fmt.Sprintf("Commit: [`%s`](%s)", shortCommit(finding.SourceCommitID), sourceCommitURL))
+		} else {
+			lines = append(lines, fmt.Sprintf("Commit: `%s`", shortCommit(finding.SourceCommitID)))
+		}
 	}
 
-	if finding.PackageName != "" {
-		lines = append(lines, fmt.Sprintf("Package: %s", finding.PackageName))
-	}
-	if finding.VulnerableVersion != "" {
-		lines = append(lines, fmt.Sprintf("Vulnerable version: %s", finding.VulnerableVersion))
-	}
-	if finding.FixedVersion != "" {
-		lines = append(lines, fmt.Sprintf("Fixed version: %s", finding.FixedVersion))
-	}
-	if finding.ExploitMaturity != "" {
-		lines = append(lines, fmt.Sprintf("Exploit maturity: %s", finding.ExploitMaturity))
-	}
-	if finding.IntroducedThrough != "" {
-		lines = append(lines, fmt.Sprintf("Introduced through: %s", finding.IntroducedThrough))
-	}
 	if finding.SourceFile != "" {
 		if sourceFileURL != "" {
-			lines = append(lines, fmt.Sprintf("Source file: [%s](%s)", sourceFileLabel, sourceFileURL))
+			lines = append(lines, fmt.Sprintf("File: [%s](%s)", sourceFileLabel, sourceFileURL))
 		} else {
-			lines = append(lines, fmt.Sprintf("Source file: %s", finding.SourceFile))
+			lines = append(lines, fmt.Sprintf("File: `%s`", sourceFileLabel))
 		}
 	} else if finding.ProjectTargetFile != "" {
-		if targetFileURL := projectTargetFileLink(sourceCfg, finding); targetFileURL != "" {
-			lines = append(lines, fmt.Sprintf("Project target file: [%s](%s)", finding.ProjectTargetFile, targetFileURL))
+		if targetFileURL != "" {
+			lines = append(lines, fmt.Sprintf("Target file: [%s](%s)", finding.ProjectTargetFile, targetFileURL))
 		} else {
-			lines = append(lines, fmt.Sprintf("Project target file: %s", finding.ProjectTargetFile))
+			lines = append(lines, fmt.Sprintf("Target file: `%s`", finding.ProjectTargetFile))
 		}
 	}
-	if finding.SourceLineStart > 0 && sourceFileURL == "" {
-		lines = append(lines, fmt.Sprintf("Source region: %s", sourceRegionString(finding)))
+
+	lines = append(lines, "")
+	if issueURL != "" {
+		lines = append(lines, fmt.Sprintf("Snyk: [Open issue](%s)", issueURL))
 	}
-	if finding.SourceCommitID != "" {
-		if sourceCommitURL != "" {
-			lines = append(lines, fmt.Sprintf("Source commit: [%s](%s)", finding.SourceCommitID, sourceCommitURL))
-		} else {
-			lines = append(lines, fmt.Sprintf("Source commit: %s", finding.SourceCommitID))
-		}
+	if finding.IssueAPIURL != "" {
+		lines = append(lines, fmt.Sprintf("API: [Issue details](%s)", finding.IssueAPIURL))
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, fmt.Sprintf("Status: `%s`", finding.Status))
+	if finding.PackageName != "" {
+		lines = append(lines, fmt.Sprintf("Package: `%s`", finding.PackageName))
+	}
+	if finding.IntroducedThrough != "" {
+		lines = append(lines, fmt.Sprintf("Introduced through: `%s`", finding.IntroducedThrough))
+	}
+	if finding.VulnerableVersion != "" {
+		lines = append(lines, fmt.Sprintf("Vulnerable version: `%s`", finding.VulnerableVersion))
+	}
+	if finding.FixedVersion != "" {
+		lines = append(lines, fmt.Sprintf("Fix version: `%s`", finding.FixedVersion))
+	}
+	if finding.ExploitMaturity != "" {
+		lines = append(lines, fmt.Sprintf("Exploit maturity: `%s`", finding.ExploitMaturity))
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, fmt.Sprintf("Project: `%s` (`%s`)", finding.ProjectName, finding.ProjectID))
+	lines = append(lines, fmt.Sprintf("Issue ID: `%s`", finding.SnykIssueID))
+	if finding.SnykIssueKey != "" {
+		lines = append(lines, fmt.Sprintf("Issue key: `%s`", finding.SnykIssueKey))
+	}
+	if finding.ProjectOrigin != "" {
+		lines = append(lines, fmt.Sprintf("Project origin: `%s`", finding.ProjectOrigin))
 	}
 
 	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabel), fmt.Sprintf("Fingerprint: %s", finding.Fingerprint))
 	return strings.Join(lines, "\n")
+}
+
+func issueTitleSubject(finding model.Finding) string {
+	switch {
+	case strings.TrimSpace(finding.SourceFile) != "":
+		return path.Base(strings.TrimSpace(finding.SourceFile))
+	case strings.TrimSpace(finding.PackageName) != "":
+		return strings.TrimSpace(finding.PackageName)
+	case strings.TrimSpace(finding.ProjectTargetFile) != "":
+		return strings.TrimSpace(finding.ProjectTargetFile)
+	case strings.TrimSpace(finding.ProjectName) != "":
+		return strings.TrimSpace(finding.ProjectName)
+	default:
+		return ""
+	}
+}
+
+func issueTitleContext(finding model.Finding) string {
+	repository := strings.TrimSpace(finding.Repository)
+	reference := strings.TrimSpace(finding.ProjectReference)
+
+	switch {
+	case strings.TrimSpace(finding.SourceFile) != "" && repository != "":
+		return repository
+	case strings.TrimSpace(finding.ProjectTargetFile) != "" && repository == "" && reference != "":
+		return reference
+	case repository != "":
+		return repository
+	case reference != "":
+		return reference
+	default:
+		return ""
+	}
 }
 
 func metadataBlock(fingerprint, managedLabel string) string {
@@ -696,6 +750,14 @@ func repositoryLink(sourceCfg config.SourceConfig, finding model.Finding) string
 		Path:   fmt.Sprintf("/%s", finding.Repository),
 	}
 	return link.String()
+}
+
+func shortCommit(commit string) string {
+	commit = strings.TrimSpace(commit)
+	if len(commit) <= 7 {
+		return commit
+	}
+	return commit[:7]
 }
 
 func githubLineAnchor(finding model.Finding) string {
