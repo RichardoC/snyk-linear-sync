@@ -542,6 +542,19 @@ func TestIssueTitleUsesReferenceForNonGitHubTargetFileFindings(t *testing.T) {
 	}
 }
 
+func TestUpsertManagedMetadataRemovesVisibleFingerprintFooter(t *testing.T) {
+	description := "Status: `open`\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->\nFingerprint: snyk:project-a:issue-1"
+
+	got := upsertManagedMetadata(description, "snyk:project-a:issue-1", "snyk-automation")
+
+	if strings.Contains(got, "Fingerprint: snyk:project-a:issue-1") {
+		t.Fatalf("upsertManagedMetadata() left visible fingerprint footer: %s", got)
+	}
+	if !strings.Contains(got, "managed_label: snyk-automation") {
+		t.Fatalf("upsertManagedMetadata() missing managed label metadata: %s", got)
+	}
+}
+
 func TestNeedsUpdateDetectsManagedLabelChange(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:        "title",

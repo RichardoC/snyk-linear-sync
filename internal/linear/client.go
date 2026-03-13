@@ -285,11 +285,6 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 			},
 			{
 				Description: &linearapi.NullableStringComparator{
-					Contains: new("Fingerprint: snyk:"),
-				},
-			},
-			{
-				Description: &linearapi.NullableStringComparator{
 					Contains: new(metadataHeader),
 				},
 			},

@@ -66,6 +66,16 @@ func TestDesiredLabelIDsRemovesManagedLabelWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestExtractFingerprintPrefersMetadataBlock(t *testing.T) {
+	description := "## Example\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_label: snyk-automation\n-->"
+
+	got := extractFingerprint(description)
+
+	if got != "snyk:project-a:issue-1" {
+		t.Fatalf("extractFingerprint() = %q, want %q", got, "snyk:project-a:issue-1")
+	}
+}
+
 func containsString(values []string, want string) bool {
 	return slices.Contains(values, want)
 }

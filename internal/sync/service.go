@@ -509,7 +509,7 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 		lines = append(lines, fmt.Sprintf("Project origin: `%s`", finding.ProjectOrigin))
 	}
 
-	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabel), fmt.Sprintf("Fingerprint: %s", finding.Fingerprint))
+	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabel))
 	return strings.Join(lines, "\n")
 }
 
@@ -549,7 +549,6 @@ func issueTitleContext(finding model.Finding) string {
 func metadataBlock(fingerprint, managedLabel string) string {
 	lines := []string{
 		"<!-- snyk-linear-sync",
-		"DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.",
 		fmt.Sprintf("fingerprint: %s", fingerprint),
 	}
 	if strings.TrimSpace(managedLabel) != "" {
@@ -806,18 +805,32 @@ func upsertManagedMetadata(description, fingerprint, managedLabel string) string
 		if relEnd := strings.Index(description[start:], "-->"); relEnd >= 0 {
 			end := start + relEnd + len("-->")
 			description = strings.TrimSpace(description[:start] + block + description[end:])
+			description = stripVisibleFingerprintLine(description)
 			return description
 		}
 	}
 
 	if description == "" {
-		return strings.Join([]string{block, fmt.Sprintf("Fingerprint: %s", fingerprint)}, "\n")
+		return block
 	}
-	return strings.TrimSpace(strings.Join([]string{description, "", block, fmt.Sprintf("Fingerprint: %s", fingerprint)}, "\n"))
+	description = stripVisibleFingerprintLine(description)
+	return strings.TrimSpace(strings.Join([]string{description, "", block}, "\n"))
 }
 
 func metadataHeaderStart() string {
 	return "<!-- snyk-linear-sync"
+}
+
+func stripVisibleFingerprintLine(description string) string {
+	lines := strings.Split(description, "\n")
+	filtered := lines[:0]
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "Fingerprint:") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
 func hasLabelNamed(labels []model.IssueLabel, name string) bool {

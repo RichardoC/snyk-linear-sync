@@ -124,13 +124,11 @@ Each managed issue contains:
 - GitHub repository, source file, and commit links when `SOURCE_PROVIDER=github` and the finding includes repository, file, and commit data
 - GitHub project target file links when `SOURCE_PROVIDER=github` and Snyk provides repository, branch/reference, and target file data but not a precise source location
 - hidden metadata block
-- human-readable `Fingerprint:` line
 
 The metadata block is required for deduplication and safe updates:
 
 ```text
 <!-- snyk-linear-sync
-DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.
 fingerprint: snyk:proj-123:issue-456
 managed_label: snyk-automation
 -->

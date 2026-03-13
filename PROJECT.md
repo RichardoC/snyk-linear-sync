@@ -99,7 +99,6 @@ It includes:
 - GitHub source file and commit links when `SOURCE_PROVIDER=github`
 - GitHub project target file links when `SOURCE_PROVIDER=github` and no precise source location is available
 - metadata block
-- human-readable fingerprint line
 
 The synced title is also structured for scanability. It includes the best available source context:
 

@@ -8,7 +8,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-03-13-source-provider-managed-label-v1"
+const metadataSchemaVersion = "2026-03-13-minimal-metadata-block-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
