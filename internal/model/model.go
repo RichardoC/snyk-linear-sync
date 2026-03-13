@@ -44,6 +44,11 @@ type Finding struct {
 	SourceColumnEnd   int
 }
 
+type SnykSnapshot struct {
+	Findings   []Finding
+	ProjectIDs map[string]struct{}
+}
+
 type IssueState string
 
 const (

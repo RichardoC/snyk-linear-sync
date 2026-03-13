@@ -68,7 +68,9 @@ Update the Linear issue when managed fields differ:
 
 ### Resolve
 
-When a previously tracked finding no longer exists in Snyk, move the Linear issue to the resolved state.
+When a previously tracked finding no longer exists in Snyk but its Snyk project still exists, move the Linear issue to the resolved state.
+
+When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead.
 
 ### Conflict
 
@@ -103,6 +105,8 @@ The current workflow mapping is:
 - `snoozed` -> `Backlog`
 - `fixed` -> `Done`
 - `ignored` -> `Cancelled`
+- missing finding in an existing Snyk project -> `Done`
+- missing finding because the Snyk project no longer exists -> `Cancelled`
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
 
@@ -156,6 +160,13 @@ The post-write refresh matters because Linear may rewrite markdown bodies after 
 - Cache bypass is the correct operator action when the rendering schema or compare logic changes.
 
 ## Operator Guidance
+
+After any code change, run:
+
+```bash
+go fix ./...
+go test ./...
+```
 
 Use a normal run for day-to-day sync:
 

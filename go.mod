@@ -1,6 +1,6 @@
 module github.com/RichardoC/snyk-linear-sync
 
-go 1.25.0
+go 1.26.0
 
 require (
 	git.sr.ht/~emersion/gqlclient v0.0.0-20250318184027-d4a003529bba

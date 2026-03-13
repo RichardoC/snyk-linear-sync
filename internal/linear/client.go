@@ -252,17 +252,17 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 		Or: []linearapi.IssueFilter{
 			{
 				Title: &linearapi.StringComparator{
-					StartsWith: stringPtr(titlePrefix),
+					StartsWith: new(titlePrefix),
 				},
 			},
 			{
 				Description: &linearapi.NullableStringComparator{
-					Contains: stringPtr("Fingerprint: snyk:"),
+					Contains: new("Fingerprint: snyk:"),
 				},
 			},
 			{
 				Description: &linearapi.NullableStringComparator{
-					Contains: stringPtr(metadataHeader),
+					Contains: new(metadataHeader),
 				},
 			},
 		},
@@ -436,8 +436,9 @@ func deref(value *string) string {
 	return *value
 }
 
+//go:fix inline
 func stringPtr(value string) *string {
-	return &value
+	return new(value)
 }
 
 func timelessDatePtr(value string) *linearapi.TimelessDate {

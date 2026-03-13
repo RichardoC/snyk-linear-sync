@@ -13,11 +13,11 @@ import (
 )
 
 type fakeSnyk struct {
-	findings []model.Finding
+	snapshot model.SnykSnapshot
 }
 
-func (f fakeSnyk) ListFindings(context.Context) ([]model.Finding, error) {
-	return f.findings, nil
+func (f fakeSnyk) LoadSnapshot(context.Context) (model.SnykSnapshot, error) {
+	return f.snapshot, nil
 }
 
 type fakeLinear struct {
@@ -73,29 +73,36 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	snyk := fakeSnyk{
-		findings: []model.Finding{
-			{
-				Fingerprint: "snyk:project-a:issue-1",
-				SnykIssueID: "issue-1",
-				ProjectID:   "project-a",
-				ProjectName: "Project A",
-				IssueTitle:  "Outdated package",
-				PackageName: "github.com/example/pkg",
-				Severity:    "high",
-				Status:      model.FindingOpen,
-				IssueURL:    "https://example.test/issue-1",
-				CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Outdated package",
+					PackageName: "github.com/example/pkg",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					IssueURL:    "https://example.test/issue-1",
+					CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-b:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-b",
+					ProjectName: "Project B",
+					IssueTitle:  "Ignored issue",
+					Severity:    "low",
+					Status:      model.FindingIgnored,
+					IssueURL:    "https://example.test/issue-2",
+					CreatedAt:   time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC),
+				},
 			},
-			{
-				Fingerprint: "snyk:project-b:issue-2",
-				SnykIssueID: "issue-2",
-				ProjectID:   "project-b",
-				ProjectName: "Project B",
-				IssueTitle:  "Ignored issue",
-				Severity:    "low",
-				Status:      model.FindingIgnored,
-				IssueURL:    "https://example.test/issue-2",
-				CreatedAt:   time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC),
+			ProjectIDs: map[string]struct{}{
+				"project-a": {},
+				"project-b": {},
+				"project-z": {},
 			},
 		},
 	}
@@ -145,6 +152,9 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 	if linear.created[0].DueDate != "2026-04-01" {
 		t.Fatalf("created due date = %q, want %q", linear.created[0].DueDate, "2026-04-01")
 	}
+	if !containsDesiredState(linear.updated, model.StateDone) {
+		t.Fatalf("updated states = %#v, want one %q", desiredStates(linear.updated), model.StateDone)
+	}
 }
 
 func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
@@ -165,24 +175,29 @@ func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	snyk := fakeSnyk{
-		findings: []model.Finding{
-			{
-				Fingerprint:  "snyk:project-a:issue-1",
-				SnykIssueID:  "issue-1",
-				SnykIssueKey: "SNYK-ISSUE-1",
-				ProjectID:    "project-a",
-				ProjectName:  "Project A",
-				IssueTitle:   "Outdated package",
-				PackageName:  "github.com/example/pkg",
-				Severity:     "high",
-				Status:       model.FindingOpen,
-				IssueURL:     "https://app.snyk.io/org/example/project/project-a#issue-SNYK-ISSUE-1",
-				IssueAPIURL:  "https://api.snyk.io/rest/orgs/example/issues/issue-1?version=2024-10-15",
-				CreatedAt:    time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:  "snyk:project-a:issue-1",
+					SnykIssueID:  "issue-1",
+					SnykIssueKey: "SNYK-ISSUE-1",
+					ProjectID:    "project-a",
+					ProjectName:  "Project A",
+					IssueTitle:   "Outdated package",
+					PackageName:  "github.com/example/pkg",
+					Severity:     "high",
+					Status:       model.FindingOpen,
+					IssueURL:     "https://app.snyk.io/org/example/project/project-a#issue-SNYK-ISSUE-1",
+					IssueAPIURL:  "https://api.snyk.io/rest/orgs/example/issues/issue-1?version=2024-10-15",
+					CreatedAt:    time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{
+				"project-a": {},
 			},
 		},
 	}
-	desired := desiredIssue(cfg.Linear.Due, snyk.findings[0])
+	desired := desiredIssue(cfg.Linear.Due, snyk.snapshot.Findings[0])
 	existing := model.ExistingIssue{
 		ID:          "existing-1",
 		Identifier:  "SEC-1",
@@ -223,6 +238,122 @@ func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 	}
 }
 
+func TestRunCancelsMissingIssueWhenProjectDeleted(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{
+			Workers: 1,
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			ProjectIDs: map[string]struct{}{
+				"project-a": {},
+			},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "missing project issue",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-z:issue-9",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateCancelled {
+		t.Fatalf("resolved state = %q, want %q", linear.updated[0].State, model.StateCancelled)
+	}
+}
+
+func TestRunCancelsMissingIssueWhenProjectDeletedEvenIfCached(t *testing.T) {
+	cfg := config.Config{
+		Cache: config.CacheConfig{},
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{
+			Workers: 1,
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			ProjectIDs: map[string]struct{}{
+				"project-a": {},
+			},
+		},
+	}
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SEC-1",
+		Title:       "missing project issue",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: "snyk:project-z:issue-9",
+	}
+	cacheStore := &fakeCache{
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			LinearHashes: map[string]string{
+				existing.Fingerprint: existingIssueHash(existing),
+			},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{existing},
+	}
+
+	service := New(cfg, logger, snyk, linear, cacheStore)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateCancelled {
+		t.Fatalf("resolved state = %q, want %q", linear.updated[0].State, model.StateCancelled)
+	}
+}
+
 func TestNeedsUpdateUsesCaseInsensitiveLabels(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:       "title",
@@ -242,6 +373,23 @@ func TestNeedsUpdateUsesCaseInsensitiveLabels(t *testing.T) {
 	if needsUpdate(existing, desired) {
 		t.Fatal("needsUpdate() = true, want false")
 	}
+}
+
+func containsDesiredState(desired []model.DesiredIssue, state model.IssueState) bool {
+	for _, issue := range desired {
+		if issue.State == state {
+			return true
+		}
+	}
+	return false
+}
+
+func desiredStates(desired []model.DesiredIssue) []model.IssueState {
+	out := make([]model.IssueState, 0, len(desired))
+	for _, issue := range desired {
+		out = append(out, issue.State)
+	}
+	return out
 }
 
 func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {

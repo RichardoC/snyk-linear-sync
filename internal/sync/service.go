@@ -17,7 +17,7 @@ import (
 )
 
 type SnykClient interface {
-	ListFindings(ctx context.Context) ([]model.Finding, error)
+	LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error)
 }
 
 type LinearClient interface {
@@ -70,6 +70,7 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	runCtx := ctx
 	var (
+		snykSnapshot   model.SnykSnapshot
 		findings       []model.Finding
 		existingIssues []model.ExistingIssue
 	)
@@ -102,7 +103,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	loadGroup, loadCtx := errgroup.WithContext(ctx)
 	loadGroup.Go(func() error {
 		var err error
-		findings, err = s.snyk.ListFindings(loadCtx)
+		snykSnapshot, err = s.snyk.LoadSnapshot(loadCtx)
+		if err != nil {
+			return err
+		}
+		findings = snykSnapshot.Findings
 		return err
 	})
 	loadGroup.Go(func() error {
@@ -217,16 +222,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
-			if cacheEnabled && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] {
-				continue
-			}
-
+			desiredState := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs)
 			resolved := model.DesiredIssue{
 				Fingerprint: existing.Fingerprint,
 				Title:       existing.Title,
 				Description: existing.Description,
 				DueDate:     existing.DueDate,
-				State:       model.StateDone,
+				State:       desiredState,
 				Priority:    existing.Priority,
 			}
 			if needsUpdate(existing, resolved) {
@@ -562,6 +564,30 @@ func stateName(state model.IssueState) string {
 	default:
 		return ""
 	}
+}
+
+func missingFindingState(fingerprint string, activeProjects map[string]struct{}) model.IssueState {
+	projectID, ok := fingerprintProjectID(fingerprint)
+	if !ok {
+		return model.StateDone
+	}
+	if _, exists := activeProjects[projectID]; exists {
+		return model.StateDone
+	}
+	return model.StateCancelled
+}
+
+func fingerprintProjectID(fingerprint string) (string, bool) {
+	const prefix = "snyk:"
+	if !strings.HasPrefix(fingerprint, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(fingerprint, prefix)
+	projectID, _, ok := strings.Cut(rest, ":")
+	if !ok || strings.TrimSpace(projectID) == "" {
+		return "", false
+	}
+	return projectID, true
 }
 
 func normalizeDescriptionForCompare(description string) string {

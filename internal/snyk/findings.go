@@ -139,20 +139,22 @@ type orgResponse struct {
 	} `json:"data"`
 }
 
-func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
+func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	orgSlug, err := c.orgSlug(ctx)
 	if err != nil {
-		return nil, err
+		return model.SnykSnapshot{}, err
 	}
 
 	projects, err := c.listProjects(ctx)
 	if err != nil {
-		return nil, err
+		return model.SnykSnapshot{}, err
 	}
 
 	projectDetails := make(map[string]projectRef, len(projects))
+	projectIDs := make(map[string]struct{}, len(projects))
 	for _, project := range projects {
 		projectDetails[project.ID] = project
+		projectIDs[project.ID] = struct{}{}
 	}
 
 	findings := make([]model.Finding, 0, len(projects))
@@ -160,7 +162,7 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 	for {
 		page, cursor, err := c.listIssuesPage(ctx, nextCursor)
 		if err != nil {
-			return nil, err
+			return model.SnykSnapshot{}, err
 		}
 
 		for _, issue := range page {
@@ -177,7 +179,7 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 			source := sourceLocation(issue.Attributes.Coordinates)
 			createdAt, err := parseIssueCreatedAt(issue.Attributes.CreatedAt)
 			if err != nil {
-				return nil, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
+				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
 			}
 			finding := model.Finding{
 				Fingerprint:       model.Fingerprint(projectID, issue.ID),
@@ -217,7 +219,18 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 		nextCursor = cursor
 	}
 
-	return findings, nil
+	return model.SnykSnapshot{
+		Findings:   findings,
+		ProjectIDs: projectIDs,
+	}, nil
+}
+
+func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
+	snapshot, err := c.LoadSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Findings, nil
 }
 
 func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {

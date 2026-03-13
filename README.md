@@ -16,7 +16,8 @@ github.com/RichardoC/snyk-linear-sync
 - Stores a stable fingerprint in a hidden metadata block in the Linear issue description.
 - Creates missing Linear issues.
 - Updates existing Linear issues when managed fields change.
-- Moves stale issues to the configured resolved state when the finding is no longer present.
+- Moves stale issues to the configured resolved state when the finding is no longer present but the Snyk project still exists.
+- Cancels managed Linear issues when their Snyk project no longer exists, such as after project deletion.
 - Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
 - Sets Linear due dates from Snyk issue creation time using configurable per-severity offsets.
 
@@ -79,11 +80,16 @@ go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
 
 ## Validation
 
-Useful local checks:
+Required after code changes:
 
 ```bash
 go fix ./...
 go test ./...
+```
+
+Additional useful check:
+
+```bash
 go vet ./...
 ```
 
@@ -138,8 +144,15 @@ Changing or removing that block can cause duplicate issues or prevent updates fr
 - snoozed -> `Backlog`
 - fixed -> `Done`
 - ignored -> `Cancelled`
+- missing finding in an existing Snyk project -> `Done`
+- missing finding because the Snyk project no longer exists -> `Cancelled`
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
+
+This distinction is intentional:
+
+- If a Snyk issue disappears but the project still exists, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
+- If the Snyk project itself is gone, the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
 
 Default due date offsets:
 
