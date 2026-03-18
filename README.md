@@ -130,7 +130,7 @@ The metadata block is required for deduplication and safe updates:
 ```text
 <!-- snyk-linear-sync
 fingerprint: snyk:proj-123:issue-456
-managed_label: snyk-automation
+managed_labels: snyk-automation,snyk-code
 -->
 ```
 
@@ -168,7 +168,7 @@ The subject portion then uses this preference:
 3. project target file
 4. project name
 
-## Managed Label
+## Managed Labels
 
 `LINEAR_MANAGED_LABEL` controls the automation label applied to managed issues:
 
@@ -184,6 +184,19 @@ When label management is enabled, the sync:
 - removes the previously managed label if label management is turned off
 
 If the configured label does not exist in Linear, the run fails with a clear message telling the operator to create the label or disable label management.
+
+`LINEAR_TOOL_LABELS` optionally maps Snyk issue `type` values to additional managed Linear labels:
+
+- format: comma-separated `issue_type:label` pairs
+- example: `code:snyk-code,package_vulnerability:snyk-open-source,cloud:snyk-cloud`
+- labels must already exist in Linear
+
+`LINEAR_TOOL_LABEL_DEFAULT` controls the fallback label for issue types without an explicit mapping:
+
+- default: `snyk-automation`
+- set to `off` to disable the fallback
+
+When tool label mapping is enabled, the sync manages both the global automation label and the tool-derived label set recorded in the metadata block.
 
 ## State Mapping
 
@@ -247,6 +260,8 @@ Optional:
 - `LINEAR_STATE_DONE`
 - `LINEAR_STATE_CANCELLED`
 - `LINEAR_MANAGED_LABEL`
+- `LINEAR_TOOL_LABELS`
+- `LINEAR_TOOL_LABEL_DEFAULT`
 - `LINEAR_DUE_DAYS_CRITICAL`
 - `LINEAR_DUE_DAYS_HIGH`
 - `LINEAR_DUE_DAYS_MEDIUM`

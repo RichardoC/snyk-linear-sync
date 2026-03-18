@@ -78,7 +78,9 @@ type StateConfig struct {
 }
 
 type LabelConfig struct {
-	Managed string
+	Managed     string
+	Tool        map[string]string
+	ToolDefault string
 }
 
 type DueDateConfig struct {
@@ -112,6 +114,11 @@ func Load(args []string) (Config, error) {
 		}
 	}
 
+	toolLabels, err := parseToolLabelMap(os.Getenv("LINEAR_TOOL_LABELS"))
+	if err != nil {
+		return Config{}, err
+	}
+
 	cfg := Config{
 		DryRun: *dryRun,
 		Log: LogConfig{
@@ -141,7 +148,9 @@ func Load(args []string) (Config, error) {
 				Cancelled: getEnv("LINEAR_STATE_CANCELLED", defaultLinearCancelledState),
 			},
 			Labels: LabelConfig{
-				Managed: normalizeManagedLabel(getEnv("LINEAR_MANAGED_LABEL", defaultManagedLabel)),
+				Managed:     normalizeManagedLabel(getEnv("LINEAR_MANAGED_LABEL", defaultManagedLabel)),
+				Tool:        toolLabels,
+				ToolDefault: normalizeManagedLabel(getEnv("LINEAR_TOOL_LABEL_DEFAULT", defaultManagedLabel)),
 			},
 			Due: DueDateConfig{
 				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
@@ -276,4 +285,40 @@ func normalizeManagedLabel(raw string) string {
 	default:
 		return value
 	}
+}
+
+func parseToolLabelMap(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	out := make(map[string]string)
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		issueType, label, ok := strings.Cut(part, ":")
+		if !ok {
+			return nil, fmt.Errorf("LINEAR_TOOL_LABELS entry %q must use issue_type:label format", part)
+		}
+
+		issueType = strings.ToLower(strings.TrimSpace(issueType))
+		label = normalizeManagedLabel(label)
+		if issueType == "" {
+			return nil, fmt.Errorf("LINEAR_TOOL_LABELS entry %q is missing the issue type", part)
+		}
+		if label == "" {
+			return nil, fmt.Errorf("LINEAR_TOOL_LABELS entry %q is missing the label name", part)
+		}
+
+		out[issueType] = label
+	}
+
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }

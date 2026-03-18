@@ -129,7 +129,7 @@ Linear may rewrite parts of the description body when rendering or storing markd
 
 If repository, file, or commit data is missing, the sync falls back to plain text.
 
-## Managed Label
+## Managed Labels
 
 `LINEAR_MANAGED_LABEL` controls the label this tool manages on synced issues.
 
@@ -145,6 +145,18 @@ Behavior:
 - if label management is disabled, the previously managed label is removed
 
 The configured label must already exist in Linear. If it does not, the run fails with a clear operator-facing error.
+
+`LINEAR_TOOL_LABELS` optionally maps Snyk issue `type` values to additional managed Linear labels.
+
+- format: comma-separated `issue_type:label` pairs
+- example: `code:snyk-code,package_vulnerability:snyk-open-source`
+
+`LINEAR_TOOL_LABEL_DEFAULT` controls the fallback label for unmapped issue types.
+
+- default: `snyk-automation`
+- `off`: disables the fallback
+
+The metadata block stores the full managed label set so the sync can remove stale tool-derived labels while preserving unrelated manual labels.
 
 ## State Mapping
 

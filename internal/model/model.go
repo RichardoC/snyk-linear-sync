@@ -18,6 +18,7 @@ type Finding struct {
 	Fingerprint       string
 	SnykIssueID       string
 	SnykIssueKey      string
+	IssueType         string
 	CreatedAt         time.Time
 	ProjectID         string
 	ProjectName       string
@@ -64,28 +65,28 @@ const (
 )
 
 type ExistingIssue struct {
-	ID           string
-	Identifier   string
-	URL          string
-	Title        string
-	Description  string
-	DueDate      string
-	StateID      string
-	StateName    string
-	Fingerprint  string
-	ManagedLabel string
-	Labels       []IssueLabel
-	Priority     int
+	ID            string
+	Identifier    string
+	URL           string
+	Title         string
+	Description   string
+	DueDate       string
+	StateID       string
+	StateName     string
+	Fingerprint   string
+	ManagedLabels []string
+	Labels        []IssueLabel
+	Priority      int
 }
 
 type DesiredIssue struct {
-	Fingerprint  string
-	Title        string
-	Description  string
-	DueDate      string
-	State        IssueState
-	ManagedLabel string
-	Priority     int
+	Fingerprint   string
+	Title         string
+	Description   string
+	DueDate       string
+	State         IssueState
+	ManagedLabels []string
+	Priority      int
 }
 
 type IssueUpdate struct {

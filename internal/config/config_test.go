@@ -12,6 +12,10 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	t.Setenv("SNYK_ORG_ID", "org-id")
 	t.Setenv("LINEAR_API_KEY", "linear-key")
 	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("SOURCE_PROVIDER", "")
+	t.Setenv("LINEAR_MANAGED_LABEL", "")
+	t.Setenv("LINEAR_TOOL_LABELS", "")
+	t.Setenv("LINEAR_TOOL_LABEL_DEFAULT", "")
 
 	cfg, err := Load(nil)
 	if err != nil {
@@ -29,6 +33,12 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	}
 	if cfg.Linear.Labels.Managed != defaultManagedLabel {
 		t.Fatalf("Managed label = %q, want %q", cfg.Linear.Labels.Managed, defaultManagedLabel)
+	}
+	if cfg.Linear.Labels.ToolDefault != defaultManagedLabel {
+		t.Fatalf("Tool default label = %q, want %q", cfg.Linear.Labels.ToolDefault, defaultManagedLabel)
+	}
+	if len(cfg.Linear.Labels.Tool) != 0 {
+		t.Fatalf("Tool labels = %#v, want empty", cfg.Linear.Labels.Tool)
 	}
 	if cfg.Linear.Due.CriticalDays != defaultCriticalDueDays {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, defaultCriticalDueDays)
@@ -92,6 +102,8 @@ func TestLoadEnvFile(t *testing.T) {
 		"LINEAR_TEAM_ID=team-id\n" +
 		"SOURCE_PROVIDER=github\n" +
 		"LINEAR_MANAGED_LABEL=off\n" +
+		"LINEAR_TOOL_LABELS=code:snyk-code, license:snyk-license\n" +
+		"LINEAR_TOOL_LABEL_DEFAULT=off\n" +
 		"LINEAR_DUE_DAYS_CRITICAL=20\n" +
 		"SNYK_OAUTH_SCOPES='scope-a, scope-b'\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -121,10 +133,29 @@ func TestLoadEnvFile(t *testing.T) {
 	if cfg.Linear.Labels.Managed != "" {
 		t.Fatalf("Managed label = %q, want empty", cfg.Linear.Labels.Managed)
 	}
+	if cfg.Linear.Labels.ToolDefault != "" {
+		t.Fatalf("Tool default label = %q, want empty", cfg.Linear.Labels.ToolDefault)
+	}
+	if cfg.Linear.Labels.Tool["code"] != "snyk-code" || cfg.Linear.Labels.Tool["license"] != "snyk-license" {
+		t.Fatalf("Tool labels = %#v, want code/license mappings", cfg.Linear.Labels.Tool)
+	}
 	if cfg.Linear.Due.CriticalDays != 20 {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, 20)
 	}
 	if len(cfg.Snyk.Scopes) != 2 || cfg.Snyk.Scopes[0] != "scope-a" || cfg.Snyk.Scopes[1] != "scope-b" {
 		t.Fatalf("Scopes = %#v, want [scope-a scope-b]", cfg.Snyk.Scopes)
+	}
+}
+
+func TestLoadRejectsMalformedToolLabels(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_TOOL_LABELS", "code")
+
+	if _, err := Load(nil); err == nil {
+		t.Fatal("Load() error = nil, want parse error")
 	}
 }

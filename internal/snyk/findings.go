@@ -185,6 +185,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				Fingerprint:       model.Fingerprint(projectID, issue.ID),
 				SnykIssueID:       issue.ID,
 				SnykIssueKey:      issueKey,
+				IssueType:         strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
 				CreatedAt:         createdAt,
 				ProjectID:         projectID,
 				ProjectName:       project.Name,

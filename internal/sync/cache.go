@@ -4,11 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-03-13-minimal-metadata-block-v1"
+const metadataSchemaVersion = "2026-03-18-managed-label-sets-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
@@ -21,7 +22,7 @@ func desiredIssueHash(desired model.DesiredIssue) string {
 		normalizeDescriptionForCompare(desired.Description),
 		desired.DueDate,
 		string(desired.State),
-		normalizeLabelName(desired.ManagedLabel),
+		strings.Join(normalizeManagedLabelNames(desired.ManagedLabels), ","),
 		fmt.Sprintf("%d", desired.Priority),
 	)
 }
@@ -33,8 +34,8 @@ func existingIssueHash(existing model.ExistingIssue) string {
 		normalizeDescriptionForCompare(existing.Description),
 		existing.DueDate,
 		normalizeWorkflowStateName(existing.StateName),
-		normalizeLabelName(existing.ManagedLabel),
-		fmt.Sprintf("%t", hasLabelNamed(existing.Labels, existing.ManagedLabel)),
+		strings.Join(normalizeManagedLabelNames(existing.ManagedLabels), ","),
+		strings.Join(presentManagedLabelNames(existing.Labels, existing.ManagedLabels), ","),
 		fmt.Sprintf("%d", existing.Priority),
 	)
 }
@@ -63,13 +64,13 @@ func nextLinearHashes(desiredByFingerprint map[string]model.DesiredIssue, existi
 		}
 
 		resolved := model.DesiredIssue{
-			Fingerprint:  existing.Fingerprint,
-			Title:        existing.Title,
-			Description:  existing.Description,
-			DueDate:      existing.DueDate,
-			State:        model.StateDone,
-			ManagedLabel: existing.ManagedLabel,
-			Priority:     existing.Priority,
+			Fingerprint:   existing.Fingerprint,
+			Title:         existing.Title,
+			Description:   existing.Description,
+			DueDate:       existing.DueDate,
+			State:         model.StateDone,
+			ManagedLabels: existing.ManagedLabels,
+			Priority:      existing.Priority,
 		}
 		if needsUpdate(existing, resolved) {
 			out[fingerprint] = desiredIssueHash(resolved)
@@ -88,4 +89,14 @@ func digestParts(parts ...string) string {
 		_, _ = h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func presentManagedLabelNames(labels []model.IssueLabel, managed []string) []string {
+	out := make([]string, 0, len(managed))
+	for _, label := range normalizeManagedLabelNames(managed) {
+		if hasLabelNamed(labels, label) {
+			out = append(out, label)
+		}
+	}
+	return out
 }

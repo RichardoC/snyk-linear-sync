@@ -408,6 +408,7 @@ func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
 		Fingerprint: "snyk:project-a:issue-1",
 		SnykIssueID: "issue-1",
 		ProjectName: "Project A",
+		IssueType:   "code",
 		Severity:    "critical",
 		Status:      model.FindingOpen,
 		CreatedAt:   time.Date(2026, time.March, 11, 23, 30, 0, 0, time.FixedZone("minus0500", -5*60*60)),
@@ -427,7 +428,9 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 		},
 		Linear: config.LinearConfig{
 			Labels: config.LabelConfig{
-				Managed: "snyk-automation",
+				Managed:     "snyk-automation",
+				Tool:        map[string]string{"code": "snyk-code"},
+				ToolDefault: "snyk-automation",
 			},
 		},
 	}
@@ -435,6 +438,7 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 		Fingerprint:       "snyk:project-a:issue-1",
 		SnykIssueID:       "issue-1",
 		SnykIssueKey:      "SNYK-CODE-ISSUE-1",
+		IssueType:         "code",
 		ProjectID:         "project-a",
 		ProjectName:       "Project A",
 		IssueTitle:        "Path Traversal",
@@ -478,8 +482,11 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 	if !strings.Contains(desired.Description, "Status: `open`") {
 		t.Fatalf("description missing status line: %s", desired.Description)
 	}
-	if !strings.Contains(desired.Description, "managed_label: snyk-automation") {
-		t.Fatalf("description missing managed label metadata: %s", desired.Description)
+	if !strings.Contains(desired.Description, "managed_labels: snyk-automation,snyk-code") {
+		t.Fatalf("description missing managed labels metadata: %s", desired.Description)
+	}
+	if len(desired.ManagedLabels) != 2 || desired.ManagedLabels[0] != "snyk-automation" || desired.ManagedLabels[1] != "snyk-code" {
+		t.Fatalf("ManagedLabels = %#v, want [snyk-automation snyk-code]", desired.ManagedLabels)
 	}
 }
 
@@ -492,6 +499,7 @@ func TestDesiredIssueAddsGitHubProjectTargetFileLinkWhenNoSourceLocationExists(t
 	finding := model.Finding{
 		Fingerprint:       "snyk:project-a:issue-1",
 		SnykIssueID:       "issue-1",
+		IssueType:         "package_vulnerability",
 		ProjectID:         "project-a",
 		ProjectName:       "owner/repo(main):apps/backend/Dockerfile.dev",
 		IssueTitle:        "Integer Overflow or Wraparound",
@@ -545,39 +553,62 @@ func TestIssueTitleUsesReferenceForNonGitHubTargetFileFindings(t *testing.T) {
 func TestUpsertManagedMetadataRemovesVisibleFingerprintFooter(t *testing.T) {
 	description := "Status: `open`\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->\nFingerprint: snyk:project-a:issue-1"
 
-	got := upsertManagedMetadata(description, "snyk:project-a:issue-1", "snyk-automation")
+	got := upsertManagedMetadata(description, "snyk:project-a:issue-1", []string{"snyk-automation", "snyk-code"})
 
 	if strings.Contains(got, "Fingerprint: snyk:project-a:issue-1") {
 		t.Fatalf("upsertManagedMetadata() left visible fingerprint footer: %s", got)
 	}
-	if !strings.Contains(got, "managed_label: snyk-automation") {
-		t.Fatalf("upsertManagedMetadata() missing managed label metadata: %s", got)
+	if !strings.Contains(got, "managed_labels: snyk-automation,snyk-code") {
+		t.Fatalf("upsertManagedMetadata() missing managed labels metadata: %s", got)
 	}
 }
 
 func TestNeedsUpdateDetectsManagedLabelChange(t *testing.T) {
 	existing := model.ExistingIssue{
-		Title:        "title",
-		Description:  "description",
-		DueDate:      "2026-04-01",
-		StateName:    "Todo",
-		ManagedLabel: "old-label",
+		Title:         "title",
+		Description:   "description",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		ManagedLabels: []string{"old-label"},
 		Labels: []model.IssueLabel{
 			{ID: "label-1", Name: "old-label"},
 		},
 		Priority: 2,
 	}
 	desired := model.DesiredIssue{
-		Title:        "title",
-		Description:  "description",
-		DueDate:      "2026-04-01",
-		State:        model.StateTodo,
-		ManagedLabel: "new-label",
-		Priority:     2,
+		Title:         "title",
+		Description:   "description",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		ManagedLabels: []string{"new-label"},
+		Priority:      2,
 	}
 
 	if !needsUpdate(existing, desired) {
 		t.Fatal("needsUpdate() = false, want true")
+	}
+}
+
+func TestManagedLabelsUsesConfiguredToolMapping(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed:     "snyk-automation",
+		Tool:        map[string]string{"code": "snyk-code"},
+		ToolDefault: "snyk-automation",
+	}, model.Finding{IssueType: "code"})
+
+	if len(labels) != 2 || labels[0] != "snyk-automation" || labels[1] != "snyk-code" {
+		t.Fatalf("managedLabels() = %#v, want [snyk-automation snyk-code]", labels)
+	}
+}
+
+func TestManagedLabelsFallsBackToConfiguredDefault(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed:     "snyk-automation",
+		ToolDefault: "snyk-fallback",
+	}, model.Finding{IssueType: "custom"})
+
+	if len(labels) != 2 || labels[0] != "snyk-automation" || labels[1] != "snyk-fallback" {
+		t.Fatalf("managedLabels() = %#v, want [snyk-automation snyk-fallback]", labels)
 	}
 }
 

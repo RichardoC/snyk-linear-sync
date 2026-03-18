@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -226,13 +227,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 			desiredState := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs)
 			resolved := model.DesiredIssue{
-				Fingerprint:  existing.Fingerprint,
-				Title:        existing.Title,
-				Description:  upsertManagedMetadata(existing.Description, existing.Fingerprint, s.cfg.Linear.Labels.Managed),
-				DueDate:      existing.DueDate,
-				State:        desiredState,
-				ManagedLabel: s.cfg.Linear.Labels.Managed,
-				Priority:     existing.Priority,
+				Fingerprint:   existing.Fingerprint,
+				Title:         existing.Title,
+				Description:   upsertManagedMetadata(existing.Description, existing.Fingerprint, existing.ManagedLabels),
+				DueDate:       existing.DueDate,
+				State:         desiredState,
+				ManagedLabels: existing.ManagedLabels,
+				Priority:      existing.Priority,
 			}
 			if needsUpdate(existing, resolved) {
 				resolveBatch = append(resolveBatch, model.IssueUpdate{Existing: existing, Desired: resolved})
@@ -394,13 +395,13 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 
 func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 	return model.DesiredIssue{
-		Fingerprint:  finding.Fingerprint,
-		Title:        issueTitle(finding),
-		Description:  issueDescription(cfg.Source, cfg.Linear.Labels.Managed, finding),
-		DueDate:      issueDueDate(cfg.Linear.Due, finding),
-		State:        issueState(finding.Status),
-		ManagedLabel: cfg.Linear.Labels.Managed,
-		Priority:     issuePriority(finding.Severity),
+		Fingerprint:   finding.Fingerprint,
+		Title:         issueTitle(finding),
+		Description:   issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding),
+		DueDate:       issueDueDate(cfg.Linear.Due, finding),
+		State:         issueState(finding.Status),
+		ManagedLabels: managedLabels(cfg.Linear.Labels, finding),
+		Priority:      issuePriority(finding.Severity),
 	}
 }
 
@@ -421,7 +422,7 @@ func issueTitle(finding model.Finding) string {
 	return fmt.Sprintf("Snyk: [%s] %s: %s in %s", severity, contextLabel, title, subject)
 }
 
-func issueDescription(sourceCfg config.SourceConfig, managedLabel string, finding model.Finding) string {
+func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, finding model.Finding) string {
 	issueURL := finding.IssueURL
 	if issueURL == "" {
 		issueURL = finding.IssueAPIURL
@@ -509,7 +510,7 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabel string, findin
 		lines = append(lines, fmt.Sprintf("Project origin: `%s`", finding.ProjectOrigin))
 	}
 
-	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabel))
+	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabels))
 	return strings.Join(lines, "\n")
 }
 
@@ -546,13 +547,13 @@ func issueTitleContext(finding model.Finding) string {
 	}
 }
 
-func metadataBlock(fingerprint, managedLabel string) string {
+func metadataBlock(fingerprint string, managedLabels []string) string {
 	lines := []string{
 		"<!-- snyk-linear-sync",
 		fmt.Sprintf("fingerprint: %s", fingerprint),
 	}
-	if strings.TrimSpace(managedLabel) != "" {
-		lines = append(lines, fmt.Sprintf("managed_label: %s", managedLabel))
+	if labels := normalizeManagedLabelNames(managedLabels); len(labels) > 0 {
+		lines = append(lines, fmt.Sprintf("managed_labels: %s", strings.Join(labels, ",")))
 	}
 	lines = append(lines, "-->")
 	return strings.Join(lines, "\n")
@@ -627,7 +628,7 @@ func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool 
 	if existing.Priority != desired.Priority {
 		return true
 	}
-	if managedLabelUpdateNeeded(existing, desired.ManagedLabel) {
+	if managedLabelsUpdateNeeded(existing, desired.ManagedLabels) {
 		return true
 	}
 	return false
@@ -779,26 +780,30 @@ func normalizeWorkflowStateName(value string) string {
 	}
 }
 
-func managedLabelUpdateNeeded(existing model.ExistingIssue, desiredManagedLabel string) bool {
-	existingManagedLabel := normalizeLabelName(existing.ManagedLabel)
-	desiredManagedLabel = normalizeLabelName(desiredManagedLabel)
+func managedLabelsUpdateNeeded(existing model.ExistingIssue, desiredManagedLabels []string) bool {
+	existingManaged := normalizeManagedLabelNames(existing.ManagedLabels)
+	desiredManaged := normalizeManagedLabelNames(desiredManagedLabels)
 
-	switch {
-	case desiredManagedLabel == "":
-		return existingManagedLabel != "" && hasLabelNamed(existing.Labels, existingManagedLabel)
-	case desiredManagedLabel != existingManagedLabel:
-		if !hasLabelNamed(existing.Labels, desiredManagedLabel) {
+	if strings.Join(existingManaged, ",") != strings.Join(desiredManaged, ",") {
+		return true
+	}
+
+	for _, label := range desiredManaged {
+		if !hasLabelNamed(existing.Labels, label) {
 			return true
 		}
-		return existingManagedLabel != "" && hasLabelNamed(existing.Labels, existingManagedLabel)
-	default:
-		return !hasLabelNamed(existing.Labels, desiredManagedLabel)
 	}
+	for _, label := range existingManaged {
+		if hasLabelNamed(existing.Labels, label) && !containsNormalizedLabel(desiredManaged, label) {
+			return true
+		}
+	}
+	return false
 }
 
-func upsertManagedMetadata(description, fingerprint, managedLabel string) string {
+func upsertManagedMetadata(description, fingerprint string, managedLabels []string) string {
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
-	block := metadataBlock(fingerprint, managedLabel)
+	block := metadataBlock(fingerprint, managedLabels)
 
 	start := strings.Index(description, metadataHeaderStart())
 	if start >= 0 {
@@ -848,6 +853,59 @@ func hasLabelNamed(labels []model.IssueLabel, name string) bool {
 
 func normalizeLabelName(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeManagedLabelNames(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := normalizeLabelName(value)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return out
+}
+
+func containsNormalizedLabel(labels []string, target string) bool {
+	target = normalizeLabelName(target)
+	for _, label := range labels {
+		if normalizeLabelName(label) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string {
+	labels := make([]string, 0, 2)
+	if managed := strings.TrimSpace(labelCfg.Managed); managed != "" {
+		labels = append(labels, managed)
+	}
+
+	issueType := strings.ToLower(strings.TrimSpace(finding.IssueType))
+	if issueType != "" {
+		if mapped := strings.TrimSpace(labelCfg.Tool[issueType]); mapped != "" {
+			labels = append(labels, mapped)
+		} else if fallback := strings.TrimSpace(labelCfg.ToolDefault); fallback != "" {
+			labels = append(labels, fallback)
+		}
+	}
+
+	return normalizeManagedLabelNames(labels)
 }
 
 func linearHashesByFingerprint(issues []model.ExistingIssue) map[string]string {

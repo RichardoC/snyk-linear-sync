@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,12 +28,12 @@ type Client struct {
 	gql *gqlclient.Client
 	log *slog.Logger
 
-	mu             sync.RWMutex
-	resolvedTeam   string
-	statesByName   map[string]string
-	statesByType   map[string]string
-	managedLabelID string
-	blockedUntil   time.Time
+	mu              sync.RWMutex
+	resolvedTeam    string
+	statesByName    map[string]string
+	statesByType    map[string]string
+	managedLabelIDs map[string]string
+	blockedUntil    time.Time
 }
 
 func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Client {
@@ -46,11 +47,12 @@ func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Clie
 	}
 
 	return &Client{
-		cfg:          cfg,
-		gql:          gqlclient.New("https://api.linear.app/graphql", httpClient),
-		log:          logger,
-		statesByName: map[string]string{},
-		statesByType: map[string]string{},
+		cfg:             cfg,
+		gql:             gqlclient.New("https://api.linear.app/graphql", httpClient),
+		log:             logger,
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
 	}
 }
 
@@ -59,9 +61,6 @@ func (c *Client) LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error
 		return nil, err
 	}
 	if err := c.loadStates(ctx); err != nil {
-		return nil, err
-	}
-	if err := c.loadManagedLabel(ctx); err != nil {
 		return nil, err
 	}
 	return c.loadIssues(ctx)
@@ -106,7 +105,7 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	if err := c.ensureStatesLoaded(ctx); err != nil {
 		return err
 	}
-	if err := c.loadManagedLabel(ctx); err != nil {
+	if err := c.ensureManagedLabelsResolved(ctx, managedLabelsFromDesiredIssues(desired)); err != nil {
 		return err
 	}
 
@@ -162,7 +161,7 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 	if err := c.ensureStatesLoaded(ctx); err != nil {
 		return err
 	}
-	if err := c.loadManagedLabel(ctx); err != nil {
+	if err := c.ensureManagedLabelsResolved(ctx, managedLabelsFromUpdates(updates)); err != nil {
 		return err
 	}
 
@@ -367,18 +366,18 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 				})
 			}
 			existing := model.ExistingIssue{
-				ID:           issue.ID,
-				Identifier:   issue.Identifier,
-				Title:        issue.Title,
-				URL:          issue.URL,
-				StateID:      issue.State.ID,
-				StateName:    issue.State.Name,
-				Description:  description,
-				Priority:     issue.Priority,
-				DueDate:      deref(issue.DueDate),
-				Fingerprint:  extractFingerprint(description),
-				ManagedLabel: extractManagedLabel(description),
-				Labels:       labels,
+				ID:            issue.ID,
+				Identifier:    issue.Identifier,
+				Title:         issue.Title,
+				URL:           issue.URL,
+				StateID:       issue.State.ID,
+				StateName:     issue.State.Name,
+				Description:   description,
+				Priority:      issue.Priority,
+				DueDate:       deref(issue.DueDate),
+				Fingerprint:   extractFingerprint(description),
+				ManagedLabels: extractManagedLabels(description),
+				Labels:        labels,
 			}
 			issues = append(issues, existing)
 		}
@@ -473,14 +472,17 @@ func extractFingerprint(description string) string {
 	return ""
 }
 
-func extractManagedLabel(description string) string {
+func extractManagedLabels(description string) []string {
 	for line := range strings.SplitSeq(description, "\n") {
 		trimmed := strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(trimmed, "managed_labels:"); ok {
+			return splitManagedLabels(after)
+		}
 		if after, ok := strings.CutPrefix(trimmed, "managed_label:"); ok {
-			return strings.TrimSpace(after)
+			return splitManagedLabels(after)
 		}
 	}
-	return ""
+	return nil
 }
 
 func (c *Client) ensureStatesLoaded(ctx context.Context) error {
@@ -493,17 +495,23 @@ func (c *Client) ensureStatesLoaded(ctx context.Context) error {
 	return c.loadStates(ctx)
 }
 
-func (c *Client) loadManagedLabel(ctx context.Context) error {
-	managedLabel := strings.TrimSpace(c.cfg.Labels.Managed)
+func (c *Client) ensureManagedLabelsResolved(ctx context.Context, labels []string) error {
+	for _, label := range normalizeManagedLabelNames(labels) {
+		if err := c.resolveManagedLabel(ctx, label); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) error {
+	managedLabel = strings.TrimSpace(managedLabel)
 	if managedLabel == "" {
-		c.mu.Lock()
-		c.managedLabelID = ""
-		c.mu.Unlock()
 		return nil
 	}
 
 	c.mu.RLock()
-	if c.managedLabelID != "" {
+	if c.managedLabelIDs[normalizeLabelName(managedLabel)] != "" {
 		c.mu.RUnlock()
 		return nil
 	}
@@ -584,35 +592,38 @@ query managedIssueLabels($name: String!, $after: String) {
 	}
 
 	c.mu.Lock()
-	c.managedLabelID = resolved
+	c.managedLabelIDs[normalizeLabelName(managedLabel)] = resolved
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
-	if strings.TrimSpace(desired.ManagedLabel) == "" {
-		return nil
-	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.managedLabelID == "" {
-		return nil
+
+	out := make([]string, 0, len(desired.ManagedLabels))
+	for _, label := range normalizeManagedLabelNames(desired.ManagedLabels) {
+		id := c.managedLabelIDs[label]
+		if id == "" {
+			continue
+		}
+		out = append(out, id)
 	}
-	return []string{c.managedLabelID}
+	return out
 }
 
 func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue) ([]string, error) {
-	out := make([]string, 0, len(existing.Labels)+1)
-	seen := make(map[string]struct{}, len(existing.Labels)+1)
-	previousManaged := normalizeLabelName(existing.ManagedLabel)
-	desiredManaged := normalizeLabelName(desired.ManagedLabel)
+	desiredManaged := normalizeManagedLabelNames(desired.ManagedLabels)
+	out := make([]string, 0, len(existing.Labels)+len(desiredManaged))
+	seen := make(map[string]struct{}, len(existing.Labels)+len(desiredManaged))
+	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
+	for _, label := range normalizeManagedLabelNames(existing.ManagedLabels) {
+		previousManaged[label] = struct{}{}
+	}
 
 	for _, label := range existing.Labels {
 		normalized := normalizeLabelName(label.Name)
-		if previousManaged != "" && normalized == previousManaged {
-			continue
-		}
-		if desiredManaged != "" && normalized == desiredManaged {
+		if _, managed := previousManaged[normalized]; managed {
 			continue
 		}
 		if _, exists := seen[label.ID]; exists {
@@ -622,20 +633,53 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 		seen[label.ID] = struct{}{}
 	}
 
-	if desiredManaged == "" {
+	if len(desiredManaged) == 0 {
 		return out, nil
 	}
 
 	c.mu.RLock()
-	managedLabelID := c.managedLabelID
-	c.mu.RUnlock()
-	if managedLabelID == "" {
-		return nil, fmt.Errorf("managed Linear label %q was not resolved", desired.ManagedLabel)
-	}
-	if _, exists := seen[managedLabelID]; !exists {
+	defer c.mu.RUnlock()
+	for _, managedLabel := range desiredManaged {
+		managedLabelID := c.managedLabelIDs[managedLabel]
+		if managedLabelID == "" {
+			return nil, fmt.Errorf("managed Linear label %q was not resolved", managedLabel)
+		}
+		if _, exists := seen[managedLabelID]; exists {
+			continue
+		}
 		out = append(out, managedLabelID)
+		seen[managedLabelID] = struct{}{}
 	}
 	return out, nil
+}
+
+func splitManagedLabels(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return normalizeManagedLabelNames(out)
+}
+
+func managedLabelsFromDesiredIssues(desired []model.DesiredIssue) []string {
+	out := make([]string, 0, len(desired))
+	for _, issue := range desired {
+		out = append(out, issue.ManagedLabels...)
+	}
+	return normalizeManagedLabelNames(out)
+}
+
+func managedLabelsFromUpdates(updates []model.IssueUpdate) []string {
+	out := make([]string, 0, len(updates))
+	for _, update := range updates {
+		out = append(out, update.Desired.ManagedLabels...)
+	}
+	return normalizeManagedLabelNames(out)
 }
 
 func deref(value *string) string {
@@ -697,6 +741,31 @@ func stateType(state model.IssueState) string {
 
 func normalizeLabelName(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func normalizeManagedLabelNames(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := normalizeLabelName(value)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return out
 }
 
 func createIssuesMutation(size int) string {

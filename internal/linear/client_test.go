@@ -15,32 +15,38 @@ func TestDesiredLabelIDsReplacesPreviousManagedLabel(t *testing.T) {
 				Managed: "snyk-automation",
 			},
 		},
-		managedLabelID: "label-new",
+		managedLabelIDs: map[string]string{
+			"snyk-automation": "label-new",
+			"snyk-code":       "label-code",
+		},
 	}
 
 	existing := model.ExistingIssue{
-		ManagedLabel: "old-managed",
+		ManagedLabels: []string{"old-managed"},
 		Labels: []model.IssueLabel{
 			{ID: "label-unrelated", Name: "customer-visible"},
 			{ID: "label-old", Name: "old-managed"},
 		},
 	}
 	desired := model.DesiredIssue{
-		ManagedLabel: "snyk-automation",
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
 	}
 
 	labelIDs, err := client.desiredLabelIDs(existing, desired)
 	if err != nil {
 		t.Fatalf("desiredLabelIDs() error = %v", err)
 	}
-	if len(labelIDs) != 2 {
-		t.Fatalf("labelIDs len = %d, want 2", len(labelIDs))
+	if len(labelIDs) != 3 {
+		t.Fatalf("labelIDs len = %d, want 3", len(labelIDs))
 	}
 	if !containsString(labelIDs, "label-unrelated") {
 		t.Fatalf("labelIDs = %#v, want unrelated label preserved", labelIDs)
 	}
 	if !containsString(labelIDs, "label-new") {
 		t.Fatalf("labelIDs = %#v, want new managed label present", labelIDs)
+	}
+	if !containsString(labelIDs, "label-code") {
+		t.Fatalf("labelIDs = %#v, want tool label present", labelIDs)
 	}
 	if containsString(labelIDs, "label-old") {
 		t.Fatalf("labelIDs = %#v, want old managed label removed", labelIDs)
@@ -50,10 +56,11 @@ func TestDesiredLabelIDsReplacesPreviousManagedLabel(t *testing.T) {
 func TestDesiredLabelIDsRemovesManagedLabelWhenDisabled(t *testing.T) {
 	client := &Client{}
 	existing := model.ExistingIssue{
-		ManagedLabel: "snyk-automation",
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
 		Labels: []model.IssueLabel{
 			{ID: "label-unrelated", Name: "customer-visible"},
 			{ID: "label-managed", Name: "snyk-automation"},
+			{ID: "label-tool", Name: "snyk-code"},
 		},
 	}
 
@@ -67,12 +74,21 @@ func TestDesiredLabelIDsRemovesManagedLabelWhenDisabled(t *testing.T) {
 }
 
 func TestExtractFingerprintPrefersMetadataBlock(t *testing.T) {
-	description := "## Example\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_label: snyk-automation\n-->"
+	description := "## Example\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,snyk-code\n-->"
 
 	got := extractFingerprint(description)
 
 	if got != "snyk:project-a:issue-1" {
 		t.Fatalf("extractFingerprint() = %q, want %q", got, "snyk:project-a:issue-1")
+	}
+}
+
+func TestExtractManagedLabelsSupportsLegacyAndNewMetadata(t *testing.T) {
+	if got := extractManagedLabels("<!-- snyk-linear-sync\nmanaged_label: snyk-automation\n-->"); !slices.Equal(got, []string{"snyk-automation"}) {
+		t.Fatalf("extractManagedLabels(legacy) = %#v", got)
+	}
+	if got := extractManagedLabels("<!-- snyk-linear-sync\nmanaged_labels: snyk-automation,snyk-code\n-->"); !slices.Equal(got, []string{"snyk-automation", "snyk-code"}) {
+		t.Fatalf("extractManagedLabels(new) = %#v", got)
 	}
 }
 
