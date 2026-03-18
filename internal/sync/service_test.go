@@ -612,6 +612,28 @@ func TestManagedLabelsFallsBackToConfiguredDefault(t *testing.T) {
 	}
 }
 
+func TestManagedLabelsUsesConfiguredOriginMapping(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed: "snyk-automation",
+		Origin:  map[string]string{"kubernetes": "snyk-kubernetes", "github": "snyk-github"},
+	}, model.Finding{ProjectOrigin: "kubernetes"})
+
+	if len(labels) != 2 || labels[0] != "snyk-automation" || labels[1] != "snyk-kubernetes" {
+		t.Fatalf("managedLabels() = %#v, want [snyk-automation snyk-kubernetes]", labels)
+	}
+}
+
+func TestManagedLabelsFallsBackToConfiguredOriginDefault(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed:       "snyk-automation",
+		OriginDefault: "snyk-origin",
+	}, model.Finding{ProjectOrigin: "github"})
+
+	if len(labels) != 2 || labels[0] != "snyk-automation" || labels[1] != "snyk-origin" {
+		t.Fatalf("managedLabels() = %#v, want [snyk-automation snyk-origin]", labels)
+	}
+}
+
 func TestNeedsUpdateIncludesDueDate(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:       "title",

@@ -156,6 +156,16 @@ The configured label must already exist in Linear. If it does not, the run fails
 - default: `snyk-automation`
 - `off`: disables the fallback
 
+`LINEAR_ORIGIN_LABELS` optionally maps Snyk project `origin` values to additional managed Linear labels.
+
+- format: comma-separated `origin:label` pairs
+- example: `github:snyk-github,kubernetes:snyk-kubernetes`
+
+`LINEAR_ORIGIN_LABEL_DEFAULT` controls the fallback label for unmapped project origins.
+
+- default: `off`
+- `off`: disables the fallback
+
 The metadata block stores the full managed label set so the sync can remove stale tool-derived labels while preserving unrelated manual labels.
 
 ## State Mapping

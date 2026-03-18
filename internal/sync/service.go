@@ -891,7 +891,7 @@ func containsNormalizedLabel(labels []string, target string) bool {
 }
 
 func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string {
-	labels := make([]string, 0, 2)
+	labels := make([]string, 0, 3)
 	if managed := strings.TrimSpace(labelCfg.Managed); managed != "" {
 		labels = append(labels, managed)
 	}
@@ -901,6 +901,15 @@ func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string 
 		if mapped := strings.TrimSpace(labelCfg.Tool[issueType]); mapped != "" {
 			labels = append(labels, mapped)
 		} else if fallback := strings.TrimSpace(labelCfg.ToolDefault); fallback != "" {
+			labels = append(labels, fallback)
+		}
+	}
+
+	projectOrigin := strings.ToLower(strings.TrimSpace(finding.ProjectOrigin))
+	if projectOrigin != "" {
+		if mapped := strings.TrimSpace(labelCfg.Origin[projectOrigin]); mapped != "" {
+			labels = append(labels, mapped)
+		} else if fallback := strings.TrimSpace(labelCfg.OriginDefault); fallback != "" {
 			labels = append(labels, fallback)
 		}
 	}

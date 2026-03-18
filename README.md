@@ -196,7 +196,18 @@ If the configured label does not exist in Linear, the run fails with a clear mes
 - default: `snyk-automation`
 - set to `off` to disable the fallback
 
-When tool label mapping is enabled, the sync manages both the global automation label and the tool-derived label set recorded in the metadata block.
+`LINEAR_ORIGIN_LABELS` optionally maps Snyk project `origin` values to additional managed Linear labels:
+
+- format: comma-separated `origin:label` pairs
+- example: `github:snyk-github,kubernetes:snyk-kubernetes`
+- labels must already exist in Linear
+
+`LINEAR_ORIGIN_LABEL_DEFAULT` controls the fallback label for project origins without an explicit mapping:
+
+- default: `off`
+- set to another label name to apply a shared fallback origin label
+
+When tool or origin label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
 ## State Mapping
 
@@ -262,6 +273,8 @@ Optional:
 - `LINEAR_MANAGED_LABEL`
 - `LINEAR_TOOL_LABELS`
 - `LINEAR_TOOL_LABEL_DEFAULT`
+- `LINEAR_ORIGIN_LABELS`
+- `LINEAR_ORIGIN_LABEL_DEFAULT`
 - `LINEAR_DUE_DAYS_CRITICAL`
 - `LINEAR_DUE_DAYS_HIGH`
 - `LINEAR_DUE_DAYS_MEDIUM`

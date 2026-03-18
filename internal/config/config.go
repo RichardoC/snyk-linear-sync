@@ -78,9 +78,11 @@ type StateConfig struct {
 }
 
 type LabelConfig struct {
-	Managed     string
-	Tool        map[string]string
-	ToolDefault string
+	Managed       string
+	Tool          map[string]string
+	ToolDefault   string
+	Origin        map[string]string
+	OriginDefault string
 }
 
 type DueDateConfig struct {
@@ -114,7 +116,11 @@ func Load(args []string) (Config, error) {
 		}
 	}
 
-	toolLabels, err := parseToolLabelMap(os.Getenv("LINEAR_TOOL_LABELS"))
+	toolLabels, err := parseLabelMap("LINEAR_TOOL_LABELS", os.Getenv("LINEAR_TOOL_LABELS"))
+	if err != nil {
+		return Config{}, err
+	}
+	originLabels, err := parseLabelMap("LINEAR_ORIGIN_LABELS", os.Getenv("LINEAR_ORIGIN_LABELS"))
 	if err != nil {
 		return Config{}, err
 	}
@@ -148,9 +154,11 @@ func Load(args []string) (Config, error) {
 				Cancelled: getEnv("LINEAR_STATE_CANCELLED", defaultLinearCancelledState),
 			},
 			Labels: LabelConfig{
-				Managed:     normalizeManagedLabel(getEnv("LINEAR_MANAGED_LABEL", defaultManagedLabel)),
-				Tool:        toolLabels,
-				ToolDefault: normalizeManagedLabel(getEnv("LINEAR_TOOL_LABEL_DEFAULT", defaultManagedLabel)),
+				Managed:       normalizeManagedLabel(getEnv("LINEAR_MANAGED_LABEL", defaultManagedLabel)),
+				Tool:          toolLabels,
+				ToolDefault:   normalizeManagedLabel(getEnv("LINEAR_TOOL_LABEL_DEFAULT", defaultManagedLabel)),
+				Origin:        originLabels,
+				OriginDefault: normalizeManagedLabel(getEnv("LINEAR_ORIGIN_LABEL_DEFAULT", "")),
 			},
 			Due: DueDateConfig{
 				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
@@ -287,7 +295,7 @@ func normalizeManagedLabel(raw string) string {
 	}
 }
 
-func parseToolLabelMap(raw string) (map[string]string, error) {
+func parseLabelMap(envName, raw string) (map[string]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
@@ -302,16 +310,16 @@ func parseToolLabelMap(raw string) (map[string]string, error) {
 
 		issueType, label, ok := strings.Cut(part, ":")
 		if !ok {
-			return nil, fmt.Errorf("LINEAR_TOOL_LABELS entry %q must use issue_type:label format", part)
+			return nil, fmt.Errorf("%s entry %q must use key:label format", envName, part)
 		}
 
 		issueType = strings.ToLower(strings.TrimSpace(issueType))
 		label = normalizeManagedLabel(label)
 		if issueType == "" {
-			return nil, fmt.Errorf("LINEAR_TOOL_LABELS entry %q is missing the issue type", part)
+			return nil, fmt.Errorf("%s entry %q is missing the key", envName, part)
 		}
 		if label == "" {
-			return nil, fmt.Errorf("LINEAR_TOOL_LABELS entry %q is missing the label name", part)
+			return nil, fmt.Errorf("%s entry %q is missing the label name", envName, part)
 		}
 
 		out[issueType] = label

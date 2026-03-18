@@ -16,6 +16,8 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	t.Setenv("LINEAR_MANAGED_LABEL", "")
 	t.Setenv("LINEAR_TOOL_LABELS", "")
 	t.Setenv("LINEAR_TOOL_LABEL_DEFAULT", "")
+	t.Setenv("LINEAR_ORIGIN_LABELS", "")
+	t.Setenv("LINEAR_ORIGIN_LABEL_DEFAULT", "")
 
 	cfg, err := Load(nil)
 	if err != nil {
@@ -39,6 +41,12 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	}
 	if len(cfg.Linear.Labels.Tool) != 0 {
 		t.Fatalf("Tool labels = %#v, want empty", cfg.Linear.Labels.Tool)
+	}
+	if cfg.Linear.Labels.OriginDefault != "" {
+		t.Fatalf("Origin default label = %q, want empty", cfg.Linear.Labels.OriginDefault)
+	}
+	if len(cfg.Linear.Labels.Origin) != 0 {
+		t.Fatalf("Origin labels = %#v, want empty", cfg.Linear.Labels.Origin)
 	}
 	if cfg.Linear.Due.CriticalDays != defaultCriticalDueDays {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, defaultCriticalDueDays)
@@ -104,6 +112,8 @@ func TestLoadEnvFile(t *testing.T) {
 		"LINEAR_MANAGED_LABEL=off\n" +
 		"LINEAR_TOOL_LABELS=code:snyk-code, license:snyk-license\n" +
 		"LINEAR_TOOL_LABEL_DEFAULT=off\n" +
+		"LINEAR_ORIGIN_LABELS=github:snyk-github,kubernetes:snyk-kubernetes\n" +
+		"LINEAR_ORIGIN_LABEL_DEFAULT=off\n" +
 		"LINEAR_DUE_DAYS_CRITICAL=20\n" +
 		"SNYK_OAUTH_SCOPES='scope-a, scope-b'\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -139,6 +149,12 @@ func TestLoadEnvFile(t *testing.T) {
 	if cfg.Linear.Labels.Tool["code"] != "snyk-code" || cfg.Linear.Labels.Tool["license"] != "snyk-license" {
 		t.Fatalf("Tool labels = %#v, want code/license mappings", cfg.Linear.Labels.Tool)
 	}
+	if cfg.Linear.Labels.OriginDefault != "" {
+		t.Fatalf("Origin default label = %q, want empty", cfg.Linear.Labels.OriginDefault)
+	}
+	if cfg.Linear.Labels.Origin["github"] != "snyk-github" || cfg.Linear.Labels.Origin["kubernetes"] != "snyk-kubernetes" {
+		t.Fatalf("Origin labels = %#v, want github/kubernetes mappings", cfg.Linear.Labels.Origin)
+	}
 	if cfg.Linear.Due.CriticalDays != 20 {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, 20)
 	}
@@ -154,6 +170,19 @@ func TestLoadRejectsMalformedToolLabels(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "linear-key")
 	t.Setenv("LINEAR_TEAM_ID", "team-id")
 	t.Setenv("LINEAR_TOOL_LABELS", "code")
+
+	if _, err := Load(nil); err == nil {
+		t.Fatal("Load() error = nil, want parse error")
+	}
+}
+
+func TestLoadRejectsMalformedOriginLabels(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_ORIGIN_LABELS", "github")
 
 	if _, err := Load(nil); err == nil {
 		t.Fatal("Load() error = nil, want parse error")
