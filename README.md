@@ -1,6 +1,6 @@
 # snyk-linear-sync
 
-Sync Snyk findings into Linear issues.
+Sync Snyk findings with Linear issues since there isn't an official integration.
 
 Repo:
 
@@ -33,7 +33,7 @@ snyk:<project-id>:<issue-id>
 
 Quickstart without cloning:
 
-Create a local `.env`, then run directly from the repo path:
+Create a local `.env`, then run directly with the repo path:
 
 ```bash
 go run github.com/RichardoC/snyk-linear-sync/cmd/snyk-linear-sync@latest --env-file .env --dry-run
