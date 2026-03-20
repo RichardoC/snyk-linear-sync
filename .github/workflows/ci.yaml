@@ -55,7 +55,7 @@ jobs:
 
       - name: Verify formatting
         run: |
-          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './.tools/*'))
+          unformatted=$(go list -f '{{.Dir}}' ./... | xargs -r gofmt -l)
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt-formatted:"
             echo "$unformatted"
