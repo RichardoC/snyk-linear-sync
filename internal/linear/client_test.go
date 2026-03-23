@@ -1,6 +1,7 @@
 package linear
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 
@@ -89,6 +90,43 @@ func TestExtractManagedLabelsSupportsLegacyAndNewMetadata(t *testing.T) {
 	}
 	if got := extractManagedLabels("<!-- snyk-linear-sync\nmanaged_labels: snyk-automation,snyk-code\n-->"); !slices.Equal(got, []string{"snyk-automation", "snyk-code"}) {
 		t.Fatalf("extractManagedLabels(new) = %#v", got)
+	}
+}
+
+func TestActorSubscriberIDsForCreateEnabledEncodesEmptyList(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			UnsubscribeActor: true,
+		},
+	}
+
+	input := issueCreateInput{
+		SubscriberIds: client.actorSubscriberIDsForCreate(),
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if string(raw) != `{"subscriberIds":[],"teamId":""}` {
+		t.Fatalf("json.Marshal() = %s, want subscriberIds empty list", raw)
+	}
+}
+
+func TestSubscriberIDsForUpdatePreservesCurrentSubscribers(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			UnsubscribeActor: true,
+		},
+	}
+
+	got := client.subscriberIDsForUpdate(model.ExistingIssue{
+		SubscriberIDs: []string{"viewer-1", "user-2", "", "user-3"},
+	})
+	if got == nil {
+		t.Fatal("subscriberIDsForUpdate() = nil, want non-nil")
+	}
+	if !slices.Equal(*got, []string{"viewer-1", "user-2", "user-3"}) {
+		t.Fatalf("subscriberIDsForUpdate() = %#v, want current subscribers preserved", *got)
 	}
 }
 

@@ -209,6 +209,12 @@ If the configured label does not exist in Linear, the run fails with a clear mes
 
 When tool or origin label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
+`LINEAR_UNSUBSCRIBE_ACTOR` controls whether the Linear API actor should be kept off the subscriber list for managed issue creates and updates:
+
+- default: `true`
+- `true`: create issues without subscribing the actor, and preserve the current subscriber list unchanged on updates
+- `false`: let Linear use its default subscriber behavior
+
 ## State Mapping
 
 - open -> `Todo`

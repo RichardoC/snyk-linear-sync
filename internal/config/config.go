@@ -63,11 +63,12 @@ type SourceConfig struct {
 }
 
 type LinearConfig struct {
-	APIKey string
-	TeamID string
-	States StateConfig
-	Labels LabelConfig
-	Due    DueDateConfig
+	APIKey           string
+	TeamID           string
+	UnsubscribeActor bool
+	States           StateConfig
+	Labels           LabelConfig
+	Due              DueDateConfig
 }
 
 type StateConfig struct {
@@ -145,8 +146,9 @@ func Load(args []string) (Config, error) {
 			Provider: normalizeSourceProvider(getEnv("SOURCE_PROVIDER", defaultSourceProvider)),
 		},
 		Linear: LinearConfig{
-			APIKey: os.Getenv("LINEAR_API_KEY"),
-			TeamID: os.Getenv("LINEAR_TEAM_ID"),
+			APIKey:           os.Getenv("LINEAR_API_KEY"),
+			TeamID:           os.Getenv("LINEAR_TEAM_ID"),
+			UnsubscribeActor: getEnvBool("LINEAR_UNSUBSCRIBE_ACTOR", true),
 			States: StateConfig{
 				Todo:      getEnv("LINEAR_STATE_TODO", defaultLinearTodoState),
 				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
@@ -258,6 +260,20 @@ func getEnvInt(key string, fallback int) int {
 	}
 
 	return n
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+
+	return v
 }
 
 func splitCSV(raw string) []string {

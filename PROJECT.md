@@ -168,6 +168,12 @@ The configured label must already exist in Linear. If it does not, the run fails
 
 The metadata block stores the full managed label set so the sync can remove stale tool-derived labels while preserving unrelated manual labels.
 
+`LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification behavior.
+
+- default: `true`
+- when enabled, the sync creates issues without subscribing the Linear API actor
+- update operations preserve the current subscriber list exactly as it already exists
+
 ## State Mapping
 
 The current workflow mapping is:

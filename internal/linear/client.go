@@ -119,14 +119,15 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 		title := issue.Title
 		description := issue.Description
 		priority := int32(issue.Priority)
-		input := linearapi.IssueCreateInput{
-			Title:       &title,
-			Description: &description,
-			TeamId:      c.teamID(),
-			StateId:     &stateID,
-			Priority:    &priority,
-			LabelIds:    c.createLabelIDs(issue),
-			DueDate:     timelessDatePtr(issue.DueDate),
+		input := issueCreateInput{
+			Title:         &title,
+			Description:   &description,
+			TeamId:        c.teamID(),
+			StateId:       &stateID,
+			Priority:      &priority,
+			SubscriberIds: c.actorSubscriberIDsForCreate(),
+			LabelIds:      c.createLabelIDs(issue),
+			DueDate:       stringOrNil(issue.DueDate),
 		}
 		op.Var(fmt.Sprintf("input%d", i), input)
 	}
@@ -179,13 +180,14 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		if err != nil {
 			return err
 		}
-		input := linearapi.IssueUpdateInput{
-			Title:       &title,
-			Description: &description,
-			StateId:     &stateID,
-			Priority:    &priority,
-			LabelIds:    labelIDs,
-			DueDate:     timelessDatePtr(update.Desired.DueDate),
+		input := issueUpdateInput{
+			Title:         &title,
+			Description:   &description,
+			StateId:       &stateID,
+			Priority:      &priority,
+			SubscriberIds: c.subscriberIDsForUpdate(update.Existing),
+			LabelIds:      labelIDs,
+			DueDate:       stringOrNil(update.Desired.DueDate),
 		}
 		op.Var(fmt.Sprintf("id%d", i), update.Existing.ID)
 		op.Var(fmt.Sprintf("input%d", i), input)
@@ -315,6 +317,11 @@ query existingIssues($filter: IssueFilter!, $after: String) {
           name
         }
       }
+      subscribers(first: 100) {
+        nodes {
+          id
+        }
+      }
     }
     pageInfo {
       hasNextPage
@@ -345,6 +352,11 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 							Name string `json:"name"`
 						} `json:"nodes"`
 					} `json:"labels"`
+					Subscribers struct {
+						Nodes []struct {
+							ID string `json:"id"`
+						} `json:"nodes"`
+					} `json:"subscribers"`
 				} `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool    `json:"hasNextPage"`
@@ -365,6 +377,13 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 					Name: label.Name,
 				})
 			}
+			subscriberIDs := make([]string, 0, len(issue.Subscribers.Nodes))
+			for _, subscriber := range issue.Subscribers.Nodes {
+				if strings.TrimSpace(subscriber.ID) == "" {
+					continue
+				}
+				subscriberIDs = append(subscriberIDs, subscriber.ID)
+			}
 			existing := model.ExistingIssue{
 				ID:            issue.ID,
 				Identifier:    issue.Identifier,
@@ -377,6 +396,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 				DueDate:       deref(issue.DueDate),
 				Fingerprint:   extractFingerprint(description),
 				ManagedLabels: extractManagedLabels(description),
+				SubscriberIDs: subscriberIDs,
 				Labels:        labels,
 			}
 			issues = append(issues, existing)
@@ -439,6 +459,51 @@ query resolveTeam($key: String!) {
 	c.resolvedTeam = resp.Teams.Nodes[0].ID
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Client) actorSubscriberIDsForCreate() *[]string {
+	if !c.cfg.UnsubscribeActor {
+		return nil
+	}
+	ids := []string{}
+	return &ids
+}
+
+func (c *Client) subscriberIDsForUpdate(existing model.ExistingIssue) *[]string {
+	if !c.cfg.UnsubscribeActor {
+		return nil
+	}
+
+	ids := make([]string, 0, len(existing.SubscriberIDs))
+	for _, subscriberID := range existing.SubscriberIDs {
+		subscriberID = strings.TrimSpace(subscriberID)
+		if subscriberID == "" {
+			continue
+		}
+		ids = append(ids, subscriberID)
+	}
+	return &ids
+}
+
+type issueCreateInput struct {
+	Title         *string   `json:"title,omitempty"`
+	Description   *string   `json:"description,omitempty"`
+	Priority      *int32    `json:"priority,omitempty"`
+	SubscriberIds *[]string `json:"subscriberIds,omitempty"`
+	LabelIds      []string  `json:"labelIds,omitempty"`
+	TeamId        string    `json:"teamId"`
+	StateId       *string   `json:"stateId,omitempty"`
+	DueDate       *string   `json:"dueDate,omitempty"`
+}
+
+type issueUpdateInput struct {
+	Title         *string   `json:"title,omitempty"`
+	Description   *string   `json:"description,omitempty"`
+	Priority      *int32    `json:"priority,omitempty"`
+	SubscriberIds *[]string `json:"subscriberIds,omitempty"`
+	LabelIds      []string  `json:"labelIds,omitempty"`
+	StateId       *string   `json:"stateId,omitempty"`
+	DueDate       *string   `json:"dueDate,omitempty"`
 }
 
 func (c *Client) teamID() string {
@@ -692,6 +757,13 @@ func deref(value *string) string {
 //go:fix inline
 func stringPtr(value string) *string {
 	return new(value)
+}
+
+func stringOrNil(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return &value
 }
 
 func timelessDatePtr(value string) *linearapi.TimelessDate {

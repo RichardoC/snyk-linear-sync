@@ -36,6 +36,9 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if cfg.Linear.Labels.Managed != defaultManagedLabel {
 		t.Fatalf("Managed label = %q, want %q", cfg.Linear.Labels.Managed, defaultManagedLabel)
 	}
+	if !cfg.Linear.UnsubscribeActor {
+		t.Fatal("UnsubscribeActor = false, want true")
+	}
 	if cfg.Linear.Labels.ToolDefault != defaultManagedLabel {
 		t.Fatalf("Tool default label = %q, want %q", cfg.Linear.Labels.ToolDefault, defaultManagedLabel)
 	}
@@ -110,6 +113,7 @@ func TestLoadEnvFile(t *testing.T) {
 		"LINEAR_TEAM_ID=team-id\n" +
 		"SOURCE_PROVIDER=github\n" +
 		"LINEAR_MANAGED_LABEL=off\n" +
+		"LINEAR_UNSUBSCRIBE_ACTOR=true\n" +
 		"LINEAR_TOOL_LABELS=code:snyk-code, license:snyk-license\n" +
 		"LINEAR_TOOL_LABEL_DEFAULT=off\n" +
 		"LINEAR_ORIGIN_LABELS=github:snyk-github,kubernetes:snyk-kubernetes\n" +
@@ -142,6 +146,9 @@ func TestLoadEnvFile(t *testing.T) {
 	}
 	if cfg.Linear.Labels.Managed != "" {
 		t.Fatalf("Managed label = %q, want empty", cfg.Linear.Labels.Managed)
+	}
+	if !cfg.Linear.UnsubscribeActor {
+		t.Fatal("UnsubscribeActor = false, want true")
 	}
 	if cfg.Linear.Labels.ToolDefault != "" {
 		t.Fatalf("Tool default label = %q, want empty", cfg.Linear.Labels.ToolDefault)
