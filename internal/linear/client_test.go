@@ -179,6 +179,11 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 						t.Fatalf("create subscriberIds = %#v, want empty list", subscriberIDs)
 					}
 					return jsonResponse(t, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"ENG-1"}}}}`), nil
+				case strings.Contains(payload.Query, "mutation issueUnsubscribeBatch"):
+					if got := payload.Variables["id0"]; got != "issue-1" {
+						t.Fatalf("issueUnsubscribe id0 = %#v, want issue-1", got)
+					}
+					return jsonResponse(t, `{"data":{"issueUnsubscribe0":{"success":true}}}`), nil
 				case strings.Contains(payload.Query, "query viewer"):
 					return jsonResponse(t, `{"data":{"viewer":{"id":"actor-1"}}}`), nil
 				case strings.Contains(payload.Query, "query issueSubscribers"):
@@ -215,8 +220,8 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 		t.Fatalf("CreateIssues() error = %v", err)
 	}
 
-	if len(requests) != 4 {
-		t.Fatalf("request count = %d, want 4", len(requests))
+	if len(requests) != 5 {
+		t.Fatalf("request count = %d, want 5", len(requests))
 	}
 }
 

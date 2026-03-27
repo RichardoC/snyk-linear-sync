@@ -149,6 +149,9 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 			return fmt.Errorf("create Linear issues failed without GraphQL error for %s", alias)
 		}
 	}
+	if err := c.issueUnsubscribeCreatedIssues(ctx, resp); err != nil {
+		return err
+	}
 	if err := c.unsubscribeActorFromCreatedIssues(ctx, resp); err != nil {
 		return err
 	}
@@ -566,6 +569,46 @@ func (c *Client) unsubscribeActorFromCreatedIssues(ctx context.Context, created 
 	for alias, result := range resp {
 		if !result.Success {
 			return fmt.Errorf("remove Linear actor from created issue subscribers failed without GraphQL error for %s", alias)
+		}
+	}
+	return nil
+}
+
+func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[string]struct {
+	Success bool `json:"success"`
+	Issue   struct {
+		ID         string `json:"id"`
+		Identifier string `json:"identifier"`
+	} `json:"issue"`
+}) error {
+	if !c.cfg.UnsubscribeActor || len(created) == 0 {
+		return nil
+	}
+
+	issueIDs := make([]string, 0, len(created))
+	for _, result := range created {
+		if id := strings.TrimSpace(result.Issue.ID); id != "" {
+			issueIDs = append(issueIDs, id)
+		}
+	}
+	if len(issueIDs) == 0 {
+		return nil
+	}
+
+	op := gqlclient.NewOperation(issueUnsubscribeMutation(len(issueIDs)))
+	for i, issueID := range issueIDs {
+		op.Var(fmt.Sprintf("id%d", i), issueID)
+	}
+
+	resp := map[string]struct {
+		Success bool `json:"success"`
+	}{}
+	if err := c.execute(ctx, op, &resp); err != nil {
+		return fmt.Errorf("issue-unsubscribe Linear actor from created issues: %w", err)
+	}
+	for alias, result := range resp {
+		if !result.Success {
+			return fmt.Errorf("issue-unsubscribe Linear actor from created issues failed without GraphQL error for %s", alias)
 		}
 	}
 	return nil
@@ -1062,6 +1105,25 @@ func issueSubscribersQuery(size int) string {
 		builder.WriteString("        id\n")
 		builder.WriteString("      }\n")
 		builder.WriteString("    }\n")
+		builder.WriteString("  }\n")
+	}
+	builder.WriteString("}")
+	return builder.String()
+}
+
+func issueUnsubscribeMutation(size int) string {
+	var builder strings.Builder
+	builder.WriteString("mutation issueUnsubscribeBatch(")
+	for i := range size {
+		if i > 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(fmt.Sprintf("$id%d: String!", i))
+	}
+	builder.WriteString(") {\n")
+	for i := range size {
+		builder.WriteString(fmt.Sprintf("  issueUnsubscribe%d: issueUnsubscribe(id: $id%d) {\n", i, i))
+		builder.WriteString("    success\n")
 		builder.WriteString("  }\n")
 	}
 	builder.WriteString("}")

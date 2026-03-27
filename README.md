@@ -215,6 +215,8 @@ When tool or origin label mapping is enabled, the sync manages the global automa
 - `true`: create issues without subscribing the actor, and preserve the current subscriber list unchanged on updates
 - `false`: let Linear use its default subscriber behavior
 
+This setting only controls the issue subscriber list. Linear will still record the API user as the issue creator, and the create mutation response may briefly include that creator in `subscribers` even when the persisted issue subscriber list is empty after a refresh.
+
 ## State Mapping
 
 - open -> `Todo`

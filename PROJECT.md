@@ -174,6 +174,8 @@ The metadata block stores the full managed label set so the sync can remove stal
 - when enabled, the sync creates issues without subscribing the Linear API actor
 - update operations preserve the current subscriber list exactly as it already exists
 
+This only affects the persisted subscriber list. Linear still records the API user as the issue creator, which is separate from `subscribers` and can make the UI look like the creator is still "following" the issue even when the stored subscriber list is empty.
+
 ## State Mapping
 
 The current workflow mapping is:
