@@ -10,7 +10,7 @@ require (
 	github.com/pavel-snyk/snyk-sdk-go/v2 v2.0.0-20260301004312-50b140348e2a
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.20.0
-	modernc.org/sqlite v1.47.0
+	modernc.org/sqlite v1.48.0
 )
 
 require (
