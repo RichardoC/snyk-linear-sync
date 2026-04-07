@@ -28,8 +28,8 @@ type Client struct {
 	gql *gqlclient.Client
 	log *slog.Logger
 
-	mu           sync.RWMutex
-	resolvedTeam string
+	mu              sync.RWMutex
+	resolvedTeam    string
 	statesByName    map[string]string
 	statesByType    map[string]string
 	managedLabelIDs map[string]string

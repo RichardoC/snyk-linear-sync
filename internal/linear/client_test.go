@@ -124,11 +124,11 @@ func TestActorSubscriberIDsForCreateEnabledEncodesEmptyList(t *testing.T) {
 // type does not have a subscriberIds field; sending it causes an Argument Validation Error.
 func TestIssueUpdateInputNeverContainsSubscriberIds(t *testing.T) {
 	input := issueUpdateInput{
-		Title:       strPtr("title"),
-		Description: strPtr("body"),
-		StateId:     strPtr("state-1"),
+		Title:       new("title"),
+		Description: new("body"),
+		StateId:     new("state-1"),
 		LabelIds:    []string{"label-1"},
-		DueDate:     strPtr("2026-04-07"),
+		DueDate:     new("2026-04-07"),
 	}
 	raw, err := json.Marshal(input)
 	if err != nil {
@@ -139,7 +139,8 @@ func TestIssueUpdateInputNeverContainsSubscriberIds(t *testing.T) {
 	}
 }
 
-func strPtr(s string) *string { return &s }
+//go:fix inline
+func strPtr(s string) *string { return new(s) }
 
 // TestUpdateIssuesDoesNotSendSubscriberIdsInPayload verifies that UpdateIssues never
 // includes subscriberIds in the GraphQL mutation variables, even when UnsubscribeActor is true.

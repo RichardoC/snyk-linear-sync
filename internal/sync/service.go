@@ -52,14 +52,14 @@ var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
-	Findings             int
-	ExistingIssues       int
-	Conflicts            int
-	PlannedCreates       int64
-	PlannedUpdates       int64
-	PlannedResolves      int64
-	CancelledDuplicates  int64
-	FailedOps            int64
+	Findings            int
+	ExistingIssues      int
+	Conflicts           int
+	PlannedCreates      int64
+	PlannedUpdates      int64
+	PlannedResolves     int64
+	CancelledDuplicates int64
+	FailedOps           int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearClient, cacheStore CacheStore) *Service {
@@ -317,9 +317,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 type jobKind string
 
 const (
-	jobCreateBatch    jobKind = "create"
-	jobUpdate         jobKind = "update"
-	jobResolve        jobKind = "resolve"
+	jobCreateBatch     jobKind = "create"
+	jobUpdate          jobKind = "update"
+	jobResolve         jobKind = "resolve"
 	jobCancelDuplicate jobKind = "cancel-duplicate"
 )
 
