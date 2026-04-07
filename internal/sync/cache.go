@@ -9,7 +9,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-03-18-managed-label-sets-v1"
+const metadataSchemaVersion = "2026-04-07-remove-subscriber-ids-from-update-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion

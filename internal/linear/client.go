@@ -28,9 +28,8 @@ type Client struct {
 	gql *gqlclient.Client
 	log *slog.Logger
 
-	mu              sync.RWMutex
-	viewerID        string
-	resolvedTeam    string
+	mu           sync.RWMutex
+	resolvedTeam string
 	statesByName    map[string]string
 	statesByType    map[string]string
 	managedLabelIDs map[string]string
@@ -152,9 +151,6 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	if err := c.issueUnsubscribeCreatedIssues(ctx, resp); err != nil {
 		return err
 	}
-	if err := c.unsubscribeActorFromCreatedIssues(ctx, resp); err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -188,13 +184,12 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 			return err
 		}
 		input := issueUpdateInput{
-			Title:         &title,
-			Description:   &description,
-			StateId:       &stateID,
-			Priority:      &priority,
-			SubscriberIds: c.subscriberIDsForUpdate(update.Existing),
-			LabelIds:      labelIDs,
-			DueDate:       stringOrNil(update.Desired.DueDate),
+			Title:       &title,
+			Description: &description,
+			StateId:     &stateID,
+			Priority:    &priority,
+			LabelIds:    labelIDs,
+			DueDate:     stringOrNil(update.Desired.DueDate),
 		}
 		op.Var(fmt.Sprintf("id%d", i), update.Existing.ID)
 		op.Var(fmt.Sprintf("input%d", i), input)
@@ -468,112 +463,6 @@ query resolveTeam($key: String!) {
 	return nil
 }
 
-func (c *Client) viewer(ctx context.Context) (string, error) {
-	c.mu.RLock()
-	if c.viewerID != "" {
-		defer c.mu.RUnlock()
-		return c.viewerID, nil
-	}
-	c.mu.RUnlock()
-
-	op := gqlclient.NewOperation(`
-query viewer {
-  viewer {
-    id
-  }
-}`)
-
-	var resp struct {
-		Viewer struct {
-			ID string `json:"id"`
-		} `json:"viewer"`
-	}
-	if err := c.execute(ctx, op, &resp); err != nil {
-		return "", fmt.Errorf("fetch Linear viewer: %w", err)
-	}
-	if strings.TrimSpace(resp.Viewer.ID) == "" {
-		return "", fmt.Errorf("fetch Linear viewer: empty viewer id")
-	}
-
-	c.mu.Lock()
-	c.viewerID = resp.Viewer.ID
-	c.mu.Unlock()
-	return resp.Viewer.ID, nil
-}
-
-func (c *Client) unsubscribeActorFromCreatedIssues(ctx context.Context, created map[string]struct {
-	Success bool `json:"success"`
-	Issue   struct {
-		ID         string `json:"id"`
-		Identifier string `json:"identifier"`
-	} `json:"issue"`
-}) error {
-	if !c.cfg.UnsubscribeActor || len(created) == 0 {
-		return nil
-	}
-
-	actorID, err := c.viewer(ctx)
-	if err != nil {
-		return err
-	}
-
-	issueIDs := make([]string, 0, len(created))
-	for _, result := range created {
-		if id := strings.TrimSpace(result.Issue.ID); id != "" {
-			issueIDs = append(issueIDs, id)
-		}
-	}
-	if len(issueIDs) == 0 {
-		return nil
-	}
-
-	subscriberIDsByIssue, err := c.loadSubscriberIDsByIssue(ctx, issueIDs)
-	if err != nil {
-		return fmt.Errorf("load created issue subscribers: %w", err)
-	}
-
-	type subscriberUpdate struct {
-		issueID       string
-		subscriberIDs []string
-	}
-	updates := make([]subscriberUpdate, 0, len(issueIDs))
-	for _, issueID := range issueIDs {
-		subscriberIDs, removedActor := sanitizeSubscriberIDs(subscriberIDsByIssue[issueID], actorID)
-		if !removedActor {
-			continue
-		}
-		updates = append(updates, subscriberUpdate{
-			issueID:       issueID,
-			subscriberIDs: subscriberIDs,
-		})
-	}
-	if len(updates) == 0 {
-		return nil
-	}
-
-	op := gqlclient.NewOperation(updateIssuesMutation(len(updates)))
-	for i, update := range updates {
-		input := issueUpdateInput{
-			SubscriberIds: subscriberIDsPtr(update.subscriberIDs),
-		}
-		op.Var(fmt.Sprintf("id%d", i), update.issueID)
-		op.Var(fmt.Sprintf("input%d", i), input)
-	}
-
-	resp := map[string]struct {
-		Success bool `json:"success"`
-	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
-		return fmt.Errorf("remove Linear actor from created issue subscribers: %w", err)
-	}
-	for alias, result := range resp {
-		if !result.Success {
-			return fmt.Errorf("remove Linear actor from created issue subscribers failed without GraphQL error for %s", alias)
-		}
-	}
-	return nil
-}
-
 func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[string]struct {
 	Success bool `json:"success"`
 	Issue   struct {
@@ -614,53 +503,12 @@ func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[
 	return nil
 }
 
-func (c *Client) loadSubscriberIDsByIssue(ctx context.Context, issueIDs []string) (map[string][]string, error) {
-	op := gqlclient.NewOperation(issueSubscribersQuery(len(issueIDs)))
-	for i, issueID := range issueIDs {
-		op.Var(fmt.Sprintf("id%d", i), issueID)
-	}
-
-	var resp map[string]struct {
-		ID          string `json:"id"`
-		Subscribers struct {
-			Nodes []struct {
-				ID string `json:"id"`
-			} `json:"nodes"`
-		} `json:"subscribers"`
-	}
-	if err := c.execute(ctx, op, &resp); err != nil {
-		return nil, err
-	}
-
-	out := make(map[string][]string, len(resp))
-	for _, issue := range resp {
-		ids, _ := sanitizeSubscriberIDs(func() []string {
-			out := make([]string, 0, len(issue.Subscribers.Nodes))
-			for _, subscriber := range issue.Subscribers.Nodes {
-				out = append(out, subscriber.ID)
-			}
-			return out
-		}(), "")
-		out[issue.ID] = ids
-	}
-	return out, nil
-}
-
 func (c *Client) actorSubscriberIDsForCreate() *[]string {
 	if !c.cfg.UnsubscribeActor {
 		return nil
 	}
 	ids := []string{}
 	return &ids
-}
-
-func (c *Client) subscriberIDsForUpdate(existing model.ExistingIssue) *[]string {
-	if !c.cfg.UnsubscribeActor {
-		return nil
-	}
-
-	ids, _ := sanitizeSubscriberIDs(existing.SubscriberIDs, "")
-	return subscriberIDsPtr(ids)
 }
 
 type issueCreateInput struct {
@@ -675,40 +523,12 @@ type issueCreateInput struct {
 }
 
 type issueUpdateInput struct {
-	Title         *string   `json:"title,omitempty"`
-	Description   *string   `json:"description,omitempty"`
-	Priority      *int32    `json:"priority,omitempty"`
-	SubscriberIds *[]string `json:"subscriberIds,omitempty"`
-	LabelIds      []string  `json:"labelIds,omitempty"`
-	StateId       *string   `json:"stateId,omitempty"`
-	DueDate       *string   `json:"dueDate,omitempty"`
-}
-
-func sanitizeSubscriberIDs(subscriberIDs []string, excludeID string) ([]string, bool) {
-	out := make([]string, 0, len(subscriberIDs))
-	seen := make(map[string]struct{}, len(subscriberIDs))
-	removedExcluded := false
-	for _, subscriberID := range subscriberIDs {
-		subscriberID = strings.TrimSpace(subscriberID)
-		if subscriberID == "" {
-			continue
-		}
-		if excludeID != "" && subscriberID == excludeID {
-			removedExcluded = true
-			continue
-		}
-		if _, exists := seen[subscriberID]; exists {
-			continue
-		}
-		seen[subscriberID] = struct{}{}
-		out = append(out, subscriberID)
-	}
-	return out, removedExcluded
-}
-
-func subscriberIDsPtr(subscriberIDs []string) *[]string {
-	ids := append([]string(nil), subscriberIDs...)
-	return &ids
+	Title       *string  `json:"title,omitempty"`
+	Description *string  `json:"description,omitempty"`
+	Priority    *int32   `json:"priority,omitempty"`
+	LabelIds    []string `json:"labelIds,omitempty"`
+	StateId     *string  `json:"stateId,omitempty"`
+	DueDate     *string  `json:"dueDate,omitempty"`
 }
 
 func (c *Client) teamID() string {
@@ -1081,30 +901,6 @@ func updateIssuesMutation(size int) string {
 	for i := range size {
 		builder.WriteString(fmt.Sprintf("  issueUpdate%d: issueUpdate(id: $id%d, input: $input%d) {\n", i, i, i))
 		builder.WriteString("    success\n")
-		builder.WriteString("  }\n")
-	}
-	builder.WriteString("}")
-	return builder.String()
-}
-
-func issueSubscribersQuery(size int) string {
-	var builder strings.Builder
-	builder.WriteString("query issueSubscribers(")
-	for i := range size {
-		if i > 0 {
-			builder.WriteString(", ")
-		}
-		builder.WriteString(fmt.Sprintf("$id%d: String!", i))
-	}
-	builder.WriteString(") {\n")
-	for i := range size {
-		builder.WriteString(fmt.Sprintf("  issue%d: issue(id: $id%d) {\n", i, i))
-		builder.WriteString("    id\n")
-		builder.WriteString("    subscribers(first: 100) {\n")
-		builder.WriteString("      nodes {\n")
-		builder.WriteString("        id\n")
-		builder.WriteString("      }\n")
-		builder.WriteString("    }\n")
 		builder.WriteString("  }\n")
 	}
 	builder.WriteString("}")

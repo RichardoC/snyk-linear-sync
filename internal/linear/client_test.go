@@ -119,21 +119,138 @@ func TestActorSubscriberIDsForCreateEnabledEncodesEmptyList(t *testing.T) {
 	}
 }
 
-func TestSubscriberIDsForUpdatePreservesCurrentSubscribers(t *testing.T) {
+// TestIssueUpdateInputNeverContainsSubscriberIds guards against regressions where
+// subscriberIds is added back to issueUpdateInput. Linear's IssueUpdateInput GraphQL
+// type does not have a subscriberIds field; sending it causes an Argument Validation Error.
+func TestIssueUpdateInputNeverContainsSubscriberIds(t *testing.T) {
+	input := issueUpdateInput{
+		Title:       strPtr("title"),
+		Description: strPtr("body"),
+		StateId:     strPtr("state-1"),
+		LabelIds:    []string{"label-1"},
+		DueDate:     strPtr("2026-04-07"),
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(raw), "subscriberIds") || strings.Contains(string(raw), "subscriberId") {
+		t.Fatalf("issueUpdateInput JSON must not contain subscriberIds, got: %s", raw)
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+// TestUpdateIssuesDoesNotSendSubscriberIdsInPayload verifies that UpdateIssues never
+// includes subscriberIds in the GraphQL mutation variables, even when UnsubscribeActor is true.
+func TestUpdateIssuesDoesNotSendSubscriberIdsInPayload(t *testing.T) {
 	client := &Client{
 		cfg: config.LinearConfig{
+			TeamID:           "team-1",
 			UnsubscribeActor: true,
+			States: config.StateConfig{
+				Todo: "Todo",
+			},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					for key, val := range payload.Variables {
+						if !strings.HasPrefix(key, "input") {
+							continue
+						}
+						input, ok := val.(map[string]any)
+						if !ok {
+							continue
+						}
+						if _, has := input["subscriberIds"]; has {
+							t.Fatalf("issueUpdate mutation must not include subscriberIds in %s, got: %#v", key, input)
+						}
+					}
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-1"},
+		statesByType: map[string]string{"unstarted": "state-1"},
+		managedLabelIDs: map[string]string{
+			"snyk-automation": "label-1",
 		},
 	}
 
-	got := client.subscriberIDsForUpdate(model.ExistingIssue{
-		SubscriberIDs: []string{"viewer-1", "user-2", "", "user-3"},
-	})
-	if got == nil {
-		t.Fatal("subscriberIDsForUpdate() = nil, want non-nil")
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{
+			ID:            "issue-1",
+			Identifier:    "SNYK-1",
+			SubscriberIDs: []string{"user-1", "user-2"},
+			ManagedLabels: []string{"snyk-automation"},
+			Labels:        []model.IssueLabel{{ID: "label-1", Name: "snyk-automation"}},
+		},
+		Desired: model.DesiredIssue{
+			Fingerprint:   "snyk:proj-1:issue-1",
+			Title:         "Snyk: updated title",
+			Description:   "updated body",
+			State:         model.StateTodo,
+			ManagedLabels: []string{"snyk-automation"},
+			Priority:      2,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
 	}
-	if !slices.Equal(*got, []string{"viewer-1", "user-2", "user-3"}) {
-		t.Fatalf("subscriberIDsForUpdate() = %#v, want current subscribers preserved", *got)
+}
+
+// TestDesiredLabelIDsPreservesManuallyAddedLabels verifies that labels added manually
+// (not tracked in managed_labels metadata) are preserved when an issue is updated.
+func TestDesiredLabelIDsPreservesManuallyAddedLabels(t *testing.T) {
+	client := &Client{
+		managedLabelIDs: map[string]string{
+			"snyk-automation": "label-managed",
+		},
+	}
+
+	existing := model.ExistingIssue{
+		ManagedLabels: []string{"snyk-automation"},
+		Labels: []model.IssueLabel{
+			{ID: "label-managed", Name: "snyk-automation"},
+			{ID: "label-manual-1", Name: "needs-review"},
+			{ID: "label-manual-2", Name: "team-platform"},
+		},
+	}
+	desired := model.DesiredIssue{
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if !containsString(labelIDs, "label-manual-1") {
+		t.Fatalf("labelIDs = %#v, want manually-added label 'needs-review' preserved", labelIDs)
+	}
+	if !containsString(labelIDs, "label-manual-2") {
+		t.Fatalf("labelIDs = %#v, want manually-added label 'team-platform' preserved", labelIDs)
+	}
+	if !containsString(labelIDs, "label-managed") {
+		t.Fatalf("labelIDs = %#v, want managed label preserved", labelIDs)
+	}
+	if len(labelIDs) != 3 {
+		t.Fatalf("labelIDs len = %d, want 3", len(labelIDs))
 	}
 }
 
@@ -184,19 +301,6 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 						t.Fatalf("issueUnsubscribe id0 = %#v, want issue-1", got)
 					}
 					return jsonResponse(t, `{"data":{"issueUnsubscribe0":{"success":true}}}`), nil
-				case strings.Contains(payload.Query, "query viewer"):
-					return jsonResponse(t, `{"data":{"viewer":{"id":"actor-1"}}}`), nil
-				case strings.Contains(payload.Query, "query issueSubscribers"):
-					return jsonResponse(t, `{"data":{"issue0":{"id":"issue-1","subscribers":{"nodes":[{"id":"actor-1"},{"id":"user-2"}]}}}}`), nil
-				case strings.Contains(payload.Query, "mutation issueUpdateBatch"):
-					if got := payload.Variables["id0"]; got != "issue-1" {
-						t.Fatalf("update id0 = %#v, want issue-1", got)
-					}
-					input0 := payload.Variables["input0"].(map[string]any)
-					if subscriberIDs := anyStrings(input0["subscriberIds"]); !slices.Equal(subscriberIDs, []string{"user-2"}) {
-						t.Fatalf("update subscriberIds = %#v, want actor removed and other subscribers preserved", subscriberIDs)
-					}
-					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
 				default:
 					t.Fatalf("unexpected GraphQL query: %s", payload.Query)
 					return nil, nil
@@ -220,18 +324,8 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 		t.Fatalf("CreateIssues() error = %v", err)
 	}
 
-	if len(requests) != 5 {
-		t.Fatalf("request count = %d, want 5", len(requests))
-	}
-}
-
-func TestSanitizeSubscriberIDsRemovesExcludedAndDeduplicates(t *testing.T) {
-	got, removed := sanitizeSubscriberIDs([]string{" actor-1 ", "user-2", "", "user-2", "user-3"}, "actor-1")
-	if !removed {
-		t.Fatal("sanitizeSubscriberIDs() removed = false, want true")
-	}
-	if !slices.Equal(got, []string{"user-2", "user-3"}) {
-		t.Fatalf("sanitizeSubscriberIDs() = %#v, want deduplicated actor-free list", got)
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2", len(requests))
 	}
 }
 
