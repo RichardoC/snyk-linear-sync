@@ -8,6 +8,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,13 +52,14 @@ var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
-	Findings        int
-	ExistingIssues  int
-	Conflicts       int
-	PlannedCreates  int64
-	PlannedUpdates  int64
-	PlannedResolves int64
-	FailedOps       int64
+	Findings             int
+	ExistingIssues       int
+	Conflicts            int
+	PlannedCreates       int64
+	PlannedUpdates       int64
+	PlannedResolves      int64
+	CancelledDuplicates  int64
+	FailedOps            int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearClient, cacheStore CacheStore) *Service {
@@ -127,16 +129,21 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	)
 
 	existingByFingerprint := map[string]model.ExistingIssue{}
-	conflicted := map[string]struct{}{}
+	var duplicatesToCancel []model.ExistingIssue
 	for _, issue := range existingIssues {
 		if issue.Fingerprint != "" {
 			if prior, exists := existingByFingerprint[issue.Fingerprint]; exists {
-				s.logger.Warn("duplicate fingerprint labels found on Linear issues",
+				canonical, duplicate := prior, issue
+				if identifierNum(issue.Identifier) < identifierNum(prior.Identifier) {
+					canonical, duplicate = issue, prior
+				}
+				s.logger.Warn("duplicate fingerprint found on Linear issues, will cancel higher-identifier copy",
 					slog.String("fingerprint", issue.Fingerprint),
-					slog.String("issue_a", prior.Identifier),
-					slog.String("issue_b", issue.Identifier),
+					slog.String("canonical", canonical.Identifier),
+					slog.String("duplicate", duplicate.Identifier),
 				)
-				conflicted[issue.Fingerprint] = struct{}{}
+				existingByFingerprint[issue.Fingerprint] = canonical
+				duplicatesToCancel = append(duplicatesToCancel, duplicate)
 				continue
 			}
 			existingByFingerprint[issue.Fingerprint] = issue
@@ -160,7 +167,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	var result RunResult
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
-	result.Conflicts = len(conflicted)
+	result.Conflicts = len(duplicatesToCancel)
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -182,9 +189,6 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		createBatch := make([]model.DesiredIssue, 0, createBatchSize)
 		updateBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for fingerprint, desired := range desiredByFingerprint {
-			if _, blocked := conflicted[fingerprint]; blocked {
-				continue
-			}
 			seen[fingerprint] = struct{}{}
 			existing, ok := existingByFingerprint[fingerprint]
 			if !ok {
@@ -219,9 +223,6 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		resolveBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for fingerprint, existing := range existingByFingerprint {
-			if _, blocked := conflicted[fingerprint]; blocked {
-				continue
-			}
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
@@ -247,6 +248,31 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		if len(resolveBatch) > 0 {
 			jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
 			s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
+		}
+
+		cancelBatch := make([]model.IssueUpdate, 0, createBatchSize)
+		for _, duplicate := range duplicatesToCancel {
+			desired := model.DesiredIssue{
+				Fingerprint:   duplicate.Fingerprint,
+				Title:         duplicate.Title,
+				Description:   duplicate.Description,
+				DueDate:       duplicate.DueDate,
+				State:         model.StateCancelled,
+				ManagedLabels: duplicate.ManagedLabels,
+				Priority:      duplicate.Priority,
+			}
+			if needsUpdate(duplicate, desired) {
+				cancelBatch = append(cancelBatch, model.IssueUpdate{Existing: duplicate, Desired: desired})
+				if len(cancelBatch) == createBatchSize {
+					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
+					cancelBatch = cancelBatch[:0]
+				}
+			}
+		}
+		if len(cancelBatch) > 0 {
+			jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+			s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 		}
 
 		return nil
@@ -291,9 +317,10 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 type jobKind string
 
 const (
-	jobCreateBatch jobKind = "create"
-	jobUpdate      jobKind = "update"
-	jobResolve     jobKind = "resolve"
+	jobCreateBatch    jobKind = "create"
+	jobUpdate         jobKind = "update"
+	jobResolve        jobKind = "resolve"
+	jobCancelDuplicate jobKind = "cancel-duplicate"
 )
 
 type job struct {
@@ -364,6 +391,29 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
 					s.logger.Error("failed to resolve issue",
+						slog.String("issue", update.Existing.Identifier),
+						slog.String("fingerprint", update.Desired.Fingerprint),
+						slog.Any("error", err),
+					)
+				}
+			}
+		}
+		return nil
+	case jobCancelDuplicate:
+		cancels := atomic.AddInt64(&result.CancelledDuplicates, int64(len(job.updateBatch)))
+		s.logExecutionProgress("cancel-duplicate", cancels)
+		if s.cfg.DryRun {
+			return nil
+		}
+		if err := s.linear.UpdateIssues(ctx, job.updateBatch); err != nil {
+			s.logger.Warn("batch cancel-duplicate failed, retrying issues individually",
+				slog.Int("batch_size", len(job.updateBatch)),
+				slog.Any("error", err),
+			)
+			for _, update := range job.updateBatch {
+				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
+					atomic.AddInt64(&result.FailedOps, 1)
+					s.logger.Error("failed to cancel duplicate issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),
 						slog.Any("error", err),
@@ -915,6 +965,20 @@ func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string 
 	}
 
 	return normalizeManagedLabelNames(labels)
+}
+
+// identifierNum extracts the numeric suffix from a Linear identifier (e.g. "SNYK-42" → 42).
+// Returns 0 if the identifier does not contain a dash or the suffix is not a number.
+func identifierNum(identifier string) int {
+	_, after, ok := strings.Cut(identifier, "-")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(after)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func linearHashesByFingerprint(issues []model.ExistingIssue) map[string]string {

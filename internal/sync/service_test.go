@@ -25,6 +25,7 @@ type fakeLinear struct {
 	snapshot []model.ExistingIssue
 	created  []model.DesiredIssue
 	updated  []model.DesiredIssue
+	updates  []model.IssueUpdate
 }
 
 type fakeCache struct {
@@ -44,6 +45,7 @@ func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssu
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
 	for _, update := range updates {
 		f.updated = append(f.updated, update.Desired)
+		f.updates = append(f.updates, update)
 	}
 	return nil
 }
@@ -674,4 +676,307 @@ func TestNeedsUpdateDetectsLinkOnlyDescriptionChange(t *testing.T) {
 	if !needsUpdate(existing, desired) {
 		t.Fatal("needsUpdate() = false, want true")
 	}
+}
+
+func TestIdentifierNum(t *testing.T) {
+	cases := []struct {
+		input string
+		want  int
+	}{
+		{"SNYK-1", 1},
+		{"SNYK-42", 42},
+		{"SNYK-11596", 11596},
+		{"SEC-999", 999},
+		{"nodash", 0},
+		{"", 0},
+		{"SNYK-abc", 0},
+	}
+	for _, tc := range cases {
+		if got := identifierNum(tc.input); got != tc.want {
+			t.Errorf("identifierNum(%q) = %d, want %d", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestRunCancelsDuplicateFingerprintKeepsLowerIdentifier(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "CVE-2026-1234",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	// SNYK-20 and SNYK-10 share the same fingerprint — concurrent-run duplicate.
+	// SNYK-10 is older (lower number) and should be kept as canonical.
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-20",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    2,
+			},
+			{
+				ID:          "issue-b",
+				Identifier:  "SNYK-10",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    2,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Conflicts != 1 {
+		t.Fatalf("Conflicts = %d, want 1", result.Conflicts)
+	}
+	if result.CancelledDuplicates != 1 {
+		t.Fatalf("CancelledDuplicates = %d, want 1", result.CancelledDuplicates)
+	}
+
+	// SNYK-20 (the higher-identifier duplicate) must be cancelled.
+	cancelledIDs := cancelledIdentifiers(linear.updates)
+	if len(cancelledIDs) != 1 || cancelledIDs[0] != "SNYK-20" {
+		t.Fatalf("cancelled identifiers = %v, want [SNYK-20]", cancelledIDs)
+	}
+}
+
+func TestRunDuplicateCancellationIsIdempotentWhenAlreadyCancelled(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "CVE-2026-1234",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	// SNYK-20 is already Cancelled — a previous run already cleaned it up.
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-20",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    2,
+			},
+			{
+				ID:          "issue-b",
+				Identifier:  "SNYK-10",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    2,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Conflicts != 1 {
+		t.Fatalf("Conflicts = %d, want 1", result.Conflicts)
+	}
+	// No update needed since SNYK-20 is already Cancelled.
+	if result.CancelledDuplicates != 0 {
+		t.Fatalf("CancelledDuplicates = %d, want 0 (already cancelled)", result.CancelledDuplicates)
+	}
+	if len(cancelledIdentifiers(linear.updates)) != 0 {
+		t.Fatalf("expected no cancel mutations, got: %v", linear.updates)
+	}
+}
+
+func TestRunThreeWayDuplicateCancelsTwoKeepsLowest(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "CVE-2026-1234",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{ID: "issue-c", Identifier: "SNYK-30", Title: "t", Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->", StateName: "Todo", Fingerprint: "snyk:project-a:issue-1"},
+			{ID: "issue-a", Identifier: "SNYK-10", Title: "t", Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->", StateName: "Todo", Fingerprint: "snyk:project-a:issue-1"},
+			{ID: "issue-b", Identifier: "SNYK-20", Title: "t", Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->", StateName: "Todo", Fingerprint: "snyk:project-a:issue-1"},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Conflicts != 2 {
+		t.Fatalf("Conflicts = %d, want 2", result.Conflicts)
+	}
+	if result.CancelledDuplicates != 2 {
+		t.Fatalf("CancelledDuplicates = %d, want 2", result.CancelledDuplicates)
+	}
+
+	cancelled := cancelledIdentifiers(linear.updates)
+	if len(cancelled) != 2 {
+		t.Fatalf("cancelled count = %d, want 2: %v", len(cancelled), cancelled)
+	}
+	for _, id := range cancelled {
+		if id == "SNYK-10" {
+			t.Fatalf("SNYK-10 (lowest) must not be cancelled; got cancelled: %v", cancelled)
+		}
+	}
+}
+
+func TestRunCancelsDuplicateAndStillSyncsCanonical(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "CVE-2026-1234",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	// SNYK-10 is canonical with a stale title — it should be updated.
+	// SNYK-20 is the duplicate — it should be cancelled.
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-20",
+				Title:       "stale title",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+			{
+				ID:          "issue-b",
+				Identifier:  "SNYK-10",
+				Title:       "stale title",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.CancelledDuplicates != 1 {
+		t.Fatalf("CancelledDuplicates = %d, want 1", result.CancelledDuplicates)
+	}
+	// Canonical (SNYK-10) must have been updated.
+	if !containsStr(updatedIdentifiers(linear.updates), "SNYK-10") {
+		t.Fatalf("SNYK-10 (canonical) was not updated; updates: %v", updatedIdentifiers(linear.updates))
+	}
+	// Duplicate (SNYK-20) must have been cancelled.
+	if !containsStr(cancelledIdentifiers(linear.updates), "SNYK-20") {
+		t.Fatalf("SNYK-20 (duplicate) was not cancelled; cancelled: %v", cancelledIdentifiers(linear.updates))
+	}
+}
+
+// minimalCfg returns the smallest valid Config needed to run the service in tests.
+func minimalCfg() config.Config {
+	return config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+}
+
+func cancelledIdentifiers(updates []model.IssueUpdate) []string {
+	var out []string
+	for _, u := range updates {
+		if u.Desired.State == model.StateCancelled {
+			out = append(out, u.Existing.Identifier)
+		}
+	}
+	return out
+}
+
+func updatedIdentifiers(updates []model.IssueUpdate) []string {
+	out := make([]string, 0, len(updates))
+	for _, u := range updates {
+		out = append(out, u.Existing.Identifier)
+	}
+	return out
+}
+
+func containsStr(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

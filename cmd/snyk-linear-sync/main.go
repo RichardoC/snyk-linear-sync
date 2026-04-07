@@ -65,6 +65,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		slog.Int64("planned_creates", result.PlannedCreates),
 		slog.Int64("planned_updates", result.PlannedUpdates),
 		slog.Int64("planned_resolves", result.PlannedResolves),
+		slog.Int64("cancelled_duplicates", result.CancelledDuplicates),
 		slog.Int64("failed_ops", result.FailedOps),
 	)
 
