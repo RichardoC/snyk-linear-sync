@@ -223,15 +223,16 @@ This setting only controls the issue subscriber list. Linear will still record t
 - snoozed -> `Backlog`
 - fixed -> `Done`
 - ignored -> `Cancelled`
-- missing finding in an existing Snyk project -> `Done`
+- missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
+- Snyk project is inactive (de-activated) -> `Cancelled`
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
 
-This distinction is intentional:
+These distinctions are intentional:
 
-- If a Snyk issue disappears but the project still exists, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
-- If the Snyk project itself is gone, the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
+- If a Snyk issue disappears but the project still exists and is active, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
+- If the Snyk project itself is gone or has been de-activated (inactive), the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
 
 Default due date offsets:
 

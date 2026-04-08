@@ -226,7 +226,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
-			desiredState := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs)
+			desiredState := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
 			resolved := model.DesiredIssue{
 				Fingerprint:   existing.Fingerprint,
 				Title:         existing.Title,
@@ -699,7 +699,7 @@ func stateName(state model.IssueState) string {
 	}
 }
 
-func missingFindingState(fingerprint string, activeProjects map[string]struct{}) model.IssueState {
+func missingFindingState(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) model.IssueState {
 	projectID, ok := fingerprintProjectID(fingerprint)
 	if !ok {
 		return model.StateDone
@@ -707,6 +707,8 @@ func missingFindingState(fingerprint string, activeProjects map[string]struct{})
 	if _, exists := activeProjects[projectID]; exists {
 		return model.StateDone
 	}
+	// Both deleted and inactive projects result in Cancelled: the issue is no
+	// longer actionable regardless of why the project stopped producing findings.
 	return model.StateCancelled
 }
 

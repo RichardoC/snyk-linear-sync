@@ -46,8 +46,9 @@ type Finding struct {
 }
 
 type SnykSnapshot struct {
-	Findings   []Finding
-	ProjectIDs map[string]struct{}
+	Findings           []Finding
+	ProjectIDs         map[string]struct{}
+	InactiveProjectIDs map[string]struct{}
 }
 
 type IssueLabel struct {

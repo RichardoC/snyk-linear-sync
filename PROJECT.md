@@ -184,8 +184,9 @@ The current workflow mapping is:
 - `snoozed` -> `Backlog`
 - `fixed` -> `Done`
 - `ignored` -> `Cancelled`
-- missing finding in an existing Snyk project -> `Done`
+- missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
+- Snyk project is inactive (de-activated) -> `Cancelled`
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
 

@@ -976,3 +976,198 @@ func updatedIdentifiers(updates []model.IssueUpdate) []string {
 func containsStr(slice []string, s string) bool {
 	return slices.Contains(slice, s)
 }
+
+// TestRunCancelsIssuesWhenProjectBecomesInactive verifies that managed Linear
+// issues are cancelled when their Snyk project is de-activated (inactive).
+func TestRunCancelsIssuesWhenProjectBecomesInactive(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// project-inactive has been de-activated; it still exists in Snyk but its
+	// issues must be cancelled in Linear.
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{},
+			ProjectIDs: map[string]struct{}{
+				"project-active": {},
+			},
+			InactiveProjectIDs: map[string]struct{}{
+				"project-inactive": {},
+			},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "issue from inactive project",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-inactive:issue-9",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateCancelled {
+		t.Fatalf("resolved state = %q, want %q", linear.updated[0].State, model.StateCancelled)
+	}
+}
+
+// TestRunCancelsIssuesWhenProjectBecomesInactiveEvenIfCached verifies that the
+// cache does not prevent cancellation when a project transitions to inactive.
+func TestRunCancelsIssuesWhenProjectBecomesInactiveEvenIfCached(t *testing.T) {
+	cfg := config.Config{
+		Cache: config.CacheConfig{},
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{},
+			ProjectIDs: map[string]struct{}{
+				"project-active": {},
+			},
+			InactiveProjectIDs: map[string]struct{}{
+				"project-inactive": {},
+			},
+		},
+	}
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SEC-1",
+		Title:       "issue from inactive project",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: "snyk:project-inactive:issue-9",
+	}
+	cacheStore := &fakeCache{
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			LinearHashes: map[string]string{
+				existing.Fingerprint: existingIssueHash(existing),
+			},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{existing},
+	}
+
+	service := New(cfg, logger, snyk, linear, cacheStore)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateCancelled {
+		t.Fatalf("resolved state = %q, want %q", linear.updated[0].State, model.StateCancelled)
+	}
+}
+
+// TestRunDoesNotCreateIssuesForInactiveProjectFindings verifies that no new
+// Linear issues are created for findings belonging to inactive Snyk projects.
+// (In practice the Snyk client excludes these findings, but the service should
+// not act on them even if they somehow appear in the snapshot.)
+func TestRunDoesNotCreateIssuesForInactiveProjectFindings(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// A finding whose project is inactive — it must not trigger a create.
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{},
+			ProjectIDs: map[string]struct{}{
+				"project-active": {},
+			},
+			InactiveProjectIDs: map[string]struct{}{
+				"project-inactive": {},
+			},
+		},
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{}}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 0 {
+		t.Fatalf("PlannedCreates = %d, want 0 (inactive project findings must not be created)", result.PlannedCreates)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0", len(linear.created))
+	}
+}
+
+// TestRunInactiveProjectAlreadyCancelledIsIdempotent verifies that an issue
+// already in the Cancelled state is not mutated again on a subsequent run.
+func TestRunInactiveProjectAlreadyCancelledIsIdempotent(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{},
+			ProjectIDs: map[string]struct{}{
+				"project-active": {},
+			},
+			InactiveProjectIDs: map[string]struct{}{
+				"project-inactive": {},
+			},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "issue from inactive project",
+				Description: "old description\n<!-- snyk-linear-sync\nfingerprint: snyk:project-inactive:issue-9\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-inactive:issue-9",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0 (already cancelled)", result.PlannedResolves)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0 (no mutation needed)", len(linear.updated))
+	}
+}
+

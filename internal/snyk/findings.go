@@ -20,6 +20,7 @@ type projectRef struct {
 	TargetReference string
 	TargetFile      string
 	Repository      string
+	Active          bool
 }
 
 type issueListResponse struct {
@@ -152,9 +153,14 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 
 	projectDetails := make(map[string]projectRef, len(projects))
 	projectIDs := make(map[string]struct{}, len(projects))
+	inactiveProjectIDs := make(map[string]struct{})
 	for _, project := range projects {
 		projectDetails[project.ID] = project
-		projectIDs[project.ID] = struct{}{}
+		if project.Active {
+			projectIDs[project.ID] = struct{}{}
+		} else {
+			inactiveProjectIDs[project.ID] = struct{}{}
+		}
 	}
 
 	findings := make([]model.Finding, 0, len(projects))
@@ -171,6 +177,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				continue
 			}
 			if issue.Relationships.ScanItem.Data.Type != "" && issue.Relationships.ScanItem.Data.Type != "project" {
+				continue
+			}
+			if _, inactive := inactiveProjectIDs[projectID]; inactive {
 				continue
 			}
 
@@ -221,8 +230,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	}
 
 	return model.SnykSnapshot{
-		Findings:   findings,
-		ProjectIDs: projectIDs,
+		Findings:           findings,
+		ProjectIDs:         projectIDs,
+		InactiveProjectIDs: inactiveProjectIDs,
 	}, nil
 }
 
@@ -249,11 +259,13 @@ func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
 			origin := ""
 			targetReference := ""
 			targetFile := ""
+			status := ""
 			if project.Attributes != nil {
 				name = project.Attributes.Name
 				origin = project.Attributes.Origin
 				targetReference = project.Attributes.TargetReference
 				targetFile = project.Attributes.TargetFile
+				status = project.Attributes.Status
 			}
 			projects = append(projects, projectRef{
 				ID:              project.ID,
@@ -262,6 +274,7 @@ func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
 				TargetReference: targetReference,
 				TargetFile:      targetFile,
 				Repository:      projectRepository(name, origin),
+				Active:          isActiveProjectStatus(status),
 			})
 		}
 
@@ -532,6 +545,19 @@ func sourceLocation(coords []coordinate) sourceLocationRepresentation {
 		}
 	}
 	return sourceLocationRepresentation{}
+}
+
+// isActiveProjectStatus returns true for projects that are being monitored.
+// Snyk uses "active" for monitored projects and "inactive" for de-activated ones.
+// An empty status is treated as active to be forward-compatible with API responses
+// that omit the field.
+func isActiveProjectStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "inactive":
+		return false
+	default:
+		return true
+	}
 }
 
 func projectRepository(name, origin string) string {
