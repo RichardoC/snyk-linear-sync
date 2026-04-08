@@ -1170,4 +1170,3 @@ func TestRunInactiveProjectAlreadyCancelledIsIdempotent(t *testing.T) {
 		t.Fatalf("updated = %d, want 0 (no mutation needed)", len(linear.updated))
 	}
 }
-
