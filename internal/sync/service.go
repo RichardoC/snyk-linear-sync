@@ -614,7 +614,7 @@ func issueState(status model.FindingStatus) model.IssueState {
 	case model.FindingIgnored:
 		return model.StateCancelled
 	case model.FindingSnoozed:
-		return model.StateBacklog
+		return model.StateTodo
 	case model.FindingFixed:
 		return model.StateDone
 	default:
@@ -638,12 +638,17 @@ func issuePriority(severity string) int {
 }
 
 func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
-	if finding.CreatedAt.IsZero() {
+	var baseDate time.Time
+	switch {
+	case !finding.IgnoreExpiresAt.IsZero():
+		expiresUTC := finding.IgnoreExpiresAt.UTC()
+		baseDate = time.Date(expiresUTC.Year(), expiresUTC.Month(), expiresUTC.Day(), 0, 0, 0, 0, time.UTC)
+	case !finding.CreatedAt.IsZero():
+		createdAtUTC := finding.CreatedAt.UTC()
+		baseDate = time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
+	default:
 		return ""
 	}
-
-	createdAtUTC := finding.CreatedAt.UTC()
-	createdDate := time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
 
 	var days int
 	switch issuePriority(finding.Severity) {
@@ -659,7 +664,7 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
 		return ""
 	}
 
-	return createdDate.AddDate(0, 0, days).Format(time.DateOnly)
+	return baseDate.AddDate(0, 0, days).Format(time.DateOnly)
 }
 
 func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {

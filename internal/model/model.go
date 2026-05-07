@@ -43,6 +43,7 @@ type Finding struct {
 	SourceColumnStart int
 	SourceLineEnd     int
 	SourceColumnEnd   int
+	IgnoreExpiresAt   time.Time
 }
 
 type SnykSnapshot struct {

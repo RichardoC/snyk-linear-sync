@@ -1170,3 +1170,95 @@ func TestRunInactiveProjectAlreadyCancelledIsIdempotent(t *testing.T) {
 		t.Fatalf("updated = %d, want 0 (no mutation needed)", len(linear.updated))
 	}
 }
+
+func TestRunKeepsTemporaryIgnoreOpenWithExtendedDueDate(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ignoreExpires := time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC)
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:     "snyk:project-a:issue-1",
+					SnykIssueID:     "issue-1",
+					ProjectID:       "project-a",
+					ProjectName:     "Project A",
+					IssueTitle:      "CVE-2026-1234",
+					Severity:        "high",
+					Status:          model.FindingOpen,
+					CreatedAt:       time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+					IgnoreExpiresAt: ignoreExpires,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    2,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Temporary ignore should NOT be cancelled or moved to Backlog.
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+	if updated.State != model.StateTodo {
+		t.Fatalf("updated state = %q, want %q", updated.State, model.StateTodo)
+	}
+	// Due date should be calculated from IgnoreExpiresAt (2026-06-01) + 30 days for high = 2026-07-01
+	if updated.DueDate != "2026-07-01" {
+		t.Fatalf("updated due date = %q, want %q", updated.DueDate, "2026-07-01")
+	}
+}
+
+func TestDesiredIssueDueDateUsesIgnoreExpiresAt(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint:     "snyk:project-a:issue-1",
+		SnykIssueID:     "issue-1",
+		ProjectName:     "Project A",
+		IssueType:       "code",
+		Severity:        "high",
+		Status:          model.FindingOpen,
+		CreatedAt:       time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IgnoreExpiresAt: time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if desired.DueDate != "2026-07-01" {
+		t.Fatalf("desired due date = %q, want %q", desired.DueDate, "2026-07-01")
+	}
+	if desired.State != model.StateTodo {
+		t.Fatalf("desired state = %q, want %q", desired.State, model.StateTodo)
+	}
+}
