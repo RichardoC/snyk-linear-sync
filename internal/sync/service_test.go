@@ -1262,3 +1262,191 @@ func TestDesiredIssueDueDateUsesIgnoreExpiresAt(t *testing.T) {
 		t.Fatalf("desired state = %q, want %q", desired.State, model.StateTodo)
 	}
 }
+
+func TestRunRespectsManualBacklogMove(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Backlog",
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (Backlog override should prevent state-only update)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0", len(linear.updated))
+	}
+}
+
+func TestRunUpdatesTitleButKeepsBacklogState(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Backlog",
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (title changed, state kept in Backlog)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateBacklog {
+		t.Fatalf("updated state = %q, want %q", linear.updated[0].State, model.StateBacklog)
+	}
+}
+
+func TestRunDoesNotOverrideBacklogForFixedFindings(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingFixed,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Backlog",
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (fixed finding should move to Done)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateDone {
+		t.Fatalf("updated state = %q, want %q", linear.updated[0].State, model.StateDone)
+	}
+}
+
+func TestIsConfiguredBacklogState(t *testing.T) {
+	cases := []struct {
+		existing   string
+		configured string
+		want       bool
+	}{
+		{"Backlog", "Backlog", true},
+		{"backlog", "Backlog", true},
+		{"BACKLOG", "Backlog", true},
+		{"Todo", "Backlog", false},
+		{"Done", "Backlog", false},
+		{"Cancelled", "Backlog", false},
+		{"", "Backlog", false},
+		{"Backlog", "", false},
+	}
+	for _, tc := range cases {
+		got := isConfiguredBacklogState(tc.existing, tc.configured)
+		if got != tc.want {
+			t.Errorf("isConfiguredBacklogState(%q, %q) = %v, want %v", tc.existing, tc.configured, got, tc.want)
+		}
+	}
+}
