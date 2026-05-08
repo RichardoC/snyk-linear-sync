@@ -2,7 +2,9 @@ package snyk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -140,6 +142,53 @@ type orgResponse struct {
 	} `json:"data"`
 }
 
+// v1IgnoreEntry represents a single ignore record from the Snyk v1 API.
+// The v1 API returns two different shapes depending on project type:
+//
+//  1. Flat:   {"created": "...", "expires": "...", ...}
+//  2. Nested: {"*": {"created": "...", "expires": "...", ...}}
+//
+// The custom UnmarshalJSON tries both formats and only extracts the fields
+// we need (created and expires)
+type v1IgnoreEntry struct {
+	Created string `json:"created"`
+	Expires string `json:"expires"`
+}
+
+func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
+	// Try nested format first: {"*": {...}} or {"path": {...}}
+	var nested map[string]struct {
+		Created string `json:"created"`
+		Expires string `json:"expires"`
+	}
+	if err := json.Unmarshal(data, &nested); err == nil && len(nested) > 0 {
+		for _, details := range nested {
+			e.Created = details.Created
+			e.Expires = details.Expires
+			return nil
+		}
+	}
+
+	// Try flat format: {...}
+	var flat struct {
+		Created string `json:"created"`
+		Expires string `json:"expires"`
+	}
+	if err := json.Unmarshal(data, &flat); err == nil {
+		e.Created = flat.Created
+		e.Expires = flat.Expires
+		return nil
+	}
+
+	return nil
+}
+
+// v1ProjectIgnores is the response shape from the Snyk v1 API
+// GET /v1/org/{org_id}/project/{project_id}/ignores.
+// Top-level keys can be either SNYK-* issue keys or issue UUIDs depending on
+// the project type; values are arrays of ignore entries.
+type v1ProjectIgnores map[string][]v1IgnoreEntry
+
 func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	orgSlug, err := c.orgSlug(ctx)
 	if err != nil {
@@ -164,11 +213,46 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	}
 
 	findings := make([]model.Finding, 0, len(projects))
+	// Build a lookup from issue key / issue ID -> latest ignore expiry across
+	// all pages. We cache v1 ignores per project ID to avoid redundant API calls
+	// when the same project spans multiple pages of issues.
+	ignoreExpiryByKey := make(map[string]time.Time)
+	v1IgnoresCache := make(map[string]v1ProjectIgnores)
+
 	nextCursor := ""
 	for {
 		page, cursor, err := c.listIssuesPage(ctx, nextCursor)
 		if err != nil {
 			return model.SnykSnapshot{}, err
+		}
+
+		// Collect project IDs that have ignored issues so we can fetch
+		// v1 ignore metadata (expiration dates) for them.
+		ignoredProjectIDs := make(map[string]struct{})
+		for _, issue := range page {
+			if issue.Attributes.Ignored {
+				projectID := issue.Relationships.ScanItem.Data.ID
+				if projectID != "" {
+					ignoredProjectIDs[projectID] = struct{}{}
+				}
+			}
+		}
+
+		for projectID := range ignoredProjectIDs {
+			ignores, ok := v1IgnoresCache[projectID]
+			if !ok {
+				var err error
+				ignores, err = c.fetchProjectIgnores(ctx, projectID)
+				if err != nil {
+					return model.SnykSnapshot{}, fmt.Errorf("fetch v1 ignores for project %s: %w", projectID, err)
+				}
+				v1IgnoresCache[projectID] = ignores
+			}
+			for issueKey, entries := range ignores {
+				if expiry := latestIgnoreExpiry(entries); !expiry.IsZero() {
+					ignoreExpiryByKey[issueKey] = expiry
+				}
+			}
 		}
 
 		for _, issue := range page {
@@ -190,6 +274,14 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			if err != nil {
 				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
 			}
+
+			ignoreExpiresAt := ignoreExpiryByKey[issueKey]
+			// The v1 API uses either SNYK-* keys or issue UUIDs as top-level keys
+			// depending on project type. If the first lookup failed, try the issue ID.
+			if ignoreExpiresAt.IsZero() && issue.ID != "" && issueKey != issue.ID {
+				ignoreExpiresAt = ignoreExpiryByKey[issue.ID]
+			}
+
 			finding := model.Finding{
 				Fingerprint:       model.Fingerprint(projectID, issue.ID),
 				SnykIssueID:       issue.ID,
@@ -210,7 +302,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				FixedVersion:      fixedVersion(issue.Attributes.Coordinates),
 				IssueURL:          c.issueUIURL(orgSlug, projectID, issueKey),
 				IssueAPIURL:       c.issueAPIURL(issue.ID),
-				Status:            mapStatus(issue.Attributes),
+				Status:            mapStatus(issue.Attributes, ignoreExpiresAt),
 				IntroducedThrough: introducedThrough(issue.Attributes.Coordinates),
 				SourceFile:        source.File,
 				SourceCommitID:    source.CommitID,
@@ -218,6 +310,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				SourceColumnStart: source.Region.Start.Column,
 				SourceLineEnd:     source.Region.End.Line,
 				SourceColumnEnd:   source.Region.End.Column,
+				IgnoreExpiresAt:   ignoreExpiresAt,
 			}
 
 			findings = append(findings, finding)
@@ -242,6 +335,85 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 		return nil, err
 	}
 	return snapshot.Findings, nil
+}
+
+func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1ProjectIgnores, error) {
+	endpoint, err := c.v1Base.Parse(fmt.Sprintf("org/%s/project/%s/ignores", c.orgID, projectID))
+	if err != nil {
+		return nil, fmt.Errorf("build v1 ignores URL: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		c.logger.Warn("v1 ignores endpoint returned 404, treating project ignores as unavailable",
+			"project_id", projectID,
+		)
+		return v1ProjectIgnores{}, nil
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("snyk v1 ignores API %s %s failed with %d: %s",
+			resp.Request.Method, resp.Request.URL, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var ignores v1ProjectIgnores
+	if err := json.NewDecoder(resp.Body).Decode(&ignores); err != nil {
+		return nil, fmt.Errorf("decode v1 ignores: %w", err)
+	}
+
+	return ignores, nil
+}
+
+// latestIgnoreExpiry returns the expiry of the most recently created ignore
+// entry among the provided ignore entries.
+func latestIgnoreExpiry(entries []v1IgnoreEntry) time.Time {
+	var latestCreated time.Time
+	var latestExpires time.Time
+
+	for _, entry := range entries {
+		createdAt, err := parseTime(entry.Created)
+		if err != nil {
+			continue
+		}
+
+		if latestCreated.IsZero() || createdAt.After(latestCreated) {
+			latestCreated = createdAt
+			if entry.Expires != "" {
+				expiresAt, err := parseTime(entry.Expires)
+				if err == nil {
+					latestExpires = expiresAt
+				} else {
+					latestExpires = time.Time{}
+				}
+			} else {
+				latestExpires = time.Time{}
+			}
+		}
+	}
+
+	return latestExpires
+}
+
+func parseTime(raw string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("empty time string")
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, raw)
 }
 
 func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
@@ -383,8 +555,11 @@ func parseIssueCreatedAt(raw string) (time.Time, error) {
 	return createdAt, nil
 }
 
-func mapStatus(issue issueAttributes) model.FindingStatus {
+func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time) model.FindingStatus {
 	if issue.Ignored {
+		if !ignoreExpiresAt.IsZero() && time.Now().Before(ignoreExpiresAt) {
+			return model.FindingOpen
+		}
 		return model.FindingIgnored
 	}
 

@@ -24,6 +24,7 @@ type Client struct {
 	orgID      string
 	httpClient *http.Client
 	restBase   *url.URL
+	v1Base     *url.URL
 	sdk        *snyksdk.Client
 	logger     *slog.Logger
 }
@@ -68,10 +69,16 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, 
 		return nil, fmt.Errorf("parse region REST URL: %w", err)
 	}
 
+	v1Base, err := url.Parse(region.V1BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse region V1 URL: %w", err)
+	}
+
 	return &Client{
 		orgID:      cfg.Snyk.OrgID,
 		httpClient: httpClient,
 		restBase:   restBase,
+		v1Base:     v1Base,
 		sdk:        sdkClient,
 		logger:     logger,
 	}, nil

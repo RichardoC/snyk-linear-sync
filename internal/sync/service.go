@@ -154,6 +154,15 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	snykHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
+
+		// Respect manual Backlog override: if a user moved an open ticket from
+		// Todo to Backlog, don't move it back on subsequent syncs.
+		if existing, ok := existingByFingerprint[finding.Fingerprint]; ok {
+			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
+				desired.State = model.StateBacklog
+			}
+		}
+
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 	}
@@ -614,7 +623,7 @@ func issueState(status model.FindingStatus) model.IssueState {
 	case model.FindingIgnored:
 		return model.StateCancelled
 	case model.FindingSnoozed:
-		return model.StateBacklog
+		return model.StateTodo
 	case model.FindingFixed:
 		return model.StateDone
 	default:
@@ -638,12 +647,17 @@ func issuePriority(severity string) int {
 }
 
 func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
-	if finding.CreatedAt.IsZero() {
+	var baseDate time.Time
+	switch {
+	case !finding.IgnoreExpiresAt.IsZero():
+		expiresUTC := finding.IgnoreExpiresAt.UTC()
+		baseDate = time.Date(expiresUTC.Year(), expiresUTC.Month(), expiresUTC.Day(), 0, 0, 0, 0, time.UTC)
+	case !finding.CreatedAt.IsZero():
+		createdAtUTC := finding.CreatedAt.UTC()
+		baseDate = time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
+	default:
 		return ""
 	}
-
-	createdAtUTC := finding.CreatedAt.UTC()
-	createdDate := time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
 
 	var days int
 	switch issuePriority(finding.Severity) {
@@ -659,7 +673,7 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
 		return ""
 	}
 
-	return createdDate.AddDate(0, 0, days).Format(time.DateOnly)
+	return baseDate.AddDate(0, 0, days).Format(time.DateOnly)
 }
 
 func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {
@@ -830,6 +844,13 @@ func normalizeWorkflowStateName(value string) string {
 	default:
 		return value
 	}
+}
+
+// isConfiguredBacklogState returns true if the existing Linear issue state name
+// matches the configured Backlog state (case-insensitive, with normalization
+// for common variants like "Canceled" → "Cancelled").
+func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool {
+	return normalizeWorkflowStateName(existingStateName) == normalizeWorkflowStateName(configuredBacklog)
 }
 
 func managedLabelsUpdateNeeded(existing model.ExistingIssue, desiredManagedLabels []string) bool {

@@ -220,9 +220,9 @@ This setting only controls the issue subscriber list. Linear will still record t
 ## State Mapping
 
 - open -> `Todo`
-- snoozed -> `Backlog`
+- temporarily ignored (snoozed with future expiry) -> `Todo`
+- permanently ignored -> `Cancelled`
 - fixed -> `Done`
-- ignored -> `Cancelled`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
 - Snyk project is inactive (de-activated) -> `Cancelled`
@@ -231,15 +231,24 @@ The configured Linear state names are resolved by name first, then by workflow t
 
 These distinctions are intentional:
 
+- Temporarily ignored issues (those with a scheduled expiry) are kept open in `Todo` rather than cancelled, because they require attention once the ignore expires.
 - If a Snyk issue disappears but the project still exists and is active, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
 - If the Snyk project itself is gone or has been de-activated (inactive), the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
 
+### Manual Backlog Override
+
+If a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs will preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override applies when the existing Linear issue state matches the configured `LINEAR_STATE_BACKLOG` value.
+
+### Due Dates
+
 Default due date offsets:
 
-- critical -> 15 days after Snyk `created_at`
-- high -> 30 days after Snyk `created_at`
-- medium -> 45 days after Snyk `created_at`
-- low -> 90 days after Snyk `created_at`
+- critical -> 15 days
+- high -> 30 days
+- medium -> 45 days
+- low -> 90 days
+
+The base date is normally the Snyk issue `created_at` timestamp. For temporarily ignored issues, the base date is the ignore expiry date, so the due date extends to the normal severity SLA calculated from when the ignore expires.
 
 ## Cache Behavior
 
