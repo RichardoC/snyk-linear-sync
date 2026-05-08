@@ -149,7 +149,7 @@ type orgResponse struct {
 //  2. Nested: {"*": {"created": "...", "expires": "...", ...}}
 //
 // The custom UnmarshalJSON tries both formats and only extracts the fields
-// we need (created and expires).
+// we need (created and expires)
 type v1IgnoreEntry struct {
 	Created string `json:"created"`
 	Expires string `json:"expires"`
