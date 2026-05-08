@@ -181,17 +181,24 @@ This only affects the persisted subscriber list. Linear still records the API us
 The current workflow mapping is:
 
 - `open` -> `Todo`
-- `snoozed` -> `Backlog`
+- `temporarily ignored` (snoozed with future expiry) -> `Todo`
+- `permanently ignored` -> `Cancelled`
 - `fixed` -> `Done`
-- `ignored` -> `Cancelled`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
 - Snyk project is inactive (de-activated) -> `Cancelled`
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
 
-Due dates are derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear.
-Default offsets are:
+### Manual Backlog Override
+
+When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
+
+### Due Dates
+
+Due dates are normally derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear. For temporarily ignored issues, the due date is instead calculated from the ignore expiry date so the SLA extends to the normal severity offset from when the ignore expires.
+
+Default offsets:
 
 - critical: 15 days
 - high: 30 days

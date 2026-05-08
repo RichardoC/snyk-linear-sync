@@ -154,6 +154,15 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	snykHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
+
+		// Respect manual Backlog override: if a user moved an open ticket from
+		// Todo to Backlog, don't move it back on subsequent syncs.
+		if existing, ok := existingByFingerprint[finding.Fingerprint]; ok {
+			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
+				desired.State = model.StateBacklog
+			}
+		}
+
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 	}
@@ -835,6 +844,13 @@ func normalizeWorkflowStateName(value string) string {
 	default:
 		return value
 	}
+}
+
+// isConfiguredBacklogState returns true if the existing Linear issue state name
+// matches the configured Backlog state (case-insensitive, with normalization
+// for common variants like "Canceled" → "Cancelled").
+func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool {
+	return normalizeWorkflowStateName(existingStateName) == normalizeWorkflowStateName(configuredBacklog)
 }
 
 func managedLabelsUpdateNeeded(existing model.ExistingIssue, desiredManagedLabels []string) bool {

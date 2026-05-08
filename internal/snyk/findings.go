@@ -145,8 +145,8 @@ type orgResponse struct {
 // v1IgnoreEntry represents a single ignore record from the Snyk v1 API.
 // The v1 API returns two different shapes depending on project type:
 //
-//   1. Flat:   {"created": "...", "expires": "...", ...}
-//   2. Nested: {"*": {"created": "...", "expires": "...", ...}}
+//  1. Flat:   {"created": "...", "expires": "...", ...}
+//  2. Nested: {"*": {"created": "...", "expires": "...", ...}}
 //
 // The custom UnmarshalJSON tries both formats and only extracts the fields
 // we need (created and expires).
