@@ -90,6 +90,7 @@ type DesiredIssue struct {
 	State         IssueState
 	ManagedLabels []string
 	Priority      int
+	PreserveState bool
 }
 
 type IssueUpdate struct {

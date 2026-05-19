@@ -16,12 +16,16 @@ func managedSchemaSignature() string {
 }
 
 func desiredIssueHash(desired model.DesiredIssue) string {
+	statePart := string(desired.State)
+	if desired.PreserveState {
+		statePart += ":preserve"
+	}
 	return digestParts(
 		desired.Fingerprint,
 		desired.Title,
 		normalizeDescriptionForCompare(desired.Description),
 		desired.DueDate,
-		string(desired.State),
+		statePart,
 		strings.Join(normalizeManagedLabelNames(desired.ManagedLabels), ","),
 		fmt.Sprintf("%d", desired.Priority),
 	)

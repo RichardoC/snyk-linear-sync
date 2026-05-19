@@ -161,6 +161,12 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
 				desired.State = model.StateBacklog
 			}
+			// Respect manual Todo override: if a user moved an open ticket into
+			// the Linear state "Todo", don't move it back to the configured open
+			// state (e.g. "Triage") on subsequent syncs.
+			if desired.State == model.StateTodo && isManualTodoState(existing.StateName) {
+				desired.PreserveState = true
+			}
 		}
 
 		desiredByFingerprint[finding.Fingerprint] = desired
@@ -686,7 +692,7 @@ func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool 
 	if desired.DueDate != "" && existing.DueDate != desired.DueDate {
 		return true
 	}
-	if normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State)) {
+	if !desired.PreserveState && normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State)) {
 		return true
 	}
 	if existing.Priority != desired.Priority {
@@ -851,6 +857,10 @@ func normalizeWorkflowStateName(value string) string {
 // for common variants like "Canceled" → "Cancelled").
 func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool {
 	return normalizeWorkflowStateName(existingStateName) == normalizeWorkflowStateName(configuredBacklog)
+}
+
+func isManualTodoState(stateName string) bool {
+	return normalizeWorkflowStateName(stateName) == "todo"
 }
 
 func managedLabelsUpdateNeeded(existing model.ExistingIssue, desiredManagedLabels []string) bool {
