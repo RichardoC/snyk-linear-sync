@@ -183,10 +183,14 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		if err != nil {
 			return err
 		}
+		var stateIDPtr *string
+		if !update.Desired.PreserveState {
+			stateIDPtr = &stateID
+		}
 		input := issueUpdateInput{
 			Title:       &title,
 			Description: &description,
-			StateId:     &stateID,
+			StateId:     stateIDPtr,
 			Priority:    &priority,
 			LabelIds:    labelIDs,
 			DueDate:     stringOrNil(update.Desired.DueDate),

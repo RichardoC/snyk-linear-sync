@@ -366,3 +366,93 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
+
+// TestUpdateIssuesOmitsStateIdWhenPreserveStateTrue verifies that UpdateIssues
+// does not include stateId in the GraphQL mutation payload when
+// Desired.PreserveState is true, preventing the sync tool from fighting
+// manual state moves (e.g. human triage from Triage → Todo).
+func TestUpdateIssuesOmitsStateIdWhenPreserveStateTrue(t *testing.T) {
+	var requests []struct {
+		Query     string
+		Variables map[string]any
+	}
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{
+				Todo: "Todo",
+			},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				requests = append(requests, struct {
+					Query     string
+					Variables map[string]any
+				}{
+					Query:     payload.Query,
+					Variables: payload.Variables,
+				})
+
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-todo"},
+		statesByType: map[string]string{"unstarted": "state-todo"},
+		managedLabelIDs: map[string]string{
+			"snyk-automation": "label-1",
+		},
+	}
+
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{
+			ID:            "issue-1",
+			Identifier:    "SEC-1",
+			StateID:       "state-todo",
+			StateName:     "Todo",
+			ManagedLabels: []string{"snyk-automation"},
+			Labels:        []model.IssueLabel{{ID: "label-1", Name: "snyk-automation"}},
+		},
+		Desired: model.DesiredIssue{
+			Fingerprint:   "snyk:proj-1:issue-1",
+			Title:         "updated title",
+			Description:   "updated body",
+			State:         model.StateTodo,
+			PreserveState: true,
+			ManagedLabels: []string{"snyk-automation"},
+			Priority:      2,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
+	}
+
+	if len(requests) != 1 {
+		t.Fatalf("request count = %d, want 1", len(requests))
+	}
+
+	input0 := requests[0].Variables["input0"].(map[string]any)
+	if _, has := input0["stateId"]; has {
+		t.Fatalf("issueUpdate mutation must omit stateId when PreserveState=true, got: %#v", input0)
+	}
+	if input0["title"] != "updated title" {
+		t.Fatalf("title = %v, want 'updated title'", input0["title"])
+	}
+}
