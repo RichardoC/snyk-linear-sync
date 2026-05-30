@@ -215,7 +215,12 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 				continue
 			}
-			if cacheEnabled && cacheSnapshot.SnykHashes[fingerprint] == snykHashes[fingerprint] && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] {
+			// The cache fast-path may not suppress a pending move into a terminal
+			// state: a finding that became fixed/ignored (desired Done/Cancelled)
+			// while its ticket sat in an open column must still be closed, even
+			// if its Snyk/Linear hashes are unchanged since the last run. Benign
+			// open-state divergences stay cache-suppressed as before.
+			if cacheEnabled && cacheSnapshot.SnykHashes[fingerprint] == snykHashes[fingerprint] && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] && !pendingTerminalTransition(existing, desired) {
 				continue
 			}
 			if needsUpdate(existing, desired) {
@@ -680,6 +685,22 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
 	}
 
 	return baseDate.AddDate(0, 0, days).Format(time.DateOnly)
+}
+
+// pendingTerminalTransition reports whether the issue still needs to move into
+// a terminal Linear state (Done/Cancelled) that it is not already in. Such a
+// transition must never be hidden by the cache fast-path, otherwise a finding
+// that became fixed or ignored while its ticket sat in an open column would
+// stay open indefinitely. Open-state divergences are intentionally excluded so
+// the cache continues to batch benign churn.
+func pendingTerminalTransition(existing model.ExistingIssue, desired model.DesiredIssue) bool {
+	if desired.PreserveState {
+		return false
+	}
+	if desired.State != model.StateDone && desired.State != model.StateCancelled {
+		return false
+	}
+	return normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State))
 }
 
 func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {
