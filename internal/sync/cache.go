@@ -9,7 +9,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-05-07-temporary-ignore-due-date-v1"
+const metadataSchemaVersion = "2026-06-01-ignore-metadata-fix-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
