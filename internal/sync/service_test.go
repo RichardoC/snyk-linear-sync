@@ -1559,3 +1559,65 @@ func TestIsConfiguredBacklogState(t *testing.T) {
 		}
 	}
 }
+
+// TestDesiredIssueDueDateUsesIgnoreExpiryForExpiredSnooze verifies that the due
+// date is calculated from the ignore expiry even after the snooze has expired.
+// Previously, once the REST API flipped ignored=false, the code lost the snooze
+// expiry and the due date reverted to CreatedAt + offset.
+func TestDesiredIssueDueDateUsesIgnoreExpiryForExpiredSnooze(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	// The snooze expired on April 29, but the v1 ignore record persists.
+	// The REST API now shows ignored=false, so Status is FindingOpen.
+	// The due date should still use IgnoreExpiresAt as the base date.
+	ignoreExpiresAt := time.Date(2026, time.April, 29, 0, 0, 0, 0, time.UTC)
+	finding := model.Finding{
+		Fingerprint:     "snyk:project-a:issue-1",
+		SnykIssueID:     "issue-1",
+		ProjectName:     "Project A",
+		IssueType:       "code",
+		Severity:        "high",
+		Status:          model.FindingOpen,
+		CreatedAt:       time.Date(2026, time.April, 10, 8, 29, 14, 0, time.UTC),
+		IgnoreExpiresAt: ignoreExpiresAt,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	// Due date should be IgnoreExpiresAt (April 29) + 30 days = May 29,
+	// NOT CreatedAt (April 10) + 30 days = May 10.
+	if desired.DueDate != "2026-05-29" {
+		t.Fatalf("desired due date = %q, want %q (ignore expiry + high offset)", desired.DueDate, "2026-05-29")
+	}
+}
+
+// TestDesiredIssueDisregardIfFixableStaysOpen verifies that an issue with
+// disregardIfFixable=true is mapped to FindingOpen (not FindingIgnored),
+// so it stays in the configured open state instead of being cancelled.
+func TestDesiredIssueDisregardIfFixableStaysOpen(t *testing.T) {
+	cfg := minimalCfg()
+	finding := model.Finding{
+		Fingerprint:        "snyk:project-a:issue-1",
+		SnykIssueID:        "issue-1",
+		ProjectName:        "Project A",
+		IssueType:          "package_vulnerability",
+		Severity:           "medium",
+		Status:             model.FindingOpen, // mapStatus returns FindingOpen for disregardIfFixable
+		CreatedAt:          time.Date(2026, time.April, 30, 11, 59, 47, 0, time.UTC),
+		DisregardIfFixable: true,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if desired.State != model.StateTodo {
+		t.Fatalf("desired state = %q, want %q for disregard-if-fixable issue", desired.State, model.StateTodo)
+	}
+}

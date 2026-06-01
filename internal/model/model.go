@@ -15,35 +15,36 @@ const (
 )
 
 type Finding struct {
-	Fingerprint       string
-	SnykIssueID       string
-	SnykIssueKey      string
-	IssueType         string
-	CreatedAt         time.Time
-	ProjectID         string
-	ProjectName       string
-	ProjectOrigin     string
-	ProjectReference  string
-	ProjectTargetFile string
-	Repository        string
-	IssueTitle        string
-	Severity          string
-	CVSS              float64
-	ExploitMaturity   string
-	PackageName       string
-	VulnerableVersion string
-	FixedVersion      string
-	IssueURL          string
-	IssueAPIURL       string
-	Status            FindingStatus
-	IntroducedThrough string
-	SourceFile        string
-	SourceCommitID    string
-	SourceLineStart   int
-	SourceColumnStart int
-	SourceLineEnd     int
-	SourceColumnEnd   int
-	IgnoreExpiresAt   time.Time
+	Fingerprint        string
+	SnykIssueID        string
+	SnykIssueKey       string
+	IssueType          string
+	CreatedAt          time.Time
+	ProjectID          string
+	ProjectName        string
+	ProjectOrigin      string
+	ProjectReference   string
+	ProjectTargetFile  string
+	Repository         string
+	IssueTitle         string
+	Severity           string
+	CVSS               float64
+	ExploitMaturity    string
+	PackageName        string
+	VulnerableVersion  string
+	FixedVersion       string
+	IssueURL           string
+	IssueAPIURL        string
+	Status             FindingStatus
+	IntroducedThrough  string
+	SourceFile         string
+	SourceCommitID     string
+	SourceLineStart    int
+	SourceColumnStart  int
+	SourceLineEnd      int
+	SourceColumnEnd    int
+	IgnoreExpiresAt    time.Time
+	DisregardIfFixable bool
 }
 
 type SnykSnapshot struct {
