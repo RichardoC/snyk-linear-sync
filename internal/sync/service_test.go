@@ -242,6 +242,166 @@ func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 	}
 }
 
+// TestRunCancelsIgnoredFindingEvenIfCached verifies that a finding which is
+// ignored in Snyk (desired state Cancelled) is moved to Cancelled even when its
+// ticket was manually parked in "Todo" and the cache claims nothing changed.
+// Regression test: the per-finding cache fast-path previously skipped these,
+// leaving wont-fix-ignored tickets stuck open indefinitely.
+func TestRunCancelsIgnoredFindingEvenIfCached(t *testing.T) {
+	cfg := config.Config{
+		Cache: config.CacheConfig{},
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:  "snyk:project-a:issue-1",
+					SnykIssueID:  "issue-1",
+					SnykIssueKey: "SNYK-ISSUE-1",
+					ProjectID:    "project-a",
+					ProjectName:  "Project A",
+					IssueTitle:   "Base image vulnerability",
+					PackageName:  "glibc/libc6",
+					Severity:     "low",
+					Status:       model.FindingIgnored,
+					CreatedAt:    time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	// desired.State is Cancelled (ignored); the ticket was manually moved to
+	// "Todo", so its state diverges from desired.
+	desired := desiredIssue(cfg, snyk.snapshot.Findings[0])
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SEC-1",
+		Title:       desired.Title,
+		Description: desired.Description,
+		DueDate:     desired.DueDate,
+		StateName:   "Todo",
+		Fingerprint: desired.Fingerprint,
+		Priority:    desired.Priority,
+	}
+	// Cache claims the issue is unchanged since last run — the masking condition
+	// that previously suppressed the cancellation.
+	cacheStore := &fakeCache{
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			SnykHashes: map[string]string{
+				desired.Fingerprint: desiredIssueHash(desired),
+			},
+			LinearHashes: map[string]string{
+				desired.Fingerprint: existingIssueHash(existing),
+			},
+		},
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+
+	service := New(cfg, logger, snyk, linear, cacheStore)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].State != model.StateCancelled {
+		t.Fatalf("updated state = %q, want %q", linear.updated[0].State, model.StateCancelled)
+	}
+}
+
+// TestRunCacheStillSkipsNonTerminalStateDivergence locks in the narrow scope of
+// the terminal-transition cache guard: an open finding whose ticket diverges
+// only in a non-terminal state must still be cache-suppressed when its hashes
+// are unchanged. (A broader !needsUpdate guard would incorrectly re-update it.)
+func TestRunCacheStillSkipsNonTerminalStateDivergence(t *testing.T) {
+	cfg := config.Config{
+		Cache: config.CacheConfig{},
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:  "snyk:project-a:issue-1",
+					SnykIssueID:  "issue-1",
+					SnykIssueKey: "SNYK-ISSUE-1",
+					ProjectID:    "project-a",
+					ProjectName:  "Project A",
+					IssueTitle:   "Outdated package",
+					PackageName:  "github.com/example/pkg",
+					Severity:     "high",
+					Status:       model.FindingOpen, // desired Todo — non-terminal
+					CreatedAt:    time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	desired := desiredIssue(cfg, snyk.snapshot.Findings[0]) // State == Todo
+	// Ticket is in a *different open* state; needsUpdate is true, but the
+	// transition is non-terminal so the cache should keep suppressing it.
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SEC-1",
+		Title:       desired.Title,
+		Description: desired.Description,
+		DueDate:     desired.DueDate,
+		StateName:   "Triage",
+		Fingerprint: desired.Fingerprint,
+		Priority:    desired.Priority,
+	}
+	cacheStore := &fakeCache{
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			SnykHashes: map[string]string{
+				desired.Fingerprint: desiredIssueHash(desired),
+			},
+			LinearHashes: map[string]string{
+				desired.Fingerprint: existingIssueHash(existing),
+			},
+		},
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+
+	service := New(cfg, logger, snyk, linear, cacheStore)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (non-terminal divergence stays cached)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0", len(linear.updated))
+	}
+}
+
 func TestRunCancelsMissingIssueWhenProjectDeleted(t *testing.T) {
 	cfg := config.Config{
 		Linear: config.LinearConfig{
