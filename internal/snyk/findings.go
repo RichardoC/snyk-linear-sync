@@ -149,34 +149,39 @@ type orgResponse struct {
 //  2. Nested: {"*": {"created": "...", "expires": "...", ...}}
 //
 // The custom UnmarshalJSON tries both formats and only extracts the fields
-// we need (created and expires)
+// we need (created, expires, and disregardIfFixable).
 type v1IgnoreEntry struct {
-	Created string `json:"created"`
-	Expires string `json:"expires"`
+	Created            string `json:"created"`
+	Expires            string `json:"expires"`
+	DisregardIfFixable bool   `json:"disregardIfFixable"`
 }
 
 func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
 	// Try nested format first: {"*": {...}} or {"path": {...}}
 	var nested map[string]struct {
-		Created string `json:"created"`
-		Expires string `json:"expires"`
+		Created            string `json:"created"`
+		Expires            string `json:"expires"`
+		DisregardIfFixable bool   `json:"disregardIfFixable"`
 	}
 	if err := json.Unmarshal(data, &nested); err == nil && len(nested) > 0 {
 		for _, details := range nested {
 			e.Created = details.Created
 			e.Expires = details.Expires
+			e.DisregardIfFixable = details.DisregardIfFixable
 			return nil
 		}
 	}
 
 	// Try flat format: {...}
 	var flat struct {
-		Created string `json:"created"`
-		Expires string `json:"expires"`
+		Created            string `json:"created"`
+		Expires            string `json:"expires"`
+		DisregardIfFixable bool   `json:"disregardIfFixable"`
 	}
 	if err := json.Unmarshal(data, &flat); err == nil {
 		e.Created = flat.Created
 		e.Expires = flat.Expires
+		e.DisregardIfFixable = flat.DisregardIfFixable
 		return nil
 	}
 
@@ -213,10 +218,17 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	}
 
 	findings := make([]model.Finding, 0, len(projects))
-	// Build a lookup from issue key / issue ID -> latest ignore expiry across
-	// all pages. We cache v1 ignores per project ID to avoid redundant API calls
+	// Build a lookup from issue key / issue ID -> ignore metadata across all
+	// pages. We cache v1 ignores per project ID to avoid redundant API calls
 	// when the same project spans multiple pages of issues.
-	ignoreExpiryByKey := make(map[string]time.Time)
+	//
+	// We fetch v1 ignore metadata for all projects that appear in the issues
+	// pages, not just those with currently-ignored issues. This ensures we
+	// preserve the snooze expiry for due date calculation even after a timed
+	// ignore expires (the REST API flips ignored=false but the v1 record
+	// persists), and also captures disregardIfFixable for "ignore until fix
+	// available" ignores.
+	ignoreMetaByKey := make(map[string]ignoreMetadata)
 	v1IgnoresCache := make(map[string]v1ProjectIgnores)
 
 	nextCursor := ""
@@ -226,19 +238,17 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			return model.SnykSnapshot{}, err
 		}
 
-		// Collect project IDs that have ignored issues so we can fetch
-		// v1 ignore metadata (expiration dates) for them.
-		ignoredProjectIDs := make(map[string]struct{})
+		// Collect all project IDs that appear in this page so we can fetch
+		// v1 ignore metadata (expiration dates and disregardIfFixable).
+		projectIDsInPage := make(map[string]struct{})
 		for _, issue := range page {
-			if issue.Attributes.Ignored {
-				projectID := issue.Relationships.ScanItem.Data.ID
-				if projectID != "" {
-					ignoredProjectIDs[projectID] = struct{}{}
-				}
+			projectID := issue.Relationships.ScanItem.Data.ID
+			if projectID != "" {
+				projectIDsInPage[projectID] = struct{}{}
 			}
 		}
 
-		for projectID := range ignoredProjectIDs {
+		for projectID := range projectIDsInPage {
 			ignores, ok := v1IgnoresCache[projectID]
 			if !ok {
 				var err error
@@ -249,8 +259,8 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				v1IgnoresCache[projectID] = ignores
 			}
 			for issueKey, entries := range ignores {
-				if expiry := latestIgnoreExpiry(entries); !expiry.IsZero() {
-					ignoreExpiryByKey[issueKey] = expiry
+				if meta := latestIgnoreMeta(entries); !meta.ExpiresAt.IsZero() || meta.DisregardIfFixable {
+					ignoreMetaByKey[issueKey] = meta
 				}
 			}
 		}
@@ -275,42 +285,43 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
 			}
 
-			ignoreExpiresAt := ignoreExpiryByKey[issueKey]
+			ignoreMeta, ok := ignoreMetaByKey[issueKey]
 			// The v1 API uses either SNYK-* keys or issue UUIDs as top-level keys
 			// depending on project type. If the first lookup failed, try the issue ID.
-			if ignoreExpiresAt.IsZero() && issue.ID != "" && issueKey != issue.ID {
-				ignoreExpiresAt = ignoreExpiryByKey[issue.ID]
+			if !ok && issue.ID != "" && issueKey != issue.ID {
+				ignoreMeta, ok = ignoreMetaByKey[issue.ID]
 			}
 
 			finding := model.Finding{
-				Fingerprint:       model.Fingerprint(projectID, issue.ID),
-				SnykIssueID:       issue.ID,
-				SnykIssueKey:      issueKey,
-				IssueType:         strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
-				CreatedAt:         createdAt,
-				ProjectID:         projectID,
-				ProjectName:       project.Name,
-				ProjectOrigin:     project.Origin,
-				ProjectReference:  project.TargetReference,
-				ProjectTargetFile: project.TargetFile,
-				Repository:        project.Repository,
-				IssueTitle:        coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
-				Severity:          coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
-				ExploitMaturity:   exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
-				PackageName:       packageName(issue.Attributes.Coordinates),
-				VulnerableVersion: vulnerableVersion(issue.Attributes.Coordinates),
-				FixedVersion:      fixedVersion(issue.Attributes.Coordinates),
-				IssueURL:          c.issueUIURL(orgSlug, projectID, issueKey),
-				IssueAPIURL:       c.issueAPIURL(issue.ID),
-				Status:            mapStatus(issue.Attributes, ignoreExpiresAt),
-				IntroducedThrough: introducedThrough(issue.Attributes.Coordinates),
-				SourceFile:        source.File,
-				SourceCommitID:    source.CommitID,
-				SourceLineStart:   source.Region.Start.Line,
-				SourceColumnStart: source.Region.Start.Column,
-				SourceLineEnd:     source.Region.End.Line,
-				SourceColumnEnd:   source.Region.End.Column,
-				IgnoreExpiresAt:   ignoreExpiresAt,
+				Fingerprint:        model.Fingerprint(projectID, issue.ID),
+				SnykIssueID:        issue.ID,
+				SnykIssueKey:       issueKey,
+				IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
+				CreatedAt:          createdAt,
+				ProjectID:          projectID,
+				ProjectName:        project.Name,
+				ProjectOrigin:      project.Origin,
+				ProjectReference:   project.TargetReference,
+				ProjectTargetFile:  project.TargetFile,
+				Repository:         project.Repository,
+				IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
+				Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
+				ExploitMaturity:    exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
+				PackageName:        packageName(issue.Attributes.Coordinates),
+				VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
+				FixedVersion:       fixedVersion(issue.Attributes.Coordinates),
+				IssueURL:           c.issueUIURL(orgSlug, projectID, issueKey),
+				IssueAPIURL:        c.issueAPIURL(issue.ID),
+				Status:             mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
+				IntroducedThrough:  introducedThrough(issue.Attributes.Coordinates),
+				SourceFile:         source.File,
+				SourceCommitID:     source.CommitID,
+				SourceLineStart:    source.Region.Start.Line,
+				SourceColumnStart:  source.Region.Start.Column,
+				SourceLineEnd:      source.Region.End.Line,
+				SourceColumnEnd:    source.Region.End.Column,
+				IgnoreExpiresAt:    ignoreMeta.ExpiresAt,
+				DisregardIfFixable: ignoreMeta.DisregardIfFixable,
 			}
 
 			findings = append(findings, finding)
@@ -375,11 +386,19 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 	return ignores, nil
 }
 
-// latestIgnoreExpiry returns the expiry of the most recently created ignore
+// ignoreMetadata carries the v1 ignore fields that the sync logic needs:
+// the snooze expiry date and whether the ignore is conditional on no fix being
+// available (disregardIfFixable).
+type ignoreMetadata struct {
+	ExpiresAt          time.Time
+	DisregardIfFixable bool
+}
+
+// latestIgnoreMeta returns the metadata of the most recently created ignore
 // entry among the provided ignore entries.
-func latestIgnoreExpiry(entries []v1IgnoreEntry) time.Time {
+func latestIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 	var latestCreated time.Time
-	var latestExpires time.Time
+	var meta ignoreMetadata
 
 	for _, entry := range entries {
 		createdAt, err := parseTime(entry.Created)
@@ -389,20 +408,21 @@ func latestIgnoreExpiry(entries []v1IgnoreEntry) time.Time {
 
 		if latestCreated.IsZero() || createdAt.After(latestCreated) {
 			latestCreated = createdAt
+			meta.DisregardIfFixable = entry.DisregardIfFixable
 			if entry.Expires != "" {
 				expiresAt, err := parseTime(entry.Expires)
 				if err == nil {
-					latestExpires = expiresAt
+					meta.ExpiresAt = expiresAt
 				} else {
-					latestExpires = time.Time{}
+					meta.ExpiresAt = time.Time{}
 				}
 			} else {
-				latestExpires = time.Time{}
+				meta.ExpiresAt = time.Time{}
 			}
 		}
 	}
 
-	return latestExpires
+	return meta
 }
 
 func parseTime(raw string) (time.Time, error) {
@@ -555,8 +575,14 @@ func parseIssueCreatedAt(raw string) (time.Time, error) {
 	return createdAt, nil
 }
 
-func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time) model.FindingStatus {
+func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixable bool) model.FindingStatus {
 	if issue.Ignored {
+		// "Ignore until a fix is available" keeps the issue open because the
+		// ignore is conditional: when a fix appears, Snyk flips ignored=false
+		// and the issue is already in the correct open state.
+		if disregardIfFixable {
+			return model.FindingOpen
+		}
 		if !ignoreExpiresAt.IsZero() && time.Now().Before(ignoreExpiresAt) {
 			return model.FindingOpen
 		}

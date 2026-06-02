@@ -89,7 +89,7 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 					Severity:    "high",
 					Status:      model.FindingOpen,
 					IssueURL:    "https://example.test/issue-1",
-					CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+					CreatedAt:   time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC),
 				},
 				{
 					Fingerprint: "snyk:project-b:issue-2",
@@ -100,7 +100,7 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 					Severity:    "low",
 					Status:      model.FindingIgnored,
 					IssueURL:    "https://example.test/issue-2",
-					CreatedAt:   time.Date(2026, time.January, 1, 9, 0, 0, 0, time.UTC),
+					CreatedAt:   time.Date(2026, time.August, 1, 9, 0, 0, 0, time.UTC),
 				},
 			},
 			ProjectIDs: map[string]struct{}{
@@ -153,8 +153,8 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 	if len(linear.updated) != 2 {
 		t.Fatalf("updated = %d, want 2", len(linear.updated))
 	}
-	if linear.created[0].DueDate != "2026-04-01" {
-		t.Fatalf("created due date = %q, want %q", linear.created[0].DueDate, "2026-04-01")
+	if linear.created[0].DueDate != "2026-10-30" {
+		t.Fatalf("created due date = %q, want %q", linear.created[0].DueDate, "2026-10-30")
 	}
 	if !containsDesiredState(linear.updated, model.StateDone) {
 		t.Fatalf("updated states = %#v, want one %q", desiredStates(linear.updated), model.StateDone)
@@ -567,6 +567,8 @@ func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
 			},
 		},
 	}
+	// Use a CreatedAt that produces a future due date so the guard against
+	// past due dates does not kick in.
 	finding := model.Finding{
 		Fingerprint: "snyk:project-a:issue-1",
 		SnykIssueID: "issue-1",
@@ -574,13 +576,75 @@ func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
 		IssueType:   "code",
 		Severity:    "critical",
 		Status:      model.FindingOpen,
-		CreatedAt:   time.Date(2026, time.March, 11, 23, 30, 0, 0, time.FixedZone("minus0500", -5*60*60)),
+		CreatedAt:   time.Date(2026, time.August, 11, 23, 30, 0, 0, time.FixedZone("minus0500", -5*60*60)),
 	}
 
 	desired := desiredIssue(cfg, finding)
 
-	if desired.DueDate != "2026-03-27" {
-		t.Fatalf("desired due date = %q, want %q", desired.DueDate, "2026-03-27")
+	if desired.DueDate != "2026-08-27" {
+		t.Fatalf("desired due date = %q, want %q", desired.DueDate, "2026-08-27")
+	}
+}
+
+func TestDesiredIssueDueDateFloorsPastDueDateToToday(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	// CreatedAt is far in the past, so CreatedAt + 30 days would be in the past.
+	// The due date should be floored to today instead.
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectName: "Project A",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+	today := time.Now().Format(time.DateOnly)
+
+	if desired.DueDate != today {
+		t.Fatalf("desired due date = %q, want %q (past due date must be floored to today)", desired.DueDate, today)
+	}
+}
+
+func TestDesiredIssueDueDateFloorsExpiredSnoozeToToday(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	// IgnoreExpiresAt is in the past (snooze already expired),
+	// so IgnoreExpiresAt + 30 days would also be in the past.
+	// The due date should be floored to today instead.
+	finding := model.Finding{
+		Fingerprint:     "snyk:project-a:issue-1",
+		SnykIssueID:     "issue-1",
+		ProjectName:     "Project A",
+		Severity:        "high",
+		Status:          model.FindingOpen,
+		CreatedAt:       time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		IgnoreExpiresAt: time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+	today := time.Now().Format(time.DateOnly)
+
+	if desired.DueDate != today {
+		t.Fatalf("desired due date = %q, want %q (past due date from expired snooze must be floored to today)", desired.DueDate, today)
 	}
 }
 
@@ -1717,5 +1781,218 @@ func TestIsConfiguredBacklogState(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("isConfiguredBacklogState(%q, %q) = %v, want %v", tc.existing, tc.configured, got, tc.want)
 		}
+	}
+}
+
+// TestDesiredIssueDueDateUsesIgnoreExpiryForExpiredSnooze verifies that when an
+// expired snooze still produces a future due date (IgnoreExpiresAt + offset),
+// the due date is set correctly. When the result would be in the past, the
+// due date is omitted instead (see TestDesiredIssueDueDateOmitsPastDueDateFromExpiredSnooze).
+func TestDesiredIssueDueDateUsesIgnoreExpiryForExpiredSnooze(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	// The snooze expired on a date that still produces a future due date
+	// when the offset is added.
+	ignoreExpiresAt := time.Date(2026, time.August, 29, 0, 0, 0, 0, time.UTC)
+	finding := model.Finding{
+		Fingerprint:     "snyk:project-a:issue-1",
+		SnykIssueID:     "issue-1",
+		ProjectName:     "Project A",
+		IssueType:       "code",
+		Severity:        "high",
+		Status:          model.FindingOpen,
+		CreatedAt:       time.Date(2026, time.April, 10, 8, 29, 14, 0, time.UTC),
+		IgnoreExpiresAt: ignoreExpiresAt,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	// Due date should be IgnoreExpiresAt (August 29) + 30 days = September 28.
+	if desired.DueDate != "2026-09-28" {
+		t.Fatalf("desired due date = %q, want %q (ignore expiry + high offset)", desired.DueDate, "2026-09-28")
+	}
+}
+
+// TestDesiredIssueDisregardIfFixableStaysOpen verifies that an issue with
+// disregardIfFixable=true is mapped to FindingOpen (not FindingIgnored),
+// so it stays in the configured open state instead of being cancelled.
+func TestDesiredIssueDisregardIfFixableStaysOpen(t *testing.T) {
+	cfg := minimalCfg()
+	finding := model.Finding{
+		Fingerprint:        "snyk:project-a:issue-1",
+		SnykIssueID:        "issue-1",
+		ProjectName:        "Project A",
+		IssueType:          "package_vulnerability",
+		Severity:           "medium",
+		Status:             model.FindingOpen, // mapStatus returns FindingOpen for disregardIfFixable
+		CreatedAt:          time.Date(2026, time.April, 30, 11, 59, 47, 0, time.UTC),
+		DisregardIfFixable: true,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if desired.State != model.StateTodo {
+		t.Fatalf("desired state = %q, want %q for disregard-if-fixable issue", desired.State, model.StateTodo)
+	}
+}
+
+// TestNeedsUpdateAlwaysCorrectsDueDate verifies that the sync always flags
+// a due date update when the desired date differs from the existing one.
+// Snyk is authoritative: the sync must correct manual overrides and stale
+// dates, even if the desired date is a floored "today" value.
+func TestNeedsUpdateAlwaysCorrectsDueDate(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-07-15", // manually-overridden future date
+		StateName:   "Todo",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-06-02", // floored to today (authoritative from Snyk)
+		State:       model.StateTodo,
+		Priority:    2,
+	}
+
+	if !needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = false, want true (Snyk-derived due date must correct manual override)")
+	}
+}
+
+// TestNeedsUpdateStillDetectsDueDateChangeWhenBothNonEmpty verifies that the
+// due date change detection still works when both dates are non-empty.
+func TestNeedsUpdateStillDetectsDueDateChangeWhenBothNonEmpty(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-07-01",
+		StateName:   "Todo",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-07-15",
+		State:       model.StateTodo,
+		Priority:    2,
+	}
+
+	if !needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = false, want true (due dates differ)")
+	}
+}
+
+// TestRunSetsFlooredDueDateOnNewIssueWithOldCreatedAt verifies that when a new
+// Snyk finding has an old CreatedAt, the sync creates the Linear issue with
+// today's date as the due date (floored from the past SLA date).
+func TestRunSetsFlooredDueDateOnNewIssueWithOldCreatedAt(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Old issue",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // old → due date would be past
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{}}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1", result.PlannedCreates)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	today := time.Now().Format(time.DateOnly)
+	if linear.created[0].DueDate != today {
+		t.Fatalf("created due date = %q, want %q (past due date floored to today)", linear.created[0].DueDate, today)
+	}
+}
+
+// TestRunCorrectsOverriddenDueDateWithAuthoritativeCalculation verifies that
+// when the Snyk-derived due date differs from the Linear due date, the sync
+// always updates it — Snyk is authoritative, even over manual overrides.
+func TestRunCorrectsOverriddenDueDateWithAuthoritativeCalculation(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Old issue",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+	today := time.Now().Format(time.DateOnly)
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     "2026-07-15", // manually-overridden future date
+				StateName:   "Todo",
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// The sync must correct the manually-overridden due date to the
+	// authoritative Snyk-derived value (floored to today for past SLAs).
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (Snyk due date must correct manual override)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].DueDate != today {
+		t.Fatalf("updated due date = %q, want %q (authoritative Snyk date floored to today)", linear.updated[0].DueDate, today)
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-05-07-temporary-ignore-due-date-v1"
+const metadataSchemaVersion = "2026-06-02-due-date-past-guard-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
@@ -20,11 +20,19 @@ func desiredIssueHash(desired model.DesiredIssue) string {
 	if desired.PreserveState {
 		statePart += ":preserve"
 	}
+	// Use DueDateBase (raw SLA date) instead of DueDate (floored) for cache
+	// stability. The floor-to-today adjustment changes daily, which would
+	// cause the Snyk hash to churn for overdue issues even when the
+	// underlying finding data has not changed.
+	dueDateForHash := desired.DueDateBase
+	if dueDateForHash == "" {
+		dueDateForHash = desired.DueDate
+	}
 	return digestParts(
 		desired.Fingerprint,
 		desired.Title,
 		normalizeDescriptionForCompare(desired.Description),
-		desired.DueDate,
+		dueDateForHash,
 		statePart,
 		strings.Join(normalizeManagedLabelNames(desired.ManagedLabels), ","),
 		fmt.Sprintf("%d", desired.Priority),

@@ -13,7 +13,7 @@ func TestMapStatusTemporaryIgnoreOpen(t *testing.T) {
 		Ignored: true,
 		Status:  "open",
 	}
-	got := mapStatus(issue, future)
+	got := mapStatus(issue, future, false)
 	if got != model.FindingOpen {
 		t.Fatalf("mapStatus() = %q, want %q for temporary ignore", got, model.FindingOpen)
 	}
@@ -24,7 +24,7 @@ func TestMapStatusPermanentIgnoreCancelled(t *testing.T) {
 		Ignored: true,
 		Status:  "open",
 	}
-	got := mapStatus(issue, time.Time{})
+	got := mapStatus(issue, time.Time{}, false)
 	if got != model.FindingIgnored {
 		t.Fatalf("mapStatus() = %q, want %q for permanent ignore", got, model.FindingIgnored)
 	}
@@ -36,31 +36,55 @@ func TestMapStatusExpiredIgnoreCancelled(t *testing.T) {
 		Ignored: true,
 		Status:  "open",
 	}
-	got := mapStatus(issue, past)
+	got := mapStatus(issue, past, false)
 	if got != model.FindingIgnored {
 		t.Fatalf("mapStatus() = %q, want %q for expired temporary ignore", got, model.FindingIgnored)
 	}
 }
 
-func TestLatestIgnoreExpiry(t *testing.T) {
+func TestMapStatusDisregardIfFixableKeepsOpen(t *testing.T) {
+	issue := issueAttributes{
+		Ignored: true,
+		Status:  "open",
+	}
+	got := mapStatus(issue, time.Time{}, true)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus() = %q, want %q for disregard-if-fixable ignore", got, model.FindingOpen)
+	}
+}
+
+func TestMapStatusDisregardIfFixableTakesPrecedenceOverExpiry(t *testing.T) {
+	past := time.Now().Add(-24 * time.Hour)
+	issue := issueAttributes{
+		Ignored: true,
+		Status:  "open",
+	}
+	// Even with a past expiry, disregardIfFixable should keep the issue open.
+	got := mapStatus(issue, past, true)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus() = %q, want %q for disregard-if-fixable with past expiry", got, model.FindingOpen)
+	}
+}
+
+func TestLatestIgnoreMeta(t *testing.T) {
 	cases := []struct {
 		name    string
 		entries []v1IgnoreEntry
-		want    time.Time
+		want    ignoreMetadata
 	}{
 		{
 			name: "single temporary ignore",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 			},
-			want: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC),
+			want: ignoreMetadata{ExpiresAt: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC)},
 		},
 		{
 			name: "permanent ignore no expires",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: ""},
 			},
-			want: time.Time{},
+			want: ignoreMetadata{},
 		},
 		{
 			name: "multiple ignores picks latest",
@@ -68,7 +92,7 @@ func TestLatestIgnoreExpiry(t *testing.T) {
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 				{Created: "2026-04-01T12:00:00Z", Expires: "2026-05-01T12:00:00Z"},
 			},
-			want: time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC),
+			want: ignoreMetadata{ExpiresAt: time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC)},
 		},
 		{
 			name: "latest has no expiry falls back to older",
@@ -76,14 +100,32 @@ func TestLatestIgnoreExpiry(t *testing.T) {
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 				{Created: "2026-04-01T12:00:00Z", Expires: ""},
 			},
-			want: time.Time{},
+			want: ignoreMetadata{},
+		},
+		{
+			name: "ignore until fix available",
+			entries: []v1IgnoreEntry{
+				{Created: "2026-03-18T12:00:00Z", Expires: "", DisregardIfFixable: true},
+			},
+			want: ignoreMetadata{DisregardIfFixable: true},
+		},
+		{
+			name: "disregardIfFixable from latest entry",
+			entries: []v1IgnoreEntry{
+				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z", DisregardIfFixable: true},
+				{Created: "2026-04-01T12:00:00Z", Expires: "2026-05-01T12:00:00Z", DisregardIfFixable: false},
+			},
+			want: ignoreMetadata{ExpiresAt: time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC), DisregardIfFixable: false},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := latestIgnoreExpiry(tc.entries)
-			if !got.Equal(tc.want) {
-				t.Fatalf("latestIgnoreExpiry() = %v, want %v", got, tc.want)
+			got := latestIgnoreMeta(tc.entries)
+			if !got.ExpiresAt.Equal(tc.want.ExpiresAt) {
+				t.Fatalf("latestIgnoreMeta().ExpiresAt = %v, want %v", got.ExpiresAt, tc.want.ExpiresAt)
+			}
+			if got.DisregardIfFixable != tc.want.DisregardIfFixable {
+				t.Fatalf("latestIgnoreMeta().DisregardIfFixable = %v, want %v", got.DisregardIfFixable, tc.want.DisregardIfFixable)
 			}
 		})
 	}
@@ -109,6 +151,16 @@ func TestV1IgnoreEntryUnmarshalJSON(t *testing.T) {
 			name: "nested format with different path key",
 			raw:  `{"path1":{"created":"2026-03-18T12:00:00Z","expires":"2026-04-18T12:00:00Z"}}`,
 			want: v1IgnoreEntry{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
+		},
+		{
+			name: "flat format with disregardIfFixable",
+			raw:  `{"created":"2026-03-18T12:00:00Z","expires":"","disregardIfFixable":true}`,
+			want: v1IgnoreEntry{Created: "2026-03-18T12:00:00Z", DisregardIfFixable: true},
+		},
+		{
+			name: "nested format with disregardIfFixable",
+			raw:  `{"*":{"created":"2026-03-18T12:00:00Z","expires":"","disregardIfFixable":true}}`,
+			want: v1IgnoreEntry{Created: "2026-03-18T12:00:00Z", DisregardIfFixable: true},
 		},
 		{
 			name: "unparsable",
