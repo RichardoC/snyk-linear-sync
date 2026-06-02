@@ -2205,8 +2205,8 @@ func TestRunAwaitingFixIssueMovedFromTodoToBacklog(t *testing.T) {
 				DueDate:       "2026-06-08", // old due date from before awaiting-fix
 				StateName:     "Todo",       // was in Todo before
 				Fingerprint:   finding.Fingerprint,
-				Priority:       desired.Priority,
-				ManagedLabels:  []string{"snyk-automation"},
+				Priority:      desired.Priority,
+				ManagedLabels: []string{"snyk-automation"},
 				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}},
 			},
 		},
