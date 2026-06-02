@@ -19,6 +19,7 @@ const (
 	defaultLinearDoneState      = "Done"
 	defaultLinearCancelledState = "Cancelled"
 	defaultManagedLabel         = "snyk-automation"
+	defaultAwaitingFixLabel     = "triage-dependency"
 	defaultCriticalDueDays      = 15
 	defaultHighDueDays          = 30
 	defaultMediumDueDays        = 45
@@ -84,6 +85,7 @@ type LabelConfig struct {
 	ToolDefault   string
 	Origin        map[string]string
 	OriginDefault string
+	AwaitingFix   string
 }
 
 type DueDateConfig struct {
@@ -161,6 +163,7 @@ func Load(args []string) (Config, error) {
 				ToolDefault:   normalizeManagedLabel(getEnv("LINEAR_TOOL_LABEL_DEFAULT", defaultManagedLabel)),
 				Origin:        originLabels,
 				OriginDefault: normalizeManagedLabel(getEnv("LINEAR_ORIGIN_LABEL_DEFAULT", "")),
+				AwaitingFix:   normalizeManagedLabel(getEnv("LINEAR_AWAITING_FIX_LABEL", defaultAwaitingFixLabel)),
 			},
 			Due: DueDateConfig{
 				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),

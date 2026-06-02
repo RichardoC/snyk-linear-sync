@@ -42,14 +42,14 @@ func TestMapStatusExpiredIgnoreCancelled(t *testing.T) {
 	}
 }
 
-func TestMapStatusDisregardIfFixableKeepsOpen(t *testing.T) {
+func TestMapStatusDisregardIfFixableAwaitingFix(t *testing.T) {
 	issue := issueAttributes{
 		Ignored: true,
 		Status:  "open",
 	}
 	got := mapStatus(issue, time.Time{}, true)
-	if got != model.FindingOpen {
-		t.Fatalf("mapStatus() = %q, want %q for disregard-if-fixable ignore", got, model.FindingOpen)
+	if got != model.FindingAwaitingFix {
+		t.Fatalf("mapStatus() = %q, want %q for disregard-if-fixable ignore", got, model.FindingAwaitingFix)
 	}
 }
 
@@ -59,10 +59,10 @@ func TestMapStatusDisregardIfFixableTakesPrecedenceOverExpiry(t *testing.T) {
 		Ignored: true,
 		Status:  "open",
 	}
-	// Even with a past expiry, disregardIfFixable should keep the issue open.
+	// Even with a past expiry, disregardIfFixable returns FindingAwaitingFix.
 	got := mapStatus(issue, past, true)
-	if got != model.FindingOpen {
-		t.Fatalf("mapStatus() = %q, want %q for disregard-if-fixable with past expiry", got, model.FindingOpen)
+	if got != model.FindingAwaitingFix {
+		t.Fatalf("mapStatus() = %q, want %q for disregard-if-fixable with past expiry", got, model.FindingAwaitingFix)
 	}
 }
 

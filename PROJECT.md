@@ -166,7 +166,16 @@ The configured label must already exist in Linear. If it does not, the run fails
 - default: `off`
 - `off`: disables the fallback
 
-The metadata block stores the full managed label set so the sync can remove stale tool-derived labels while preserving unrelated manual labels.
+`LINEAR_AWAITING_FIX_LABEL` controls the label applied to issues where Snyk reports the ignore as "until fix is available" (disregardIfFixable).
+
+- default: `triage-dependency`
+- `off`: disables the awaiting-fix label
+- any other value: the exact Linear label name to apply
+- the label must already exist in Linear
+
+When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels.
+
+The metadata block stores the full managed label set so the sync can remove stale tool-derived, origin-derived, and awaiting-fix labels while preserving unrelated manual labels.
 
 `LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification behavior.
 
@@ -181,6 +190,7 @@ This only affects the persisted subscriber list. Linear still records the API us
 The current workflow mapping is:
 
 - `open` -> `Todo`
+- `ignored until fix available` (disregardIfFixable) -> `Backlog` (no due date, `triage-dependency` label)
 - `temporarily ignored` (snoozed with future expiry) -> `Todo`
 - `permanently ignored` -> `Cancelled`
 - `fixed` -> `Done`
@@ -190,6 +200,8 @@ The current workflow mapping is:
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
 
+The `ignored until fix available` state is distinct from other ignored states because the ignore is conditional on an upstream fix. These issues are placed in `Backlog` with no due date and the `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`). The description renders `Status: ignored (no fix available)` so the Snyk-side reality is visible in Linear. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a recalculated due date.
+
 ### Manual Backlog Override
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
@@ -197,6 +209,8 @@ When a user manually moves a managed open ticket from `Todo` to `Backlog` in Lin
 ### Due Dates
 
 Due dates are normally derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear. For temporarily ignored issues, the due date is instead calculated from the ignore expiry date so the SLA extends to the normal severity offset from when the ignore expires.
+
+Issues ignored "until fix is available" have no due date. The SLA clock is paused while the issue is blocked on an upstream fix. When a fix becomes available, Snyk flips `ignored=false` and the next run calculates a due date from `created_at` + offset (floored to today if past), moving the issue to `Todo`.
 
 Default offsets:
 

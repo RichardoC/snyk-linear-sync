@@ -532,7 +532,7 @@ type issueUpdateInput struct {
 	Priority    *int32   `json:"priority,omitempty"`
 	LabelIds    []string `json:"labelIds,omitempty"`
 	StateId     *string  `json:"stateId,omitempty"`
-	DueDate     *string  `json:"dueDate,omitempty"`
+	DueDate     *string  `json:"dueDate"`
 }
 
 func (c *Client) teamID() string {

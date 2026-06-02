@@ -8,10 +8,11 @@ import (
 type FindingStatus string
 
 const (
-	FindingOpen    FindingStatus = "open"
-	FindingSnoozed FindingStatus = "snoozed"
-	FindingFixed   FindingStatus = "fixed"
-	FindingIgnored FindingStatus = "ignored"
+	FindingOpen        FindingStatus = "open"
+	FindingAwaitingFix FindingStatus = "awaiting_fix"
+	FindingSnoozed     FindingStatus = "snoozed"
+	FindingFixed       FindingStatus = "fixed"
+	FindingIgnored     FindingStatus = "ignored"
 )
 
 type Finding struct {

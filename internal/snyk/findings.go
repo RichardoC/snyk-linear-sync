@@ -577,11 +577,12 @@ func parseIssueCreatedAt(raw string) (time.Time, error) {
 
 func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixable bool) model.FindingStatus {
 	if issue.Ignored {
-		// "Ignore until a fix is available" keeps the issue open because the
-		// ignore is conditional: when a fix appears, Snyk flips ignored=false
-		// and the issue is already in the correct open state.
+		// "Ignore until a fix is available" maps to FindingAwaitingFix so the
+		// sync places the issue in Backlog with no due date, signalling that the
+		// issue is blocked on an upstream fix. When a fix appears, Snyk flips
+		// ignored=false and the next run maps it back to FindingOpen (Todo).
 		if disregardIfFixable {
-			return model.FindingOpen
+			return model.FindingAwaitingFix
 		}
 		if !ignoreExpiresAt.IsZero() && time.Now().Before(ignoreExpiresAt) {
 			return model.FindingOpen

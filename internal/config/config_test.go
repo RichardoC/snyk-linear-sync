@@ -51,6 +51,9 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if len(cfg.Linear.Labels.Origin) != 0 {
 		t.Fatalf("Origin labels = %#v, want empty", cfg.Linear.Labels.Origin)
 	}
+	if cfg.Linear.Labels.AwaitingFix != defaultAwaitingFixLabel {
+		t.Fatalf("AwaitingFix label = %q, want %q", cfg.Linear.Labels.AwaitingFix, defaultAwaitingFixLabel)
+	}
 	if cfg.Linear.Due.CriticalDays != defaultCriticalDueDays {
 		t.Fatalf("Critical due days = %d, want %d", cfg.Linear.Due.CriticalDays, defaultCriticalDueDays)
 	}

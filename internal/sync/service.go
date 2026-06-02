@@ -465,6 +465,13 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 
 func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 	dueDate, dueDateBase := issueDueDate(cfg.Linear.Due, finding)
+	// No meaningful SLA while blocked on an upstream fix. When a fix becomes
+	// available Snyk flips ignored=false; the next run maps it back to
+	// FindingOpen (Todo) and recalculates the due date.
+	if finding.Status == model.FindingAwaitingFix {
+		dueDate = ""
+		dueDateBase = ""
+	}
 	return model.DesiredIssue{
 		Fingerprint:   finding.Fingerprint,
 		Title:         issueTitle(finding),
@@ -555,7 +562,7 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, fmt.Sprintf("Status: `%s`", finding.Status))
+	lines = append(lines, fmt.Sprintf("Status: `%s`", statusDisplayName(finding.Status)))
 	if finding.PackageName != "" {
 		lines = append(lines, fmt.Sprintf("Package: `%s`", finding.PackageName))
 	}
@@ -633,6 +640,8 @@ func metadataBlock(fingerprint string, managedLabels []string) string {
 
 func issueState(status model.FindingStatus) model.IssueState {
 	switch status {
+	case model.FindingAwaitingFix:
+		return model.StateBacklog
 	case model.FindingIgnored:
 		return model.StateCancelled
 	case model.FindingSnoozed:
@@ -641,6 +650,20 @@ func issueState(status model.FindingStatus) model.IssueState {
 		return model.StateDone
 	default:
 		return model.StateTodo
+	}
+}
+
+// statusDisplayName renders the FindingStatus value for the Linear issue
+// description. The raw constant values are code-internal; the description
+// should show what Snyk actually reports.
+func statusDisplayName(status model.FindingStatus) string {
+	switch status {
+	case model.FindingAwaitingFix:
+		return "ignored (no fix available)"
+	case model.FindingSnoozed:
+		return "snoozed"
+	default:
+		return string(status)
 	}
 }
 
@@ -734,8 +757,13 @@ func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool 
 	if normalizeDescriptionForCompare(existing.Description) != normalizeDescriptionForCompare(desired.Description) {
 		return true
 	}
-	if desired.DueDate != "" && existing.DueDate != desired.DueDate {
-		return true
+	if existing.DueDate != desired.DueDate {
+		// Clear a stale due date when the desired state has none (e.g. an
+		// issue that moved to FindingAwaitingFix), or update when Snyk
+		// says the date should change.
+		if desired.DueDate != "" || existing.DueDate != "" {
+			return true
+		}
 	}
 	if !desired.PreserveState && normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State)) {
 		return true
@@ -1019,9 +1047,13 @@ func containsNormalizedLabel(labels []string, target string) bool {
 }
 
 func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string {
-	labels := make([]string, 0, 3)
+	labels := make([]string, 0, 4)
 	if managed := strings.TrimSpace(labelCfg.Managed); managed != "" {
 		labels = append(labels, managed)
+	}
+
+	if finding.Status == model.FindingAwaitingFix && strings.TrimSpace(labelCfg.AwaitingFix) != "" {
+		labels = append(labels, labelCfg.AwaitingFix)
 	}
 
 	issueType := strings.ToLower(strings.TrimSpace(finding.IssueType))

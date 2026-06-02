@@ -861,6 +861,91 @@ func TestManagedLabelsFallsBackToConfiguredOriginDefault(t *testing.T) {
 	}
 }
 
+func TestManagedLabelsAddsAwaitingFixLabel(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed:     "snyk-automation",
+		AwaitingFix: "triage-dependency",
+	}, model.Finding{Status: model.FindingAwaitingFix})
+
+	found := false
+	for _, l := range labels {
+		if l == "triage-dependency" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("managedLabels() = %#v, want triage-dependency for awaiting-fix issue", labels)
+	}
+}
+
+func TestManagedLabelsOmitsAwaitingFixLabelWhenOff(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed:     "snyk-automation",
+		AwaitingFix: "", // off
+	}, model.Finding{Status: model.FindingAwaitingFix})
+
+	for _, l := range labels {
+		if l == "triage-dependency" {
+			t.Fatalf("managedLabels() should not include triage-dependency when AwaitingFix is off")
+		}
+	}
+}
+
+func TestManagedLabelsOmitsAwaitingFixLabelForOpenIssue(t *testing.T) {
+	labels := managedLabels(config.LabelConfig{
+		Managed:     "snyk-automation",
+		AwaitingFix: "triage-dependency",
+	}, model.Finding{Status: model.FindingOpen})
+
+	for _, l := range labels {
+		if l == "triage-dependency" {
+			t.Fatalf("managedLabels() should not include triage-dependency for open issues")
+		}
+	}
+}
+
+func TestNeedsUpdateClearsDueDateWhenDesiredIsEmpty(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "2026-07-01",
+		StateName:   "Backlog",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "", // cleared for awaiting-fix
+		State:       model.StateBacklog,
+		Priority:    2,
+	}
+
+	if !needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = false, want true (must clear stale due date for awaiting-fix)")
+	}
+}
+
+func TestNeedsUpdateSkipsDueDateWhenBothEmpty(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "",
+		StateName:   "Backlog",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:       "title",
+		Description: "description",
+		DueDate:     "",
+		State:       model.StateBacklog,
+		Priority:    2,
+	}
+
+	if needsUpdate(existing, desired) {
+		t.Fatal("needsUpdate() = true, want false (both due dates empty)")
+	}
+}
+
 func TestNeedsUpdateIncludesDueDate(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:       "title",
@@ -1821,26 +1906,45 @@ func TestDesiredIssueDueDateUsesIgnoreExpiryForExpiredSnooze(t *testing.T) {
 	}
 }
 
-// TestDesiredIssueDisregardIfFixableStaysOpen verifies that an issue with
-// disregardIfFixable=true is mapped to FindingOpen (not FindingIgnored),
-// so it stays in the configured open state instead of being cancelled.
-func TestDesiredIssueDisregardIfFixableStaysOpen(t *testing.T) {
+// TestDesiredIssueDisregardIfFixableMapsToBacklog verifies that an issue with
+// disregardIfFixable=true is mapped to FindingAwaitingFix, placed in Backlog
+// with no due date, and receives the triage-dependency label.
+func TestDesiredItemDisregardIfFixableMapsToBacklog(t *testing.T) {
 	cfg := minimalCfg()
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
 	finding := model.Finding{
 		Fingerprint:        "snyk:project-a:issue-1",
 		SnykIssueID:        "issue-1",
 		ProjectName:        "Project A",
 		IssueType:          "package_vulnerability",
 		Severity:           "medium",
-		Status:             model.FindingOpen, // mapStatus returns FindingOpen for disregardIfFixable
+		Status:             model.FindingAwaitingFix,
 		CreatedAt:          time.Date(2026, time.April, 30, 11, 59, 47, 0, time.UTC),
 		DisregardIfFixable: true,
 	}
 
 	desired := desiredIssue(cfg, finding)
 
-	if desired.State != model.StateTodo {
-		t.Fatalf("desired state = %q, want %q for disregard-if-fixable issue", desired.State, model.StateTodo)
+	if desired.State != model.StateBacklog {
+		t.Fatalf("desired state = %q, want %q for disregard-if-fixable issue", desired.State, model.StateBacklog)
+	}
+	if desired.DueDate != "" {
+		t.Fatalf("desired due date = %q, want empty for disregard-if-fixable issue", desired.DueDate)
+	}
+	if desired.DueDateBase != "" {
+		t.Fatalf("desired due date base = %q, want empty for disregard-if-fixable issue", desired.DueDateBase)
+	}
+	labelFound := false
+	for _, label := range desired.ManagedLabels {
+		if label == "triage-dependency" {
+			labelFound = true
+		}
+	}
+	if !labelFound {
+		t.Fatalf("managed labels = %v, want triage-dependency for disregard-if-fixable issue", desired.ManagedLabels)
+	}
+	if !strings.Contains(desired.Description, "ignored (no fix available)") {
+		t.Fatalf("description should contain 'ignored (no fix available)', got: %s", desired.Description)
 	}
 }
 
@@ -1994,5 +2098,146 @@ func TestRunCorrectsOverriddenDueDateWithAuthoritativeCalculation(t *testing.T) 
 	}
 	if linear.updated[0].DueDate != today {
 		t.Fatalf("updated due date = %q, want %q (authoritative Snyk date floored to today)", linear.updated[0].DueDate, today)
+	}
+}
+
+// TestRunAwaitingFixIssueGoesToBacklogWithNoDueDate verifies the full flow for
+// a Snyk finding with disregardIfFixable=true: the sync creates the Linear
+// issue in Backlog with no due date and the triage-dependency label.
+func TestRunAwaitingFixIssueGoesToBacklogWithNoDueDate(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:        "snyk:project-a:issue-1",
+					SnykIssueID:        "issue-1",
+					ProjectID:          "project-a",
+					ProjectName:        "Project A",
+					IssueTitle:         "XSS in postcss",
+					IssueType:          "package_vulnerability",
+					Severity:           "medium",
+					Status:             model.FindingAwaitingFix,
+					CreatedAt:          time.Date(2026, time.April, 24, 20, 20, 42, 0, time.UTC),
+					DisregardIfFixable: true,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{}}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1", result.PlannedCreates)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	created := linear.created[0]
+	if created.State != model.StateBacklog {
+		t.Fatalf("created state = %q, want %q", created.State, model.StateBacklog)
+	}
+	if created.DueDate != "" {
+		t.Fatalf("created due date = %q, want empty for awaiting-fix issue", created.DueDate)
+	}
+	labelFound := false
+	for _, label := range created.ManagedLabels {
+		if label == "triage-dependency" {
+			labelFound = true
+		}
+	}
+	if !labelFound {
+		t.Fatalf("created managed labels = %v, want triage-dependency", created.ManagedLabels)
+	}
+	if !strings.Contains(created.Description, "ignored (no fix available)") {
+		t.Fatalf("description should contain 'ignored (no fix available)'")
+	}
+}
+
+// TestRunAwaitingFixIssueMovedFromTodoToBacklog verifies that when an existing
+// issue was previously synced as Todo (before the awaiting-fix feature) and
+// the Snyk finding now maps to FindingAwaitingFix, the sync moves it to
+// Backlog, clears the due date, and adds the triage-dependency label.
+func TestRunAwaitingFixIssueMovedFromTodoToBacklog(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint:        "snyk:project-a:issue-1",
+		SnykIssueID:        "issue-1",
+		ProjectID:          "project-a",
+		ProjectName:        "Project A",
+		IssueTitle:         "XSS in postcss",
+		IssueType:          "package_vulnerability",
+		Severity:           "medium",
+		Status:             model.FindingAwaitingFix,
+		CreatedAt:          time.Date(2026, time.April, 24, 20, 20, 42, 0, time.UTC),
+		DisregardIfFixable: true,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         desired.Title,
+				Description:   desired.Description,
+				DueDate:       "2026-06-08", // old due date from before awaiting-fix
+				StateName:     "Todo",       // was in Todo before
+				Fingerprint:   finding.Fingerprint,
+				Priority:       desired.Priority,
+				ManagedLabels:  []string{"snyk-automation"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+	if updated.State != model.StateBacklog {
+		t.Fatalf("updated state = %q, want %q", updated.State, model.StateBacklog)
+	}
+	if updated.DueDate != "" {
+		t.Fatalf("updated due date = %q, want empty (cleared for awaiting-fix)", updated.DueDate)
+	}
+	labelFound := false
+	for _, label := range updated.ManagedLabels {
+		if label == "triage-dependency" {
+			labelFound = true
+		}
+	}
+	if !labelFound {
+		t.Fatalf("updated managed labels = %v, want triage-dependency", updated.ManagedLabels)
 	}
 }
