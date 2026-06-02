@@ -87,7 +87,8 @@ type DesiredIssue struct {
 	Fingerprint   string
 	Title         string
 	Description   string
-	DueDate       string
+	DueDate       string // effective due date written to Linear (floored to today if the raw SLA date is past)
+	DueDateBase   string // raw SLA date from Snyk data (CreatedAt or IgnoreExpiresAt + offset); used for cache hashing so that the floor-to-today adjustment does not cause daily cache churn
 	State         IssueState
 	ManagedLabels []string
 	Priority      int

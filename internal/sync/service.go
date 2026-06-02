@@ -459,11 +459,13 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 }
 
 func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
+	dueDate, dueDateBase := issueDueDate(cfg.Linear.Due, finding)
 	return model.DesiredIssue{
 		Fingerprint:   finding.Fingerprint,
 		Title:         issueTitle(finding),
 		Description:   issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding),
-		DueDate:       issueDueDate(cfg.Linear.Due, finding),
+		DueDate:       dueDate,
+		DueDateBase:   dueDateBase,
 		State:         issueState(finding.Status),
 		ManagedLabels: managedLabels(cfg.Linear.Labels, finding),
 		Priority:      issuePriority(finding.Severity),
@@ -652,7 +654,7 @@ func issuePriority(severity string) int {
 	}
 }
 
-func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
+func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective, base string) {
 	var baseDate time.Time
 	switch {
 	case !finding.IgnoreExpiresAt.IsZero():
@@ -662,7 +664,7 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
 		createdAtUTC := finding.CreatedAt.UTC()
 		baseDate = time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
 	default:
-		return ""
+		return "", ""
 	}
 
 	var days int
@@ -676,10 +678,32 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) string {
 	case 4:
 		days = dueCfg.LowDays
 	default:
-		return ""
+		return "", ""
 	}
 
-	return baseDate.AddDate(0, 0, days).Format(time.DateOnly)
+	dueDate := baseDate.AddDate(0, 0, days)
+	base = dueDate.Format(time.DateOnly)
+
+	// Floor to today when the calculated date is in the past. Snyk data
+	// is the authoritative source for the due date, so the sync must
+	// always set it — even if someone manually overrode it in Linear.
+	// A past due date is not useful for triage, so flooring to today
+	// signals "this is overdue and needs attention now" while keeping
+	// the sync authoritative.
+	//
+	// The base (raw) date is returned separately so the cache hash
+	// uses the stable raw value instead of the floored date. This
+	// prevents daily cache churn for overdue issues whose underlying
+	// Snyk data has not changed.
+	now := time.Now()
+	if dueDate.Before(now) {
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		effective = today.Format(time.DateOnly)
+	} else {
+		effective = base
+	}
+
+	return effective, base
 }
 
 func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {
