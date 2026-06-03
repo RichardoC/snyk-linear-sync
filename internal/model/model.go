@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -96,9 +97,66 @@ type DesiredIssue struct {
 	PreserveState bool
 }
 
+// IssueDiff captures which managed fields changed between the existing and
+// desired Linear issue. It is used to generate human-readable change
+// comments posted after each update batch.
+type IssueDiff struct {
+	TitleChanged       bool
+	TitleFrom          string
+	TitleTo            string
+	DescriptionChanged bool
+	DueDateChanged     bool
+	DueDateFrom        string
+	DueDateTo          string
+	StateChanged       bool
+	StateFrom          string
+	StateTo            string
+	PriorityChanged    bool
+	PriorityFrom       int
+	PriorityTo         int
+	LabelsAdded        []string
+	LabelsRemoved      []string
+}
+
 type IssueUpdate struct {
 	Existing ExistingIssue
 	Desired  DesiredIssue
+	Diff     *IssueDiff
+}
+
+// NormalizeLabelName normalizes a label name for comparison.
+func NormalizeLabelName(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+// NormalizeWorkflowStateName normalizes a Linear state name for comparison.
+// It lowercases the value, strips whitespace, and maps common variants
+// (e.g. "Canceled" → "cancelled") so state matching works regardless of
+// how the Linear workspace is configured.
+func NormalizeWorkflowStateName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "canceled":
+		return "cancelled"
+	default:
+		return value
+	}
+}
+
+// StateName returns the canonical state name for a model.IssueState.
+func StateName(state IssueState) string {
+	switch state {
+	case StateTodo:
+		return "todo"
+	case StateBacklog:
+		return "backlog"
+	case StateDone:
+		return "done"
+	case StateCancelled:
+		return "cancelled"
+	default:
+		return ""
+	}
 }
 
 func Fingerprint(projectID, issueID string) string {

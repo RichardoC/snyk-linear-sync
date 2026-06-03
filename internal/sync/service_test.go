@@ -27,6 +27,7 @@ type fakeLinear struct {
 	created  []model.DesiredIssue
 	updated  []model.DesiredIssue
 	updates  []model.IssueUpdate
+	comments []model.IssueUpdate
 }
 
 type fakeCache struct {
@@ -48,6 +49,11 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 		f.updated = append(f.updated, update.Desired)
 		f.updates = append(f.updates, update)
 	}
+	return nil
+}
+
+func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) error {
+	f.comments = append(f.comments, updates...)
 	return nil
 }
 
@@ -2239,5 +2245,143 @@ func TestRunAwaitingFixIssueMovedFromTodoToBacklog(t *testing.T) {
 	}
 	if !labelFound {
 		t.Fatalf("updated managed labels = %v, want triage-dependency", updated.ManagedLabels)
+	}
+}
+
+func TestComputeDiffDetectsAllChanges(t *testing.T) {
+	existing := model.ExistingIssue{
+		ID:            "issue-1",
+		Identifier:    "SEC-1",
+		Title:         "old title",
+		Description:   "old description",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      3,
+		ManagedLabels: []string{"snyk-automation"},
+		Labels:        []model.IssueLabel{{ID: "label-1", Name: "snyk-automation"}},
+	}
+	desired := model.DesiredIssue{
+		Title:         "new title",
+		Description:   "new description",
+		DueDate:       "2026-05-01",
+		State:         model.StateBacklog,
+		Priority:      1,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if !diff.TitleChanged {
+		t.Fatal("expected TitleChanged")
+	}
+	if diff.TitleFrom != "old title" || diff.TitleTo != "new title" {
+		t.Fatalf("title diff = %q → %q", diff.TitleFrom, diff.TitleTo)
+	}
+	if !diff.DescriptionChanged {
+		t.Fatal("expected DescriptionChanged")
+	}
+	if !diff.DueDateChanged {
+		t.Fatal("expected DueDateChanged")
+	}
+	if diff.DueDateFrom != "2026-04-01" || diff.DueDateTo != "2026-05-01" {
+		t.Fatalf("due date diff = %q → %q", diff.DueDateFrom, diff.DueDateTo)
+	}
+	if !diff.StateChanged {
+		t.Fatal("expected StateChanged")
+	}
+	if diff.StateTo != "backlog" {
+		t.Fatalf("state to = %q", diff.StateTo)
+	}
+	if !diff.PriorityChanged {
+		t.Fatal("expected PriorityChanged")
+	}
+	if diff.PriorityFrom != 3 || diff.PriorityTo != 1 {
+		t.Fatalf("priority diff = %d → %d", diff.PriorityFrom, diff.PriorityTo)
+	}
+	if len(diff.LabelsAdded) != 1 || diff.LabelsAdded[0] != "snyk-code" {
+		t.Fatalf("labels added = %v, want [snyk-code]", diff.LabelsAdded)
+	}
+	if len(diff.LabelsRemoved) != 0 {
+		t.Fatalf("labels removed = %v, want []", diff.LabelsRemoved)
+	}
+}
+
+func TestComputeDiffDetectsNoChanges(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "same title",
+		Description:   "same description",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+	desired := model.DesiredIssue{
+		Title:         "same title",
+		Description:   "same description",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if diff.TitleChanged || diff.DescriptionChanged || diff.DueDateChanged ||
+		diff.StateChanged || diff.PriorityChanged ||
+		len(diff.LabelsAdded) > 0 || len(diff.LabelsRemoved) > 0 {
+		t.Fatalf("expected no changes, got: %+v", diff)
+	}
+}
+
+func TestComputeDiffDetectsLabelRemoval(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+		Labels: []model.IssueLabel{
+			{ID: "l1", Name: "snyk-automation"},
+			{ID: "l2", Name: "snyk-code"},
+		},
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if len(diff.LabelsRemoved) != 1 || diff.LabelsRemoved[0] != "snyk-code" {
+		t.Fatalf("labels removed = %v, want [snyk-code]", diff.LabelsRemoved)
+	}
+}
+
+func TestComputeDiffNoStateChangeWhenPreserveState(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "desc",
+		DueDate:     "2026-04-01",
+		StateName:   "Todo",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateBacklog,
+		PreserveState: true,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if diff.StateChanged {
+		t.Fatal("expected no state change when PreserveState=true")
 	}
 }

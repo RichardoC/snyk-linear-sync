@@ -28,6 +28,7 @@ type LinearClient interface {
 	LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error)
 	CreateIssues(ctx context.Context, desired []model.DesiredIssue) error
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
+	PostComments(ctx context.Context, updates []model.IssueUpdate) error
 }
 
 type CacheStore interface {
@@ -224,7 +225,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				continue
 			}
 			if needsUpdate(existing, desired) {
-				updateBatch = append(updateBatch, model.IssueUpdate{Existing: existing, Desired: desired})
+				update := model.IssueUpdate{Existing: existing, Desired: desired}
+				update.Diff = ComputeDiff(existing, desired)
+				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
 					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
@@ -257,7 +260,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				Priority:      existing.Priority,
 			}
 			if needsUpdate(existing, resolved) {
-				resolveBatch = append(resolveBatch, model.IssueUpdate{Existing: existing, Desired: resolved})
+				resolvedUpdate := model.IssueUpdate{Existing: existing, Desired: resolved}
+				resolvedUpdate.Diff = ComputeDiff(existing, resolved)
+				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
 					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
@@ -282,7 +287,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				Priority:      duplicate.Priority,
 			}
 			if needsUpdate(duplicate, desired) {
-				cancelBatch = append(cancelBatch, model.IssueUpdate{Existing: duplicate, Desired: desired})
+				cancelUpdate := model.IssueUpdate{Existing: duplicate, Desired: desired}
+				cancelUpdate.Diff = ComputeDiff(duplicate, desired)
+				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
 					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
@@ -394,6 +401,13 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 					)
 				}
 			}
+		} else {
+			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
+				s.logger.Warn("failed to post update comments",
+					slog.Int("batch_size", len(job.updateBatch)),
+					slog.Any("error", err),
+				)
+			}
 		}
 		return nil
 	case jobResolve:
@@ -417,6 +431,13 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 					)
 				}
 			}
+		} else {
+			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
+				s.logger.Warn("failed to post resolve comments",
+					slog.Int("batch_size", len(job.updateBatch)),
+					slog.Any("error", err),
+				)
+			}
 		}
 		return nil
 	case jobCancelDuplicate:
@@ -439,6 +460,13 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 						slog.Any("error", err),
 					)
 				}
+			}
+		} else {
+			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
+				s.logger.Warn("failed to post cancel-duplicate comments",
+					slog.Int("batch_size", len(job.updateBatch)),
+					slog.Any("error", err),
+				)
 			}
 		}
 		return nil
@@ -775,6 +803,79 @@ func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool 
 		return true
 	}
 	return false
+}
+
+// ComputeDiff returns a diff describing which managed fields changed between
+// the existing and desired Linear issue. The caller is responsible for only
+// displaying a change when the corresponding field is non-empty (e.g. a
+// resolved issue may carry the existing issue's title and description).
+func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *model.IssueDiff {
+	d := &model.IssueDiff{}
+
+	if existing.Title != desired.Title {
+		d.TitleChanged = true
+		d.TitleFrom = existing.Title
+		d.TitleTo = desired.Title
+	}
+
+	if normalizeDescriptionForCompare(existing.Description) != normalizeDescriptionForCompare(desired.Description) {
+		d.DescriptionChanged = true
+	}
+
+	if existing.DueDate != desired.DueDate {
+		if desired.DueDate != "" || existing.DueDate != "" {
+			d.DueDateChanged = true
+			d.DueDateFrom = existing.DueDate
+			d.DueDateTo = desired.DueDate
+		}
+	}
+
+	if !desired.PreserveState {
+		existingNorm := model.NormalizeWorkflowStateName(existing.StateName)
+		desiredNorm := model.NormalizeWorkflowStateName(model.StateName(desired.State))
+		if existingNorm != desiredNorm {
+			d.StateChanged = true
+			d.StateFrom = existing.StateName
+			d.StateTo = desiredNorm
+		}
+	}
+
+	if existing.Priority != desired.Priority {
+		d.PriorityChanged = true
+		d.PriorityFrom = existing.Priority
+		d.PriorityTo = desired.Priority
+	}
+
+	existingLabels := make(map[string]struct{}, len(existing.Labels))
+	for _, l := range existing.Labels {
+		existingLabels[model.NormalizeLabelName(l.Name)] = struct{}{}
+	}
+	desiredLabelSet := make(map[string]struct{}, len(desired.ManagedLabels))
+	for _, l := range desired.ManagedLabels {
+		desiredLabelSet[model.NormalizeLabelName(l)] = struct{}{}
+	}
+	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
+	for _, l := range existing.ManagedLabels {
+		previousManaged[model.NormalizeLabelName(l)] = struct{}{}
+	}
+
+	for label := range desiredLabelSet {
+		if _, inPrevious := previousManaged[label]; inPrevious {
+			continue
+		}
+		if _, inExisting := existingLabels[label]; !inExisting {
+			d.LabelsAdded = append(d.LabelsAdded, label)
+		}
+	}
+
+	for _, label := range existing.ManagedLabels {
+		norm := model.NormalizeLabelName(label)
+		if _, exists := desiredLabelSet[norm]; !exists {
+			d.LabelsRemoved = append(d.LabelsRemoved, norm)
+		}
+	}
+
+	return d
 }
 
 func stateName(state model.IssueState) string {

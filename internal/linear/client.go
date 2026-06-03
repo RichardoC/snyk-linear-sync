@@ -215,6 +215,58 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 	return nil
 }
 
+// PostComments posts a single change-summary comment on each updated issue,
+// explaining which managed fields were modified and why. Comments are posted
+// after a successful update/resolve/cancel mutation so the Linear history
+// shows exactly what the sync changed.
+func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	type commentJob struct {
+		index   int
+		comment string
+	}
+	var jobs []commentJob
+	for i, update := range updates {
+		if comment := buildChangeComment(update); comment != "" {
+			jobs = append(jobs, commentJob{index: i, comment: comment})
+		}
+	}
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	op := gqlclient.NewOperation(commentCreateMutation(len(jobs)))
+	for j, job := range jobs {
+		input := commentCreateInput{
+			Body:          &job.comment,
+			IssueId:       updates[job.index].Existing.ID,
+			SubscriberIds: c.actorSubscriberIDsForComment(),
+		}
+		op.Var(fmt.Sprintf("input%d", j), input)
+	}
+
+	resp := map[string]struct {
+		Success bool `json:"success"`
+		Comment struct {
+			ID string `json:"id"`
+		} `json:"comment"`
+	}{}
+	if err := c.execute(ctx, op, &resp); err != nil {
+		return fmt.Errorf("post Linear change comments: %w", err)
+	}
+
+	for alias, result := range resp {
+		if !result.Success {
+			return fmt.Errorf("post Linear change comment failed without GraphQL error for %s", alias)
+		}
+	}
+
+	return nil
+}
+
 func (c *Client) loadStates(ctx context.Context) error {
 	var after *string
 	states := map[string]string{}
@@ -515,6 +567,14 @@ func (c *Client) actorSubscriberIDsForCreate() *[]string {
 	return &ids
 }
 
+func (c *Client) actorSubscriberIDsForComment() *[]string {
+	if !c.cfg.UnsubscribeActor {
+		return nil
+	}
+	ids := []string{}
+	return &ids
+}
+
 type issueCreateInput struct {
 	Title         *string   `json:"title,omitempty"`
 	Description   *string   `json:"description,omitempty"`
@@ -533,6 +593,12 @@ type issueUpdateInput struct {
 	LabelIds    []string `json:"labelIds,omitempty"`
 	StateId     *string  `json:"stateId,omitempty"`
 	DueDate     *string  `json:"dueDate"`
+}
+
+type commentCreateInput struct {
+	Body          *string   `json:"body,omitempty"`
+	IssueId       string    `json:"issueId"`
+	SubscriberIds *[]string `json:"subscriberIds,omitempty"`
 }
 
 func (c *Client) teamID() string {
@@ -869,6 +935,55 @@ func normalizeManagedLabelNames(values []string) []string {
 	return out
 }
 
+// buildChangeComment generates a human-readable comment summarizing which
+// managed fields changed on an issue and why. It returns an empty string
+// when there is nothing meaningful to report.
+func buildChangeComment(update model.IssueUpdate) string {
+	if update.Diff == nil {
+		return ""
+	}
+	d := update.Diff
+	if !d.TitleChanged && !d.DescriptionChanged && !d.DueDateChanged &&
+		!d.StateChanged && !d.PriorityChanged && len(d.LabelsAdded) == 0 && len(d.LabelsRemoved) == 0 {
+		return ""
+	}
+
+	lines := []string{"**snyk-linear-sync**"}
+	lines = append(lines, "")
+
+	if d.TitleChanged {
+		lines = append(lines, fmt.Sprintf("- **Title**: `%s` → `%s`", d.TitleFrom, d.TitleTo))
+	}
+	if d.DescriptionChanged {
+		lines = append(lines, "- **Description** updated")
+	}
+	if d.DueDateChanged {
+		from := d.DueDateFrom
+		if from == "" {
+			from = "(none)"
+		}
+		to := d.DueDateTo
+		if to == "" {
+			to = "(cleared)"
+		}
+		lines = append(lines, fmt.Sprintf("- **Due date**: `%s` → `%s`", from, to))
+	}
+	if d.StateChanged {
+		lines = append(lines, fmt.Sprintf("- **State**: `%s` → `%s`", d.StateFrom, d.StateTo))
+	}
+	if d.PriorityChanged {
+		lines = append(lines, fmt.Sprintf("- **Priority**: %d → %d", d.PriorityFrom, d.PriorityTo))
+	}
+	if len(d.LabelsAdded) > 0 {
+		lines = append(lines, fmt.Sprintf("- **Labels added**: %s", strings.Join(d.LabelsAdded, ", ")))
+	}
+	if len(d.LabelsRemoved) > 0 {
+		lines = append(lines, fmt.Sprintf("- **Labels removed**: %s", strings.Join(d.LabelsRemoved, ", ")))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func createIssuesMutation(size int) string {
 	var builder strings.Builder
 	builder.WriteString("mutation issueCreateBatch(")
@@ -924,6 +1039,28 @@ func issueUnsubscribeMutation(size int) string {
 	for i := range size {
 		builder.WriteString(fmt.Sprintf("  issueUnsubscribe%d: issueUnsubscribe(id: $id%d) {\n", i, i))
 		builder.WriteString("    success\n")
+		builder.WriteString("  }\n")
+	}
+	builder.WriteString("}")
+	return builder.String()
+}
+
+func commentCreateMutation(size int) string {
+	var builder strings.Builder
+	builder.WriteString("mutation commentCreateBatch(")
+	for i := range size {
+		if i > 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(fmt.Sprintf("$input%d: CommentCreateInput!", i))
+	}
+	builder.WriteString(") {\n")
+	for i := range size {
+		builder.WriteString(fmt.Sprintf("  commentCreate%d: commentCreate(input: $input%d) {\n", i, i))
+		builder.WriteString("    success\n")
+		builder.WriteString("    comment {\n")
+		builder.WriteString("      id\n")
+		builder.WriteString("    }\n")
 		builder.WriteString("  }\n")
 	}
 	builder.WriteString("}")

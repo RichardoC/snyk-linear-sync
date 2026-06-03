@@ -456,3 +456,122 @@ func TestUpdateIssuesOmitsStateIdWhenPreserveStateTrue(t *testing.T) {
 		t.Fatalf("title = %v, want 'updated title'", input0["title"])
 	}
 }
+
+func TestBuildChangeCommentGeneratesSummary(t *testing.T) {
+	update := model.IssueUpdate{
+		Existing: model.ExistingIssue{
+			ID:            "issue-1",
+			Identifier:    "SEC-1",
+			Title:         "old title",
+			Description:   "old body",
+			DueDate:       "2026-04-01",
+			StateName:     "Todo",
+			Priority:      3,
+			ManagedLabels: []string{"snyk-automation"},
+			Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}},
+		},
+		Desired: model.DesiredIssue{
+			Title:         "new title",
+			Description:   "new body",
+			DueDate:       "2026-05-01",
+			State:         model.StateBacklog,
+			Priority:      1,
+			ManagedLabels: []string{"snyk-automation", "snyk-code"},
+		},
+		Diff: &model.IssueDiff{
+			TitleChanged:       true,
+			TitleFrom:          "old title",
+			TitleTo:            "new title",
+			DescriptionChanged: true,
+			DueDateChanged:     true,
+			DueDateFrom:        "2026-04-01",
+			DueDateTo:          "2026-05-01",
+			StateChanged:       true,
+			StateFrom:          "Todo",
+			StateTo:            "backlog",
+			PriorityChanged:    true,
+			PriorityFrom:       3,
+			PriorityTo:         1,
+			LabelsAdded:        []string{"snyk-code"},
+		},
+	}
+
+	comment := buildChangeComment(update)
+
+	if comment == "" {
+		t.Fatal("expected non-empty comment")
+	}
+	if !strings.Contains(comment, "**snyk-linear-sync**") {
+		t.Fatalf("comment missing header: %s", comment)
+	}
+	if !strings.Contains(comment, "**Title**") {
+		t.Fatalf("comment missing title change: %s", comment)
+	}
+	if !strings.Contains(comment, "**Description**") {
+		t.Fatalf("comment missing description change: %s", comment)
+	}
+	if !strings.Contains(comment, "**Due date**") {
+		t.Fatalf("comment missing due date change: %s", comment)
+	}
+	if !strings.Contains(comment, "**State**") {
+		t.Fatalf("comment missing state change: %s", comment)
+	}
+	if !strings.Contains(comment, "**Priority**") {
+		t.Fatalf("comment missing priority change: %s", comment)
+	}
+	if !strings.Contains(comment, "**Labels added**") {
+		t.Fatalf("comment missing labels added: %s", comment)
+	}
+}
+
+func TestBuildChangeCommentReturnsEmptyWhenNoChanges(t *testing.T) {
+	update := model.IssueUpdate{
+		Existing: model.ExistingIssue{
+			Title:       "title",
+			Description: "desc",
+			DueDate:     "2026-04-01",
+			StateName:   "Todo",
+			Priority:    2,
+		},
+		Desired: model.DesiredIssue{
+			Title:       "title",
+			Description: "desc",
+			DueDate:     "2026-04-01",
+			State:       model.StateTodo,
+			Priority:    2,
+		},
+		Diff: &model.IssueDiff{},
+	}
+
+	comment := buildChangeComment(update)
+
+	if comment != "" {
+		t.Fatalf("expected empty comment, got: %s", comment)
+	}
+}
+
+func TestBuildChangeCommentReturnsEmptyWhenDiffIsNil(t *testing.T) {
+	update := model.IssueUpdate{
+		Existing: model.ExistingIssue{
+			Title:       "title",
+			Description: "desc",
+			DueDate:     "2026-04-01",
+			StateName:   "Todo",
+			Priority:    2,
+		},
+		Desired: model.DesiredIssue{
+			Title:       "new title",
+			Description: "new desc",
+			DueDate:     "2026-05-01",
+			State:       model.StateBacklog,
+			Priority:    1,
+		},
+		Diff: nil,
+	}
+
+	comment := buildChangeComment(update)
+
+	if comment != "" {
+		t.Fatalf("expected empty comment when diff is nil, got: %s", comment)
+	}
+}
