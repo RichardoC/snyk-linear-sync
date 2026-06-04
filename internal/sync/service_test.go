@@ -2304,6 +2304,9 @@ func TestComputeDiffDetectsAllChanges(t *testing.T) {
 	if len(diff.LabelsRemoved) != 0 {
 		t.Fatalf("labels removed = %v, want []", diff.LabelsRemoved)
 	}
+	if !diff.LabelsNeedUpdate {
+		t.Fatal("expected LabelsNeedUpdate when labels are added")
+	}
 }
 
 func TestComputeDiffDetectsNoChanges(t *testing.T) {
@@ -2327,7 +2330,7 @@ func TestComputeDiffDetectsNoChanges(t *testing.T) {
 	diff := ComputeDiff(existing, desired)
 
 	if diff.TitleChanged || diff.DescriptionChanged || diff.DueDateChanged ||
-		diff.StateChanged || diff.PriorityChanged ||
+		diff.StateChanged || diff.PriorityChanged || diff.LabelsNeedUpdate ||
 		len(diff.LabelsAdded) > 0 || len(diff.LabelsRemoved) > 0 {
 		t.Fatalf("expected no changes, got: %+v", diff)
 	}
@@ -2360,6 +2363,9 @@ func TestComputeDiffDetectsLabelRemoval(t *testing.T) {
 	if len(diff.LabelsRemoved) != 1 || diff.LabelsRemoved[0] != "snyk-code" {
 		t.Fatalf("labels removed = %v, want [snyk-code]", diff.LabelsRemoved)
 	}
+	if !diff.LabelsNeedUpdate {
+		t.Fatal("expected LabelsNeedUpdate when labels are removed")
+	}
 }
 
 func TestComputeDiffNoStateChangeWhenPreserveState(t *testing.T) {
@@ -2383,5 +2389,128 @@ func TestComputeDiffNoStateChangeWhenPreserveState(t *testing.T) {
 
 	if diff.StateChanged {
 		t.Fatal("expected no state change when PreserveState=true")
+	}
+}
+
+func TestComputeDiffDetectsLabelNotOnIssue(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+		// snyk-code is managed but not actually on the issue (failed to apply).
+		Labels: []model.IssueLabel{
+			{ID: "l1", Name: "snyk-automation"},
+		},
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if !diff.LabelsNeedUpdate {
+		t.Fatal("expected LabelsNeedUpdate when managed label is not on issue")
+	}
+	if len(diff.LabelsAdded) != 0 {
+		t.Fatalf("LabelsAdded = %v, want empty (label was in previous managed set)", diff.LabelsAdded)
+	}
+	if len(diff.LabelsRemoved) != 0 {
+		t.Fatalf("LabelsRemoved = %v, want empty", diff.LabelsRemoved)
+	}
+}
+
+func TestRunPostsChangeCommentsOnUpdate(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Updated title",
+					PackageName: "github.com/example/pkg",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    3,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(linear.comments))
+	}
+}
+
+func TestRunSkipsCommentsForResolve(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "resolved issue",
+				Description:   "old description\n\u003c!-- snyk-linear-sync\nfingerprint: snyk:project-z:issue-9\n--\u003e",
+				StateName:     "Todo",
+				Fingerprint:   "snyk:project-z:issue-9",
+				ManagedLabels: []string{"snyk-automation"},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if len(linear.comments) != 0 {
+		t.Fatalf("comments = %d, want 0 (no comments for resolve)", len(linear.comments))
 	}
 }

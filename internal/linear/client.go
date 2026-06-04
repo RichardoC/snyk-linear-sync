@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -225,13 +224,13 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 	}
 
 	type commentJob struct {
-		index   int
+		issueID string
 		comment string
 	}
 	var jobs []commentJob
-	for i, update := range updates {
+	for _, update := range updates {
 		if comment := buildChangeComment(update); comment != "" {
-			jobs = append(jobs, commentJob{index: i, comment: comment})
+			jobs = append(jobs, commentJob{issueID: update.Existing.ID, comment: comment})
 		}
 	}
 	if len(jobs) == 0 {
@@ -242,7 +241,7 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 	for j, job := range jobs {
 		input := commentCreateInput{
 			Body:          &job.comment,
-			IssueId:       updates[job.index].Existing.ID,
+			IssueId:       job.issueID,
 			SubscriberIds: c.actorSubscriberIDsForComment(),
 		}
 		op.Var(fmt.Sprintf("input%d", j), input)
@@ -671,7 +670,7 @@ func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) e
 	}
 
 	c.mu.RLock()
-	if c.managedLabelIDs[normalizeLabelName(managedLabel)] != "" {
+	if c.managedLabelIDs[model.NormalizeLabelName(managedLabel)] != "" {
 		c.mu.RUnlock()
 		return nil
 	}
@@ -752,7 +751,7 @@ query managedIssueLabels($name: String!, $after: String) {
 	}
 
 	c.mu.Lock()
-	c.managedLabelIDs[normalizeLabelName(managedLabel)] = resolved
+	c.managedLabelIDs[model.NormalizeLabelName(managedLabel)] = resolved
 	c.mu.Unlock()
 	return nil
 }
@@ -782,7 +781,7 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 	}
 
 	for _, label := range existing.Labels {
-		normalized := normalizeLabelName(label.Name)
+		normalized := model.NormalizeLabelName(label.Name)
 		if _, managed := previousManaged[normalized]; managed {
 			continue
 		}
@@ -906,33 +905,8 @@ func stateType(state model.IssueState) string {
 	}
 }
 
-func normalizeLabelName(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
-}
-
 func normalizeManagedLabelNames(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(values))
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		normalized := normalizeLabelName(value)
-		if normalized == "" {
-			continue
-		}
-		if _, exists := seen[normalized]; exists {
-			continue
-		}
-		seen[normalized] = struct{}{}
-		out = append(out, normalized)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	slices.Sort(out)
-	return out
+	return model.NormalizeManagedLabelNames(values)
 }
 
 // buildChangeComment generates a human-readable comment summarizing which
@@ -972,7 +946,7 @@ func buildChangeComment(update model.IssueUpdate) string {
 		lines = append(lines, fmt.Sprintf("- **State**: `%s` → `%s`", d.StateFrom, d.StateTo))
 	}
 	if d.PriorityChanged {
-		lines = append(lines, fmt.Sprintf("- **Priority**: %d → %d", d.PriorityFrom, d.PriorityTo))
+		lines = append(lines, fmt.Sprintf("- **Priority**: `%d` → `%d`", d.PriorityFrom, d.PriorityTo))
 	}
 	if len(d.LabelsAdded) > 0 {
 		lines = append(lines, fmt.Sprintf("- **Labels added**: %s", strings.Join(d.LabelsAdded, ", ")))

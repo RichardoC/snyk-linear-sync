@@ -519,6 +519,9 @@ func TestBuildChangeCommentGeneratesSummary(t *testing.T) {
 	if !strings.Contains(comment, "**Priority**") {
 		t.Fatalf("comment missing priority change: %s", comment)
 	}
+	if !strings.Contains(comment, "**Priority**: `3` → `1`") {
+		t.Fatalf("comment priority not backtick-formatted: %s", comment)
+	}
 	if !strings.Contains(comment, "**Labels added**") {
 		t.Fatalf("comment missing labels added: %s", comment)
 	}

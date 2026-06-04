@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -116,6 +117,12 @@ type IssueDiff struct {
 	PriorityTo         int
 	LabelsAdded        []string
 	LabelsRemoved      []string
+	LabelsNeedUpdate   bool
+}
+
+func (d *IssueDiff) HasChanges() bool {
+	return d.TitleChanged || d.DescriptionChanged || d.DueDateChanged ||
+		d.StateChanged || d.PriorityChanged || d.LabelsNeedUpdate
 }
 
 type IssueUpdate struct {
@@ -163,11 +170,48 @@ func Fingerprint(projectID, issueID string) string {
 	return fmt.Sprintf("snyk:%s:%s", projectID, issueID)
 }
 
-func (i ExistingIssue) HasLabel(name string) bool {
-	for _, label := range i.Labels {
-		if label.Name == name {
+// NormalizeManagedLabelNames deduplicates, normalizes, and sorts a set of
+// label names for consistent comparison and storage.
+func NormalizeManagedLabelNames(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := NormalizeLabelName(value)
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return out
+}
+
+// HasLabelNamed reports whether the label list contains a label with the
+// given name, using case-insensitive normalized comparison.
+func HasLabelNamed(labels []IssueLabel, name string) bool {
+	name = NormalizeLabelName(name)
+	if name == "" {
+		return false
+	}
+	for _, label := range labels {
+		if NormalizeLabelName(label.Name) == name {
 			return true
 		}
 	}
 	return false
+}
+
+func (i ExistingIssue) HasLabel(name string) bool {
+	return HasLabelNamed(i.Labels, name)
 }
