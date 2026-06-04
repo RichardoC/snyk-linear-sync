@@ -27,6 +27,7 @@ type fakeLinear struct {
 	created  []model.DesiredIssue
 	updated  []model.DesiredIssue
 	updates  []model.IssueUpdate
+	comments []model.IssueUpdate
 }
 
 type fakeCache struct {
@@ -48,6 +49,11 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 		f.updated = append(f.updated, update.Desired)
 		f.updates = append(f.updates, update)
 	}
+	return nil
+}
+
+func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) error {
+	f.comments = append(f.comments, updates...)
 	return nil
 }
 
@@ -2239,5 +2245,272 @@ func TestRunAwaitingFixIssueMovedFromTodoToBacklog(t *testing.T) {
 	}
 	if !labelFound {
 		t.Fatalf("updated managed labels = %v, want triage-dependency", updated.ManagedLabels)
+	}
+}
+
+func TestComputeDiffDetectsAllChanges(t *testing.T) {
+	existing := model.ExistingIssue{
+		ID:            "issue-1",
+		Identifier:    "SEC-1",
+		Title:         "old title",
+		Description:   "old description",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      3,
+		ManagedLabels: []string{"snyk-automation"},
+		Labels:        []model.IssueLabel{{ID: "label-1", Name: "snyk-automation"}},
+	}
+	desired := model.DesiredIssue{
+		Title:         "new title",
+		Description:   "new description",
+		DueDate:       "2026-05-01",
+		State:         model.StateBacklog,
+		Priority:      1,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if !diff.TitleChanged {
+		t.Fatal("expected TitleChanged")
+	}
+	if diff.TitleFrom != "old title" || diff.TitleTo != "new title" {
+		t.Fatalf("title diff = %q → %q", diff.TitleFrom, diff.TitleTo)
+	}
+	if !diff.DescriptionChanged {
+		t.Fatal("expected DescriptionChanged")
+	}
+	if !diff.DueDateChanged {
+		t.Fatal("expected DueDateChanged")
+	}
+	if diff.DueDateFrom != "2026-04-01" || diff.DueDateTo != "2026-05-01" {
+		t.Fatalf("due date diff = %q → %q", diff.DueDateFrom, diff.DueDateTo)
+	}
+	if !diff.StateChanged {
+		t.Fatal("expected StateChanged")
+	}
+	if diff.StateTo != "backlog" {
+		t.Fatalf("state to = %q", diff.StateTo)
+	}
+	if !diff.PriorityChanged {
+		t.Fatal("expected PriorityChanged")
+	}
+	if diff.PriorityFrom != 3 || diff.PriorityTo != 1 {
+		t.Fatalf("priority diff = %d → %d", diff.PriorityFrom, diff.PriorityTo)
+	}
+	if len(diff.LabelsAdded) != 1 || diff.LabelsAdded[0] != "snyk-code" {
+		t.Fatalf("labels added = %v, want [snyk-code]", diff.LabelsAdded)
+	}
+	if len(diff.LabelsRemoved) != 0 {
+		t.Fatalf("labels removed = %v, want []", diff.LabelsRemoved)
+	}
+	if !diff.LabelsNeedUpdate {
+		t.Fatal("expected LabelsNeedUpdate when labels are added")
+	}
+}
+
+func TestComputeDiffDetectsNoChanges(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "same title",
+		Description:   "same description",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+	desired := model.DesiredIssue{
+		Title:         "same title",
+		Description:   "same description",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if diff.TitleChanged || diff.DescriptionChanged || diff.DueDateChanged ||
+		diff.StateChanged || diff.PriorityChanged || diff.LabelsNeedUpdate ||
+		len(diff.LabelsAdded) > 0 || len(diff.LabelsRemoved) > 0 {
+		t.Fatalf("expected no changes, got: %+v", diff)
+	}
+}
+
+func TestComputeDiffDetectsLabelRemoval(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+		Labels: []model.IssueLabel{
+			{ID: "l1", Name: "snyk-automation"},
+			{ID: "l2", Name: "snyk-code"},
+		},
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if len(diff.LabelsRemoved) != 1 || diff.LabelsRemoved[0] != "snyk-code" {
+		t.Fatalf("labels removed = %v, want [snyk-code]", diff.LabelsRemoved)
+	}
+	if !diff.LabelsNeedUpdate {
+		t.Fatal("expected LabelsNeedUpdate when labels are removed")
+	}
+}
+
+func TestComputeDiffNoStateChangeWhenPreserveState(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:       "title",
+		Description: "desc",
+		DueDate:     "2026-04-01",
+		StateName:   "Todo",
+		Priority:    2,
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateBacklog,
+		PreserveState: true,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if diff.StateChanged {
+		t.Fatal("expected no state change when PreserveState=true")
+	}
+}
+
+func TestComputeDiffDetectsLabelNotOnIssue(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+		// snyk-code is managed but not actually on the issue (failed to apply).
+		Labels: []model.IssueLabel{
+			{ID: "l1", Name: "snyk-automation"},
+		},
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if !diff.LabelsNeedUpdate {
+		t.Fatal("expected LabelsNeedUpdate when managed label is not on issue")
+	}
+	if len(diff.LabelsAdded) != 0 {
+		t.Fatalf("LabelsAdded = %v, want empty (label was in previous managed set)", diff.LabelsAdded)
+	}
+	if len(diff.LabelsRemoved) != 0 {
+		t.Fatalf("LabelsRemoved = %v, want empty", diff.LabelsRemoved)
+	}
+}
+
+func TestRunPostsChangeCommentsOnUpdate(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Updated title",
+					PackageName: "github.com/example/pkg",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    3,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(linear.comments))
+	}
+}
+
+func TestRunSkipsCommentsForResolve(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "resolved issue",
+				Description:   "old description\n\u003c!-- snyk-linear-sync\nfingerprint: snyk:project-z:issue-9\n--\u003e",
+				StateName:     "Todo",
+				Fingerprint:   "snyk:project-z:issue-9",
+				ManagedLabels: []string{"snyk-automation"},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if len(linear.comments) != 0 {
+		t.Fatalf("comments = %d, want 0 (no comments for resolve)", len(linear.comments))
 	}
 }

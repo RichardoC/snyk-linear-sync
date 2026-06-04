@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"path"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -28,6 +27,7 @@ type LinearClient interface {
 	LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error)
 	CreateIssues(ctx context.Context, desired []model.DesiredIssue) error
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
+	PostComments(ctx context.Context, updates []model.IssueUpdate) error
 }
 
 type CacheStore interface {
@@ -224,7 +224,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				continue
 			}
 			if needsUpdate(existing, desired) {
-				updateBatch = append(updateBatch, model.IssueUpdate{Existing: existing, Desired: desired})
+				update := model.IssueUpdate{Existing: existing, Desired: desired}
+				update.Diff = ComputeDiff(existing, desired)
+				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
 					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
@@ -257,7 +259,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				Priority:      existing.Priority,
 			}
 			if needsUpdate(existing, resolved) {
-				resolveBatch = append(resolveBatch, model.IssueUpdate{Existing: existing, Desired: resolved})
+				resolvedUpdate := model.IssueUpdate{Existing: existing, Desired: resolved}
+				resolvedUpdate.Diff = ComputeDiff(existing, resolved)
+				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
 					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
@@ -282,7 +286,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				Priority:      duplicate.Priority,
 			}
 			if needsUpdate(duplicate, desired) {
-				cancelBatch = append(cancelBatch, model.IssueUpdate{Existing: duplicate, Desired: desired})
+				cancelUpdate := model.IssueUpdate{Existing: duplicate, Desired: desired}
+				cancelUpdate.Diff = ComputeDiff(duplicate, desired)
+				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
 					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
@@ -392,6 +398,22 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 						slog.String("fingerprint", update.Desired.Fingerprint),
 						slog.Any("error", err),
 					)
+				}
+			}
+		} else {
+			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
+				s.logger.Warn("batch comment post failed, retrying individually",
+					slog.Int("batch_size", len(job.updateBatch)),
+					slog.Any("error", err),
+				)
+				for _, update := range job.updateBatch {
+					if err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+						s.logger.Warn("failed to post change comment",
+							slog.String("issue", update.Existing.Identifier),
+							slog.String("fingerprint", update.Desired.Fingerprint),
+							slog.Any("error", err),
+						)
+					}
 				}
 			}
 		}
@@ -631,7 +653,7 @@ func metadataBlock(fingerprint string, managedLabels []string) string {
 		"<!-- snyk-linear-sync",
 		fmt.Sprintf("fingerprint: %s", fingerprint),
 	}
-	if labels := normalizeManagedLabelNames(managedLabels); len(labels) > 0 {
+	if labels := model.NormalizeManagedLabelNames(managedLabels); len(labels) > 0 {
 		lines = append(lines, fmt.Sprintf("managed_labels: %s", strings.Join(labels, ",")))
 	}
 	lines = append(lines, "-->")
@@ -747,49 +769,100 @@ func pendingTerminalTransition(existing model.ExistingIssue, desired model.Desir
 	if desired.State != model.StateDone && desired.State != model.StateCancelled {
 		return false
 	}
-	return normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State))
+	return model.NormalizeWorkflowStateName(existing.StateName) != model.NormalizeWorkflowStateName(model.StateName(desired.State))
 }
 
 func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {
-	if existing.Title != desired.Title {
-		return true
-	}
-	if normalizeDescriptionForCompare(existing.Description) != normalizeDescriptionForCompare(desired.Description) {
-		return true
-	}
-	if existing.DueDate != desired.DueDate {
-		// Clear a stale due date when the desired state has none (e.g. an
-		// issue that moved to FindingAwaitingFix), or update when Snyk
-		// says the date should change.
-		if desired.DueDate != "" || existing.DueDate != "" {
-			return true
-		}
-	}
-	if !desired.PreserveState && normalizeWorkflowStateName(existing.StateName) != normalizeWorkflowStateName(stateName(desired.State)) {
-		return true
-	}
-	if existing.Priority != desired.Priority {
-		return true
-	}
-	if managedLabelsUpdateNeeded(existing, desired.ManagedLabels) {
-		return true
-	}
-	return false
+	return ComputeDiff(existing, desired).HasChanges()
 }
 
-func stateName(state model.IssueState) string {
-	switch state {
-	case model.StateTodo:
-		return "todo"
-	case model.StateBacklog:
-		return "backlog"
-	case model.StateDone:
-		return "done"
-	case model.StateCancelled:
-		return "cancelled"
-	default:
-		return ""
+// ComputeDiff returns a diff describing which managed fields changed between
+// the existing and desired Linear issue. The caller is responsible for only
+// displaying a change when the corresponding field is non-empty (e.g. a
+// resolved issue may carry the existing issue's title and description).
+func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *model.IssueDiff {
+	d := &model.IssueDiff{}
+
+	if existing.Title != desired.Title {
+		d.TitleChanged = true
+		d.TitleFrom = existing.Title
+		d.TitleTo = desired.Title
 	}
+
+	if normalizeDescriptionForCompare(existing.Description) != normalizeDescriptionForCompare(desired.Description) {
+		d.DescriptionChanged = true
+	}
+
+	if existing.DueDate != desired.DueDate {
+		if desired.DueDate != "" || existing.DueDate != "" {
+			d.DueDateChanged = true
+			d.DueDateFrom = existing.DueDate
+			d.DueDateTo = desired.DueDate
+		}
+	}
+
+	if !desired.PreserveState {
+		existingNorm := model.NormalizeWorkflowStateName(existing.StateName)
+		desiredNorm := model.NormalizeWorkflowStateName(model.StateName(desired.State))
+		if existingNorm != desiredNorm {
+			d.StateChanged = true
+			d.StateFrom = existing.StateName
+			d.StateTo = desiredNorm
+		}
+	}
+
+	if existing.Priority != desired.Priority {
+		d.PriorityChanged = true
+		d.PriorityFrom = existing.Priority
+		d.PriorityTo = desired.Priority
+	}
+
+	existingLabels := make(map[string]struct{}, len(existing.Labels))
+	for _, l := range existing.Labels {
+		existingLabels[model.NormalizeLabelName(l.Name)] = struct{}{}
+	}
+	desiredLabelSet := make(map[string]struct{}, len(desired.ManagedLabels))
+	for _, l := range desired.ManagedLabels {
+		desiredLabelSet[model.NormalizeLabelName(l)] = struct{}{}
+	}
+	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
+	for _, l := range existing.ManagedLabels {
+		previousManaged[model.NormalizeLabelName(l)] = struct{}{}
+	}
+
+	for label := range desiredLabelSet {
+		if _, inPrevious := previousManaged[label]; inPrevious {
+			continue
+		}
+		if _, inExisting := existingLabels[label]; !inExisting {
+			d.LabelsAdded = append(d.LabelsAdded, label)
+		}
+	}
+
+	for _, label := range existing.ManagedLabels {
+		norm := model.NormalizeLabelName(label)
+		if _, exists := desiredLabelSet[norm]; !exists {
+			d.LabelsRemoved = append(d.LabelsRemoved, norm)
+		}
+	}
+
+	d.LabelsNeedUpdate = len(d.LabelsAdded) > 0 || len(d.LabelsRemoved) > 0
+
+	// Also detect labels that are in the managed set but not actually present
+	// on the issue. This covers the case where a label was supposed to be
+	// applied in a previous run but the Linear mutation failed. Only check
+	// this when we have label data to compare against; an empty Labels
+	// list on the existing issue means label data was not loaded.
+	if !d.LabelsNeedUpdate && len(existingLabels) > 0 {
+		for label := range desiredLabelSet {
+			if _, inExisting := existingLabels[label]; !inExisting {
+				d.LabelsNeedUpdate = true
+				break
+			}
+		}
+	}
+
+	return d
 }
 
 func missingFindingState(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) model.IssueState {
@@ -915,46 +988,15 @@ func githubLineAnchor(finding model.Finding) string {
 	return fmt.Sprintf("L%d", finding.SourceLineStart)
 }
 
-func normalizeWorkflowStateName(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	switch value {
-	case "canceled":
-		return "cancelled"
-	default:
-		return value
-	}
-}
-
 // isConfiguredBacklogState returns true if the existing Linear issue state name
 // matches the configured Backlog state (case-insensitive, with normalization
 // for common variants like "Canceled" → "Cancelled").
 func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool {
-	return normalizeWorkflowStateName(existingStateName) == normalizeWorkflowStateName(configuredBacklog)
+	return model.NormalizeWorkflowStateName(existingStateName) == model.NormalizeWorkflowStateName(configuredBacklog)
 }
 
 func isManualTodoState(stateName string) bool {
-	return normalizeWorkflowStateName(stateName) == "todo"
-}
-
-func managedLabelsUpdateNeeded(existing model.ExistingIssue, desiredManagedLabels []string) bool {
-	existingManaged := normalizeManagedLabelNames(existing.ManagedLabels)
-	desiredManaged := normalizeManagedLabelNames(desiredManagedLabels)
-
-	if strings.Join(existingManaged, ",") != strings.Join(desiredManaged, ",") {
-		return true
-	}
-
-	for _, label := range desiredManaged {
-		if !hasLabelNamed(existing.Labels, label) {
-			return true
-		}
-	}
-	for _, label := range existingManaged {
-		if hasLabelNamed(existing.Labels, label) && !containsNormalizedLabel(desiredManaged, label) {
-			return true
-		}
-	}
-	return false
+	return model.NormalizeWorkflowStateName(stateName) == "todo"
 }
 
 func upsertManagedMetadata(description, fingerprint string, managedLabels []string) string {
@@ -994,58 +1036,6 @@ func stripVisibleFingerprintLine(description string) string {
 	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
-func hasLabelNamed(labels []model.IssueLabel, name string) bool {
-	name = normalizeLabelName(name)
-	if name == "" {
-		return false
-	}
-	for _, label := range labels {
-		if normalizeLabelName(label.Name) == name {
-			return true
-		}
-	}
-	return false
-}
-
-func normalizeLabelName(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
-}
-
-func normalizeManagedLabelNames(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(values))
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		normalized := normalizeLabelName(value)
-		if normalized == "" {
-			continue
-		}
-		if _, exists := seen[normalized]; exists {
-			continue
-		}
-		seen[normalized] = struct{}{}
-		out = append(out, normalized)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	slices.Sort(out)
-	return out
-}
-
-func containsNormalizedLabel(labels []string, target string) bool {
-	target = normalizeLabelName(target)
-	for _, label := range labels {
-		if normalizeLabelName(label) == target {
-			return true
-		}
-	}
-	return false
-}
-
 func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string {
 	labels := make([]string, 0, 4)
 	if managed := strings.TrimSpace(labelCfg.Managed); managed != "" {
@@ -1074,7 +1064,7 @@ func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string 
 		}
 	}
 
-	return normalizeManagedLabelNames(labels)
+	return model.NormalizeManagedLabelNames(labels)
 }
 
 // identifierNum extracts the numeric suffix from a Linear identifier (e.g. "SNYK-42" → 42).

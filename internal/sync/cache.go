@@ -34,7 +34,7 @@ func desiredIssueHash(desired model.DesiredIssue) string {
 		normalizeDescriptionForCompare(desired.Description),
 		dueDateForHash,
 		statePart,
-		strings.Join(normalizeManagedLabelNames(desired.ManagedLabels), ","),
+		strings.Join(model.NormalizeManagedLabelNames(desired.ManagedLabels), ","),
 		fmt.Sprintf("%d", desired.Priority),
 	)
 }
@@ -45,8 +45,8 @@ func existingIssueHash(existing model.ExistingIssue) string {
 		existing.Title,
 		normalizeDescriptionForCompare(existing.Description),
 		existing.DueDate,
-		normalizeWorkflowStateName(existing.StateName),
-		strings.Join(normalizeManagedLabelNames(existing.ManagedLabels), ","),
+		model.NormalizeWorkflowStateName(existing.StateName),
+		strings.Join(model.NormalizeManagedLabelNames(existing.ManagedLabels), ","),
 		strings.Join(presentManagedLabelNames(existing.Labels, existing.ManagedLabels), ","),
 		fmt.Sprintf("%d", existing.Priority),
 	)
@@ -105,8 +105,8 @@ func digestParts(parts ...string) string {
 
 func presentManagedLabelNames(labels []model.IssueLabel, managed []string) []string {
 	out := make([]string, 0, len(managed))
-	for _, label := range normalizeManagedLabelNames(managed) {
-		if hasLabelNamed(labels, label) {
+	for _, label := range model.NormalizeManagedLabelNames(managed) {
+		if model.HasLabelNamed(labels, label) {
 			out = append(out, label)
 		}
 	}
