@@ -15,3 +15,7 @@ data/
 # binaries
 /snyk-linear-sync
 /investigate-duedate
+
+# Bots suggesting commit messages
+COMMIT_MSG
+COMMIT_MSG.md

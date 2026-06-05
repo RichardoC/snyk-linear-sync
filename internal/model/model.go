@@ -81,7 +81,6 @@ type ExistingIssue struct {
 	StateName     string
 	Fingerprint   string
 	ManagedLabels []string
-	SubscriberIDs []string
 	Labels        []IssueLabel
 	Priority      int
 }

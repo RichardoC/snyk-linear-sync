@@ -57,11 +57,6 @@ type linearIssueNode struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
 	} `json:"labels"`
-	Subscribers struct {
-		Nodes []struct {
-			ID string `json:"id"`
-		} `json:"nodes"`
-	} `json:"subscribers"`
 }
 
 func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Client {
@@ -133,11 +128,6 @@ query issueByIdentifier($filter: IssueFilter!) {
           name
         }
       }
-      subscribers(first: 100) {
-        nodes {
-          id
-        }
-      }
     }
   }
 }`)
@@ -193,13 +183,6 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 			Name: label.Name,
 		})
 	}
-	subscriberIDs := make([]string, 0, len(issue.Subscribers.Nodes))
-	for _, subscriber := range issue.Subscribers.Nodes {
-		if strings.TrimSpace(subscriber.ID) == "" {
-			continue
-		}
-		subscriberIDs = append(subscriberIDs, subscriber.ID)
-	}
 	return model.ExistingIssue{
 		ID:            issue.ID,
 		Identifier:    issue.Identifier,
@@ -212,7 +195,6 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 		DueDate:       deref(issue.DueDate),
 		Fingerprint:   extractFingerprint(description),
 		ManagedLabels: extractManagedLabels(description),
-		SubscriberIDs: subscriberIDs,
 		Labels:        labels,
 	}
 }
@@ -524,11 +506,6 @@ query existingIssues($filter: IssueFilter!, $after: String) {
         nodes {
           id
           name
-        }
-      }
-      subscribers(first: 100) {
-        nodes {
-          id
         }
       }
     }
