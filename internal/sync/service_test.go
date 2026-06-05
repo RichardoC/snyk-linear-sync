@@ -2881,7 +2881,7 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 		IssueTitle:  "XSS in postcss",
 		IssueType:   "package_vulnerability",
 		Severity:    "high",
-		Status:      model.FindingOpen, // fix is now available
+		Status:      model.FindingOpen,                                      // fix is now available
 		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
 	}
 
@@ -2898,8 +2898,8 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 				Identifier:    "SEC-1",
 				Title:         "Snyk: [high] XSS in postcss",
 				Description:   "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,triage-dependency\n-->",
-				DueDate:       "",            // was cleared for awaiting-fix
-				StateName:     "Backlog",     // was in Backlog for awaiting-fix
+				DueDate:       "",        // was cleared for awaiting-fix
+				StateName:     "Backlog", // was in Backlog for awaiting-fix
 				Fingerprint:   finding.Fingerprint,
 				Priority:      2,
 				ManagedLabels: []string{"snyk-automation", "triage-dependency"}, // had the awaiting-fix label

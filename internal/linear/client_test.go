@@ -598,10 +598,10 @@ func TestBuildChangeCommentRemovedLabels(t *testing.T) {
 			ManagedLabels: []string{"snyk-automation"},
 		},
 		Diff: &model.IssueDiff{
-			StateChanged:  true,
-			StateFrom:     "Backlog",
-			StateTo:       "todo",
-			LabelsRemoved: []string{"triage-dependency"},
+			StateChanged:     true,
+			StateFrom:        "Backlog",
+			StateTo:          "todo",
+			LabelsRemoved:    []string{"triage-dependency"},
 			LabelsNeedUpdate: true,
 		},
 	}
