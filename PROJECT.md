@@ -206,6 +206,18 @@ The `ignored until fix available` state is distinct from other ignored states be
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
 
+### Manual Non-Terminal State Override
+
+When a user manually moves a managed issue to any non-terminal Linear workflow state that differs from what the sync would set, subsequent syncs preserve the user's chosen state. This generalises the previous Backlog-only and hardcoded "Todo" overrides.
+
+This covers:
+
+- a user moving an open issue from the configured open state (e.g. `Triage`) to `Todo` or `In Progress`
+- a user moving an awaiting-fix issue from `Backlog` to `Todo`
+- any other non-terminal state that differs from the configured state for the desired model state
+
+Terminal states (`Done`, `Cancelled`) are never preserved: the sync always transitions to a terminal state when the Snyk finding is fixed or ignored, even if a user manually moved the issue to a terminal state.
+
 ### Due Dates
 
 Due dates are normally derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear. For temporarily ignored issues, the due date is instead calculated from the ignore expiry date so the SLA extends to the normal severity offset from when the ignore expires.

@@ -254,6 +254,12 @@ These distinctions are intentional:
 
 If a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs will preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override applies when the existing Linear issue state matches the configured `LINEAR_STATE_BACKLOG` value.
 
+### Manual Non-Terminal State Override
+
+If a user manually moves a managed issue to any non-terminal Linear state that differs from what the sync would set (e.g. `Todo` or `In Progress` when the configured open state is `Triage`, or `Todo` when the finding is awaiting fix and the sync would set `Backlog`), subsequent syncs will preserve the user's chosen state. This prevents the automation from dragging issues back to the configured state after intentional triage decisions.
+
+Terminal states (`Done`, `Cancelled`) are never preserved — the sync always transitions to a terminal state when the Snyk finding is fixed or ignored.
+
 ### Due Dates
 
 Default due date offsets:

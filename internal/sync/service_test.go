@@ -2478,6 +2478,355 @@ func TestRunPostsChangeCommentsOnUpdate(t *testing.T) {
 	}
 }
 
+// TestRunPreservesNonTerminalStateWhenUserMovesToTodo verifies the core bug
+// fix: when the configured open state is "Triage" and a user manually moves
+// an open finding's issue to "Todo", the sync must not drag it back to
+// "Triage". This was the original isManualTodoState check, now generalized
+// to cover any non-terminal state.
+func TestRunPreservesNonTerminalStateWhenUserMovesToTodo(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Triage" // simulate the real workspace config
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	// The user manually moved the issue from Triage to Todo.
+	desired := desiredIssue(cfg, finding)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Todo", // not the configured open state "Triage"
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (Todo state should be preserved)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0", len(linear.updated))
+	}
+}
+
+// TestRunPreservesNonTerminalStateWhenUserMovesToInProgress verifies that the
+// general non-terminal state override also covers custom states like "In
+// Progress" — not just the hardcoded "todo" that the old isManualTodoState
+// checked for.
+func TestRunPreservesNonTerminalStateWhenUserMovesToInProgress(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Triage"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	desired := desiredIssue(cfg, finding)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "In Progress", // custom non-terminal state
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (In Progress state should be preserved)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0", len(linear.updated))
+	}
+}
+
+// TestRunPreservesTodoWhenFindingIsAwaitingFix verifies that the sync does
+// not override a user's manual move from Backlog to Todo when the Snyk
+// finding is still in "awaiting fix" status. The old isManualTodoState check
+// only fired when desired.State was Todo; when the finding was awaiting fix
+// (desired Backlog), the check was bypassed and the issue was dragged back
+// to Backlog.
+func TestRunPreservesTodoWhenFindingIsAwaitingFix(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Triage"
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint:        "snyk:project-a:issue-1",
+		SnykIssueID:        "issue-1",
+		ProjectID:          "project-a",
+		ProjectName:        "Project A",
+		IssueTitle:         "Outdated package",
+		Severity:           "high",
+		Status:             model.FindingAwaitingFix,
+		CreatedAt:          time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		DisregardIfFixable: true,
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	// The user manually moved the issue from Backlog to Todo despite the
+	// finding still being awaiting-fix. The sync must respect this.
+	desired := desiredIssue(cfg, finding)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         desired.Title,
+				Description:   desired.Description,
+				DueDate:       "", // awaiting-fix has no due date
+				StateName:     "Todo",
+				Fingerprint:   finding.Fingerprint,
+				Priority:      desired.Priority,
+				ManagedLabels: desired.ManagedLabels,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (Todo state should be preserved even when finding is awaiting fix)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0", len(linear.updated))
+	}
+}
+
+// TestRunDoesNotPreserveTerminalStates verifies that the non-terminal state
+// override does NOT apply when the existing state is a terminal state like
+// Done or Cancelled. If a user manually marks an open finding as Done, the
+// sync should still move it back to the configured open state.
+func TestRunDoesNotPreserveTerminalStates(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Triage"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Done", // terminal state — should NOT be preserved
+				Fingerprint: finding.Fingerprint,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates == 0 {
+		t.Fatal("PlannedUpdates = 0, want > 0 (Done state should NOT be preserved for open finding)")
+	}
+}
+
+// TestRunPreservesNonTerminalStateWithOtherFieldChanges verifies that when
+// PreserveState is set due to a non-terminal state override, an update that
+// changes OTHER fields (like title) still omits stateId from the mutation
+// so the user's state choice is preserved.
+func TestRunPreservesNonTerminalStateWithOtherFieldChanges(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Triage"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "New title from Snyk",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	desired := desiredIssue(cfg, finding)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "Stale title", // different from desired
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Todo", // user moved to Todo — should be preserved
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (title changed, state preserved)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	// The state should be preserved as Todo via PreserveState.
+	// The user moved the issue to Todo; the sync should not override it
+	// back to the configured open state (Triage).
+	if linear.updated[0].State != model.StateTodo {
+		t.Fatalf("updated state = %q, want %q (Todo state should be preserved when other fields change)", linear.updated[0].State, model.StateTodo)
+	}
+}
+
+// TestRunNonTerminalOverrideDoesNotFireWhenStateMatchesConfig verifies that
+// PreserveState is NOT set when the existing state already matches the
+// configured state for the desired model state. This prevents the sync from
+// unnecessarily adding ":preserve" to the Snyk hash.
+func TestRunNonTerminalOverrideDoesNotFireWhenStateMatchesConfig(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Triage"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Outdated package",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	desired := desiredIssue(cfg, finding)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Triage", // matches configured Todo state
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (no override needed when state matches config)", result.PlannedUpdates)
+	}
+}
+
 func TestRunSkipsCommentsForResolve(t *testing.T) {
 	cfg := minimalCfg()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

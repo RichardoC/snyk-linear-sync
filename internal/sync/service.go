@@ -155,16 +155,22 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	for _, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
 
-		// Respect manual Backlog override: if a user moved an open ticket from
-		// Todo to Backlog, don't move it back on subsequent syncs.
 		if existing, ok := existingByFingerprint[finding.Fingerprint]; ok {
+			// Respect manual Backlog override: if a user moved an open ticket from
+			// Todo to Backlog, don't move it back on subsequent syncs.
 			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
 				desired.State = model.StateBacklog
 			}
-			// Respect manual Todo override: if a user moved an open ticket into
-			// the Linear state "Todo", don't move it back to the configured open
-			// state (e.g. "Triage") on subsequent syncs.
-			if desired.State == model.StateTodo && isManualTodoState(existing.StateName) {
+			// Respect manual non-terminal state override: when both the desired
+			// model state and the existing Linear state are non-terminal, preserve
+			// the user's chosen Linear state. This prevents the sync from dragging
+			// an issue back to the configured open state (e.g. "Triage") when a
+			// user has manually moved it to "Todo", "In Progress", or any other
+			// non-terminal state. It also handles the case where the existing
+			// state already matches the configured state, avoiding false-positive
+			// state-change detection due to model state names ("todo") differing
+			// from configured Linear state names ("Triage").
+			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing.StateName, s.cfg.Linear.States) {
 				desired.PreserveState = true
 			}
 		}
@@ -995,8 +1001,28 @@ func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool 
 	return model.NormalizeWorkflowStateName(existingStateName) == model.NormalizeWorkflowStateName(configuredBacklog)
 }
 
-func isManualTodoState(stateName string) bool {
-	return model.NormalizeWorkflowStateName(stateName) == "todo"
+// isNonTerminalModelState reports whether the desired model state is
+// non-terminal. Todo and Backlog are non-terminal; Done and Cancelled are
+// terminal. When the sync wants a terminal state the transition must always
+// be allowed (handled by pendingTerminalTransition), so PreserveState only
+// applies to non-terminal desired states.
+func isNonTerminalModelState(state model.IssueState) bool {
+	return state == model.StateTodo || state == model.StateBacklog
+}
+
+// isNonTerminalLinearState reports whether the existing Linear issue state is
+// non-terminal (i.e. not the configured Done or Cancelled state). Users can
+// freely move issues between non-terminal states as part of triage; the sync
+// should not override those manual decisions.
+func isNonTerminalLinearState(stateName string, states config.StateConfig) bool {
+	normalized := model.NormalizeWorkflowStateName(stateName)
+	if normalized == model.NormalizeWorkflowStateName(states.Done) {
+		return false
+	}
+	if normalized == model.NormalizeWorkflowStateName(states.Cancelled) {
+		return false
+	}
+	return true
 }
 
 func upsertManagedMetadata(description, fingerprint string, managedLabels []string) string {
