@@ -173,6 +173,17 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing.StateName, s.cfg.Linear.States) {
 				desired.PreserveState = true
 			}
+
+			// When a fix becomes available for a previously-blocked issue,
+			// recalculate the due date from today instead of the original
+			// created_at. The original SLA date is meaningless because the
+			// team couldn't act on the issue while no fix was available. A
+			// fresh SLA from fix-availability gives a meaningful triage
+			// deadline without the daily churn that the old floor-to-today
+			// caused for all overdue issues.
+			if finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix) {
+				desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(s.cfg.Linear.Due, finding)
+			}
 		}
 
 		desiredByFingerprint[finding.Fingerprint] = desired
@@ -254,13 +265,14 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
-			desiredState := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
+			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
 			resolved := model.DesiredIssue{
 				Fingerprint:   existing.Fingerprint,
 				Title:         existing.Title,
 				Description:   upsertManagedMetadata(existing.Description, existing.Fingerprint, existing.ManagedLabels),
 				DueDate:       existing.DueDate,
 				State:         desiredState,
+				StateReason:   stateReason,
 				ManagedLabels: existing.ManagedLabels,
 				Priority:      existing.Priority,
 			}
@@ -288,6 +300,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				Description:   duplicate.Description,
 				DueDate:       duplicate.DueDate,
 				State:         model.StateCancelled,
+				StateReason:   "duplicate of another managed issue",
 				ManagedLabels: duplicate.ManagedLabels,
 				Priority:      duplicate.Priority,
 			}
@@ -492,13 +505,14 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 }
 
 func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
-	dueDate, dueDateBase := issueDueDate(cfg.Linear.Due, finding)
+	dueDate, dueDateBase, dueDateReason := issueDueDate(cfg.Linear.Due, finding)
 	// No meaningful SLA while blocked on an upstream fix. When a fix becomes
 	// available Snyk flips ignored=false; the next run maps it back to
 	// FindingOpen (Todo) and recalculates the due date.
 	if finding.Status == model.FindingAwaitingFix {
 		dueDate = ""
 		dueDateBase = ""
+		dueDateReason = "awaiting upstream fix, SLA paused"
 	}
 	return model.DesiredIssue{
 		Fingerprint:   finding.Fingerprint,
@@ -507,7 +521,10 @@ func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 		DueDate:       dueDate,
 		DueDateBase:   dueDateBase,
 		State:         issueState(finding.Status),
+		StateReason:   stateReason(finding.Status),
+		DueDateReason: dueDateReason,
 		ManagedLabels: managedLabels(cfg.Linear.Labels, finding),
+		LabelReasons:  buildLabelReasons(cfg.Linear.Labels, finding),
 		Priority:      issuePriority(finding.Severity),
 	}
 }
@@ -681,6 +698,23 @@ func issueState(status model.FindingStatus) model.IssueState {
 	}
 }
 
+func stateReason(status model.FindingStatus) string {
+	switch status {
+	case model.FindingOpen:
+		return "Snyk reports this finding as open"
+	case model.FindingAwaitingFix:
+		return "Snyk reports this issue as ignored until a fix is available"
+	case model.FindingSnoozed:
+		return "Snyk reports this issue as temporarily deferred"
+	case model.FindingIgnored:
+		return "Snyk reports this issue as permanently ignored"
+	case model.FindingFixed:
+		return "Snyk reports this finding as fixed"
+	default:
+		return ""
+	}
+}
+
 // statusDisplayName renders the FindingStatus value for the Linear issue
 // description. The raw constant values are code-internal; the description
 // should show what Snyk actually reports.
@@ -710,17 +744,20 @@ func issuePriority(severity string) int {
 	}
 }
 
-func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective, base string) {
+func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective, base, reason string) {
 	var baseDate time.Time
+	var basis string
 	switch {
 	case !finding.IgnoreExpiresAt.IsZero():
 		expiresUTC := finding.IgnoreExpiresAt.UTC()
 		baseDate = time.Date(expiresUTC.Year(), expiresUTC.Month(), expiresUTC.Day(), 0, 0, 0, 0, time.UTC)
+		basis = "ignore expiry"
 	case !finding.CreatedAt.IsZero():
 		createdAtUTC := finding.CreatedAt.UTC()
 		baseDate = time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
+		basis = "issue creation"
 	default:
-		return "", ""
+		return "", "", ""
 	}
 
 	var days int
@@ -734,32 +771,61 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 	case 4:
 		days = dueCfg.LowDays
 	default:
-		return "", ""
+		return "", "", ""
 	}
 
 	dueDate := baseDate.AddDate(0, 0, days)
-	base = dueDate.Format(time.DateOnly)
+	dueDateStr := dueDate.Format(time.DateOnly)
 
-	// Floor to today when the calculated date is in the past. Snyk data
-	// is the authoritative source for the due date, so the sync must
-	// always set it — even if someone manually overrode it in Linear.
-	// A past due date is not useful for triage, so flooring to today
-	// signals "this is overdue and needs attention now" while keeping
-	// the sync authoritative.
-	//
-	// The base (raw) date is returned separately so the cache hash
-	// uses the stable raw value instead of the floored date. This
-	// prevents daily cache churn for overdue issues whose underlying
-	// Snyk data has not changed.
-	now := time.Now()
-	if dueDate.Before(now) {
-		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-		effective = today.Format(time.DateOnly)
-	} else {
-		effective = base
+	severityName := strings.ToLower(strings.TrimSpace(finding.Severity))
+	if severityName == "" {
+		severityName = "unknown"
+	}
+	reason = fmt.Sprintf("%s severity SLA: %d days from %s", severityName, days, basis)
+
+	// A past due date is left as-is. Linear renders past due dates as
+	// "overdue", and the actual past date is more informative than flooring
+	// to today: it tells the triager how long the issue has been past its
+	// SLA, not just that it is overdue. Flooring to today caused daily
+	// churn — each run would advance the floor by one day, triggering a
+	// spurious update even when the underlying Snyk data was unchanged.
+
+	return dueDateStr, dueDateStr, reason
+}
+
+// issueDueDateFromFixAvailability calculates a due date for an issue that has
+// just become actionable after being blocked on an upstream fix. Unlike
+// issueDueDate which uses the Snyk created_at as the base, this uses today
+// as the base — the SLA clock starts when the fix becomes available, not
+// when the issue was originally found (which would give a meaningless past
+// date because the team couldn't act on it while no fix existed).
+func issueDueDateFromFixAvailability(dueCfg config.DueDateConfig, finding model.Finding) (string, string, string) {
+	var days int
+	switch issuePriority(finding.Severity) {
+	case 1:
+		days = dueCfg.CriticalDays
+	case 2:
+		days = dueCfg.HighDays
+	case 3:
+		days = dueCfg.MediumDays
+	case 4:
+		days = dueCfg.LowDays
+	default:
+		return "", "", ""
 	}
 
-	return effective, base
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	dueDate := today.AddDate(0, 0, days)
+	dueDateStr := dueDate.Format(time.DateOnly)
+
+	severityName := strings.ToLower(strings.TrimSpace(finding.Severity))
+	if severityName == "" {
+		severityName = "unknown"
+	}
+	reason := fmt.Sprintf("%s severity SLA: %d days from fix availability", severityName, days)
+
+	return dueDateStr, dueDateStr, reason
 }
 
 // pendingTerminalTransition reports whether the issue still needs to move into
@@ -871,17 +937,20 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *mode
 	return d
 }
 
-func missingFindingState(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) model.IssueState {
+func missingFindingState(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) (model.IssueState, string) {
 	projectID, ok := fingerprintProjectID(fingerprint)
 	if !ok {
-		return model.StateDone
+		return model.StateDone, "this Snyk finding is no longer present"
 	}
 	if _, exists := activeProjects[projectID]; exists {
-		return model.StateDone
+		return model.StateDone, "this Snyk finding is no longer present"
+	}
+	if _, exists := inactiveProjects[projectID]; exists {
+		return model.StateCancelled, "the Snyk project has been deactivated"
 	}
 	// Both deleted and inactive projects result in Cancelled: the issue is no
 	// longer actionable regardless of why the project stopped producing findings.
-	return model.StateCancelled
+	return model.StateCancelled, "the Snyk project no longer exists"
 }
 
 func fingerprintProjectID(fingerprint string) (string, bool) {
@@ -1001,6 +1070,23 @@ func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool 
 	return model.NormalizeWorkflowStateName(existingStateName) == model.NormalizeWorkflowStateName(configuredBacklog)
 }
 
+// wasAwaitingFix reports whether the existing Linear issue was previously in
+// the awaiting-fix state, based on the managed label recorded in the metadata
+// block. This detects issues that were blocked on an upstream fix and have
+// now become actionable.
+func wasAwaitingFix(managedLabels []string, awaitingFixLabel string) bool {
+	if awaitingFixLabel == "" {
+		return false
+	}
+	normalized := model.NormalizeLabelName(awaitingFixLabel)
+	for _, label := range model.NormalizeManagedLabelNames(managedLabels) {
+		if label == normalized {
+			return true
+		}
+	}
+	return false
+}
+
 // isNonTerminalModelState reports whether the desired model state is
 // non-terminal. Todo and Backlog are non-terminal; Done and Cancelled are
 // terminal. When the sync wants a terminal state the transition must always
@@ -1091,6 +1177,37 @@ func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string 
 	}
 
 	return model.NormalizeManagedLabelNames(labels)
+}
+
+// buildLabelReasons returns a map from normalized label name to a short reason
+// string explaining why that label is included in the managed set. This gives
+// change comments a "why" instead of just listing added labels.
+func buildLabelReasons(labelCfg config.LabelConfig, finding model.Finding) map[string]string {
+	reasons := make(map[string]string)
+
+	if finding.Status == model.FindingAwaitingFix && strings.TrimSpace(labelCfg.AwaitingFix) != "" {
+		reasons[model.NormalizeLabelName(labelCfg.AwaitingFix)] = "awaiting upstream fix"
+	}
+
+	issueType := strings.ToLower(strings.TrimSpace(finding.IssueType))
+	if issueType != "" {
+		if mapped, ok := labelCfg.Tool[issueType]; ok && strings.TrimSpace(mapped) != "" {
+			reasons[model.NormalizeLabelName(mapped)] = fmt.Sprintf("Snyk issue type is %s", issueType)
+		} else if strings.TrimSpace(labelCfg.ToolDefault) != "" {
+			reasons[model.NormalizeLabelName(labelCfg.ToolDefault)] = fmt.Sprintf("Snyk issue type is %s", issueType)
+		}
+	}
+
+	projectOrigin := strings.ToLower(strings.TrimSpace(finding.ProjectOrigin))
+	if projectOrigin != "" {
+		if mapped, ok := labelCfg.Origin[projectOrigin]; ok && strings.TrimSpace(mapped) != "" {
+			reasons[model.NormalizeLabelName(mapped)] = fmt.Sprintf("Snyk project origin is %s", projectOrigin)
+		} else if strings.TrimSpace(labelCfg.OriginDefault) != "" {
+			reasons[model.NormalizeLabelName(labelCfg.OriginDefault)] = fmt.Sprintf("Snyk project origin is %s", projectOrigin)
+		}
+	}
+
+	return reasons
 }
 
 // identifierNum extracts the numeric suffix from a Linear identifier (e.g. "SNYK-42" → 42).

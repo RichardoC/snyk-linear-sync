@@ -592,7 +592,7 @@ func TestDesiredIssueDueDateUsesSnykCreatedAt(t *testing.T) {
 	}
 }
 
-func TestDesiredIssueDueDateFloorsPastDueDateToToday(t *testing.T) {
+func TestDesiredIssueDueDateLeavesPastSLAAsIs(t *testing.T) {
 	cfg := config.Config{
 		Linear: config.LinearConfig{
 			Due: config.DueDateConfig{
@@ -603,8 +603,9 @@ func TestDesiredIssueDueDateFloorsPastDueDateToToday(t *testing.T) {
 			},
 		},
 	}
-	// CreatedAt is far in the past, so CreatedAt + 30 days would be in the past.
-	// The due date should be floored to today instead.
+	// CreatedAt is far in the past, so CreatedAt + 30 days is also in the past.
+	// The due date is left as the raw SLA date (past dates show as overdue
+	// in Linear and indicate how long the issue has exceeded its SLA).
 	finding := model.Finding{
 		Fingerprint: "snyk:project-a:issue-1",
 		SnykIssueID: "issue-1",
@@ -615,14 +616,13 @@ func TestDesiredIssueDueDateFloorsPastDueDateToToday(t *testing.T) {
 	}
 
 	desired := desiredIssue(cfg, finding)
-	today := time.Now().Format(time.DateOnly)
 
-	if desired.DueDate != today {
-		t.Fatalf("desired due date = %q, want %q (past due date must be floored to today)", desired.DueDate, today)
+	if desired.DueDate != "2026-01-31" {
+		t.Fatalf("desired due date = %q, want %q (raw SLA date for past issues)", desired.DueDate, "2026-01-31")
 	}
 }
 
-func TestDesiredIssueDueDateFloorsExpiredSnoozeToToday(t *testing.T) {
+func TestDesiredIssueDueDateLeavesPastExpiredSnoozeAsIs(t *testing.T) {
 	cfg := config.Config{
 		Linear: config.LinearConfig{
 			Due: config.DueDateConfig{
@@ -634,8 +634,8 @@ func TestDesiredIssueDueDateFloorsExpiredSnoozeToToday(t *testing.T) {
 		},
 	}
 	// IgnoreExpiresAt is in the past (snooze already expired),
-	// so IgnoreExpiresAt + 30 days would also be in the past.
-	// The due date should be floored to today instead.
+	// so IgnoreExpiresAt + 30 days is also in the past. The due date is
+	// left as the raw SLA date.
 	finding := model.Finding{
 		Fingerprint:     "snyk:project-a:issue-1",
 		SnykIssueID:     "issue-1",
@@ -647,10 +647,9 @@ func TestDesiredIssueDueDateFloorsExpiredSnoozeToToday(t *testing.T) {
 	}
 
 	desired := desiredIssue(cfg, finding)
-	today := time.Now().Format(time.DateOnly)
 
-	if desired.DueDate != today {
-		t.Fatalf("desired due date = %q, want %q (past due date from expired snooze must be floored to today)", desired.DueDate, today)
+	if desired.DueDate != "2026-03-31" {
+		t.Fatalf("desired due date = %q, want %q (raw SLA date from expired snooze)", desired.DueDate, "2026-03-31")
 	}
 }
 
@@ -1969,7 +1968,7 @@ func TestNeedsUpdateAlwaysCorrectsDueDate(t *testing.T) {
 	desired := model.DesiredIssue{
 		Title:       "title",
 		Description: "description",
-		DueDate:     "2026-06-02", // floored to today (authoritative from Snyk)
+		DueDate:     "2026-01-31", // Snyk-derived SLA date (authoritative)
 		State:       model.StateTodo,
 		Priority:    2,
 	}
@@ -2002,9 +2001,10 @@ func TestNeedsUpdateStillDetectsDueDateChangeWhenBothNonEmpty(t *testing.T) {
 	}
 }
 
-// TestRunSetsFlooredDueDateOnNewIssueWithOldCreatedAt verifies that when a new
+// TestRunSetsRawSLADateOnNewIssueWithOldCreatedAt verifies that when a new
 // Snyk finding has an old CreatedAt, the sync creates the Linear issue with
-// today's date as the due date (floored from the past SLA date).
+// the raw SLA date (past dates show as overdue in Linear and indicate how long
+// the issue has exceeded its SLA).
 func TestRunSetsFlooredDueDateOnNewIssueWithOldCreatedAt(t *testing.T) {
 	cfg := minimalCfg()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -2040,9 +2040,8 @@ func TestRunSetsFlooredDueDateOnNewIssueWithOldCreatedAt(t *testing.T) {
 	if len(linear.created) != 1 {
 		t.Fatalf("created = %d, want 1", len(linear.created))
 	}
-	today := time.Now().Format(time.DateOnly)
-	if linear.created[0].DueDate != today {
-		t.Fatalf("created due date = %q, want %q (past due date floored to today)", linear.created[0].DueDate, today)
+	if linear.created[0].DueDate != "2026-01-31" {
+		t.Fatalf("created due date = %q, want %q (raw SLA date for past issues)", linear.created[0].DueDate, "2026-01-31")
 	}
 }
 
@@ -2065,7 +2064,6 @@ func TestRunCorrectsOverriddenDueDateWithAuthoritativeCalculation(t *testing.T) 
 	}
 
 	desired := desiredIssue(cfg, finding)
-	today := time.Now().Format(time.DateOnly)
 
 	snyk := fakeSnyk{
 		snapshot: model.SnykSnapshot{
@@ -2095,15 +2093,15 @@ func TestRunCorrectsOverriddenDueDateWithAuthoritativeCalculation(t *testing.T) 
 	}
 
 	// The sync must correct the manually-overridden due date to the
-	// authoritative Snyk-derived value (floored to today for past SLAs).
+	// authoritative Snyk-derived SLA date.
 	if result.PlannedUpdates != 1 {
 		t.Fatalf("PlannedUpdates = %d, want 1 (Snyk due date must correct manual override)", result.PlannedUpdates)
 	}
 	if len(linear.updated) != 1 {
 		t.Fatalf("updated = %d, want 1", len(linear.updated))
 	}
-	if linear.updated[0].DueDate != today {
-		t.Fatalf("updated due date = %q, want %q (authoritative Snyk date floored to today)", linear.updated[0].DueDate, today)
+	if linear.updated[0].DueDate != "2026-01-31" {
+		t.Fatalf("updated due date = %q, want %q (authoritative Snyk SLA date)", linear.updated[0].DueDate, "2026-01-31")
 	}
 }
 
@@ -2861,5 +2859,82 @@ func TestRunSkipsCommentsForResolve(t *testing.T) {
 	}
 	if len(linear.comments) != 0 {
 		t.Fatalf("comments = %d, want 0 (no comments for resolve)", len(linear.comments))
+	}
+}
+
+// TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability verifies that
+// when a Snyk finding transitions from awaiting-fix to open (fix became
+// available), the due date is recalculated from today instead of the
+// original created_at — because the old SLA date is meaningless when the
+// team couldn't act on the issue while no fix existed.
+func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingOpen, // fix is now available
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "Snyk: [high] XSS in postcss",
+				Description:   "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,triage-dependency\n-->",
+				DueDate:       "",            // was cleared for awaiting-fix
+				StateName:     "Backlog",     // was in Backlog for awaiting-fix
+				Fingerprint:   finding.Fingerprint,
+				Priority:      2,
+				ManagedLabels: []string{"snyk-automation", "triage-dependency"}, // had the awaiting-fix label
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}, {ID: "l2", Name: "triage-dependency"}},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+
+	// Due date should be calculated from today + 30 days (high severity SLA),
+	// NOT from 2026-01-01 + 30 days (which would give 2026-01-31, a meaningless
+	// past date for an issue that was blocked for months).
+	expectedDueDate := time.Now().AddDate(0, 0, 30)
+	expectedStr := time.Date(expectedDueDate.Year(), expectedDueDate.Month(), expectedDueDate.Day(), 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
+	if updated.DueDate != expectedStr {
+		t.Fatalf("updated due date = %q, want %q (SLA from fix availability, not from months-old created_at)", updated.DueDate, expectedStr)
+	}
+
+	// The triage-dependency label should be removed.
+	for _, label := range updated.ManagedLabels {
+		if label == "triage-dependency" {
+			t.Fatalf("updated managed labels should not contain triage-dependency after fix is available: %v", updated.ManagedLabels)
+		}
 	}
 }

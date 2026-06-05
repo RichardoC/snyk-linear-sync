@@ -96,6 +96,9 @@ type DesiredIssue struct {
 	ManagedLabels []string
 	Priority      int
 	PreserveState bool
+	StateReason   string
+	DueDateReason string
+	LabelReasons  map[string]string // normalized label name → reason
 }
 
 // IssueDiff captures which managed fields changed between the existing and
