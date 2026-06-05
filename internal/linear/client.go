@@ -909,9 +909,11 @@ func normalizeManagedLabelNames(values []string) []string {
 	return model.NormalizeManagedLabelNames(values)
 }
 
-// buildChangeComment generates a human-readable comment summarizing which
-// managed fields changed on an issue and why. It returns an empty string
-// when there is nothing meaningful to report.
+// buildChangeComment generates a human-readable comment explaining why the
+// sync changed a managed issue. Unlike the Linear activity log which shows
+// what changed, this comment explains why — linking each change back to the
+// Snyk finding state that drove it. It returns an empty string when there is
+// nothing meaningful to report.
 func buildChangeComment(update model.IssueUpdate) string {
 	if update.Diff == nil {
 		return ""
@@ -922,40 +924,79 @@ func buildChangeComment(update model.IssueUpdate) string {
 		return ""
 	}
 
-	lines := []string{"**snyk-linear-sync**"}
-	lines = append(lines, "")
+	lines := []string{"**snyk-linear-sync**", ""}
+
+	if d.StateChanged {
+		reason := update.Desired.StateReason
+		if reason != "" {
+			lines = append(lines, fmt.Sprintf("- Moved to **%s** — %s", d.StateTo, reason))
+		} else {
+			lines = append(lines, fmt.Sprintf("- Moved to **%s**", d.StateTo))
+		}
+	}
+
+	if d.DueDateChanged {
+		if update.Desired.DueDate == "" {
+			reason := update.Desired.DueDateReason
+			if reason != "" {
+				lines = append(lines, fmt.Sprintf("- Due date cleared — %s", reason))
+			} else {
+				lines = append(lines, "- Due date cleared")
+			}
+		} else {
+			reason := update.Desired.DueDateReason
+			if reason != "" {
+				lines = append(lines, fmt.Sprintf("- Due date set to **%s** — %s", update.Desired.DueDate, reason))
+			} else {
+				lines = append(lines, fmt.Sprintf("- Due date set to **%s**", update.Desired.DueDate))
+			}
+		}
+	}
+
+	if d.DescriptionChanged {
+		lines = append(lines, "- Description updated — Snyk finding data changed")
+	}
 
 	if d.TitleChanged {
-		lines = append(lines, fmt.Sprintf("- **Title**: `%s` → `%s`", d.TitleFrom, d.TitleTo))
+		lines = append(lines, "- Title updated — Snyk finding data changed")
 	}
-	if d.DescriptionChanged {
-		lines = append(lines, "- **Description** updated")
-	}
-	if d.DueDateChanged {
-		from := d.DueDateFrom
-		if from == "" {
-			from = "(none)"
-		}
-		to := d.DueDateTo
-		if to == "" {
-			to = "(cleared)"
-		}
-		lines = append(lines, fmt.Sprintf("- **Due date**: `%s` → `%s`", from, to))
-	}
-	if d.StateChanged {
-		lines = append(lines, fmt.Sprintf("- **State**: `%s` → `%s`", d.StateFrom, d.StateTo))
-	}
+
 	if d.PriorityChanged {
-		lines = append(lines, fmt.Sprintf("- **Priority**: `%d` → `%d`", d.PriorityFrom, d.PriorityTo))
+		lines = append(lines, fmt.Sprintf("- Priority set to **%s** — Snyk severity changed", priorityName(d.PriorityTo)))
 	}
-	if len(d.LabelsAdded) > 0 {
-		lines = append(lines, fmt.Sprintf("- **Labels added**: %s", strings.Join(d.LabelsAdded, ", ")))
+
+	for _, label := range d.LabelsAdded {
+		var reason string
+		if update.Desired.LabelReasons != nil {
+			reason = update.Desired.LabelReasons[label]
+		}
+		if reason != "" {
+			lines = append(lines, fmt.Sprintf("- Added **%s** — %s", label, reason))
+		} else {
+			lines = append(lines, fmt.Sprintf("- Added **%s**", label))
+		}
 	}
-	if len(d.LabelsRemoved) > 0 {
-		lines = append(lines, fmt.Sprintf("- **Labels removed**: %s", strings.Join(d.LabelsRemoved, ", ")))
+
+	for _, label := range d.LabelsRemoved {
+		lines = append(lines, fmt.Sprintf("- Removed **%s** — no longer applicable", label))
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func priorityName(priority int) string {
+	switch priority {
+	case 1:
+		return "Urgent"
+	case 2:
+		return "High"
+	case 3:
+		return "Medium"
+	case 4:
+		return "Low"
+	default:
+		return "None"
+	}
 }
 
 func createIssuesMutation(size int) string {

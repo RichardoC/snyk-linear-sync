@@ -475,8 +475,11 @@ func TestBuildChangeCommentGeneratesSummary(t *testing.T) {
 			Description:   "new body",
 			DueDate:       "2026-05-01",
 			State:         model.StateBacklog,
+			StateReason:   "Snyk reports this issue as ignored until a fix is available",
+			DueDateReason: "high severity SLA: 30 days from issue creation",
 			Priority:      1,
 			ManagedLabels: []string{"snyk-automation", "snyk-code"},
+			LabelReasons:  map[string]string{"snyk-code": "Snyk issue type is code"},
 		},
 		Diff: &model.IssueDiff{
 			TitleChanged:       true,
@@ -504,26 +507,29 @@ func TestBuildChangeCommentGeneratesSummary(t *testing.T) {
 	if !strings.Contains(comment, "**snyk-linear-sync**") {
 		t.Fatalf("comment missing header: %s", comment)
 	}
-	if !strings.Contains(comment, "**Title**") {
-		t.Fatalf("comment missing title change: %s", comment)
+	// State comment explains why, not just what
+	if !strings.Contains(comment, "Moved to **backlog** — Snyk reports this issue as ignored until a fix is available") {
+		t.Fatalf("comment missing state change with reason: %s", comment)
 	}
-	if !strings.Contains(comment, "**Description**") {
-		t.Fatalf("comment missing description change: %s", comment)
+	// Due date comment explains the SLA basis
+	if !strings.Contains(comment, "Due date set to **2026-05-01** — high severity SLA: 30 days from issue creation") {
+		t.Fatalf("comment missing due date with reason: %s", comment)
 	}
-	if !strings.Contains(comment, "**Due date**") {
-		t.Fatalf("comment missing due date change: %s", comment)
+	// Description explains the driver
+	if !strings.Contains(comment, "Description updated — Snyk finding data changed") {
+		t.Fatalf("comment missing description reason: %s", comment)
 	}
-	if !strings.Contains(comment, "**State**") {
-		t.Fatalf("comment missing state change: %s", comment)
+	// Title explains the driver
+	if !strings.Contains(comment, "Title updated — Snyk finding data changed") {
+		t.Fatalf("comment missing title reason: %s", comment)
 	}
-	if !strings.Contains(comment, "**Priority**") {
-		t.Fatalf("comment missing priority change: %s", comment)
+	// Priority uses human-readable name and explains the driver
+	if !strings.Contains(comment, "Priority set to **Urgent** — Snyk severity changed") {
+		t.Fatalf("comment missing priority with reason: %s", comment)
 	}
-	if !strings.Contains(comment, "**Priority**: `3` → `1`") {
-		t.Fatalf("comment priority not backtick-formatted: %s", comment)
-	}
-	if !strings.Contains(comment, "**Labels added**") {
-		t.Fatalf("comment missing labels added: %s", comment)
+	// Added label includes reason from LabelReasons
+	if !strings.Contains(comment, "Added **snyk-code** — Snyk issue type is code") {
+		t.Fatalf("comment missing label with reason: %s", comment)
 	}
 }
 
@@ -550,6 +556,85 @@ func TestBuildChangeCommentReturnsEmptyWhenNoChanges(t *testing.T) {
 
 	if comment != "" {
 		t.Fatalf("expected empty comment, got: %s", comment)
+	}
+}
+
+func TestBuildChangeCommentDueDateClearedWithReason(t *testing.T) {
+	update := model.IssueUpdate{
+		Existing: model.ExistingIssue{
+			DueDate:   "2026-04-01",
+			StateName: "Todo",
+		},
+		Desired: model.DesiredIssue{
+			DueDate:       "",
+			DueDateReason: "awaiting upstream fix, SLA paused",
+			State:         model.StateBacklog,
+		},
+		Diff: &model.IssueDiff{
+			DueDateChanged: true,
+			DueDateFrom:    "2026-04-01",
+			DueDateTo:      "",
+		},
+	}
+
+	comment := buildChangeComment(update)
+	if !strings.Contains(comment, "Due date cleared — awaiting upstream fix, SLA paused") {
+		t.Fatalf("comment missing cleared due date with reason: %s", comment)
+	}
+}
+
+func TestBuildChangeCommentRemovedLabels(t *testing.T) {
+	update := model.IssueUpdate{
+		Existing: model.ExistingIssue{
+			ManagedLabels: []string{"snyk-automation", "triage-dependency"},
+			Labels: []model.IssueLabel{
+				{ID: "l1", Name: "snyk-automation"},
+				{ID: "l2", Name: "triage-dependency"},
+			},
+			StateName: "Backlog",
+		},
+		Desired: model.DesiredIssue{
+			State:         model.StateTodo,
+			ManagedLabels: []string{"snyk-automation"},
+		},
+		Diff: &model.IssueDiff{
+			StateChanged:     true,
+			StateFrom:        "Backlog",
+			StateTo:          "todo",
+			LabelsRemoved:    []string{"triage-dependency"},
+			LabelsNeedUpdate: true,
+		},
+	}
+
+	comment := buildChangeComment(update)
+	if !strings.Contains(comment, "Removed **triage-dependency** — no longer applicable") {
+		t.Fatalf("comment missing removed label: %s", comment)
+	}
+}
+
+func TestBuildChangeCommentStateChangeWithoutReason(t *testing.T) {
+	update := model.IssueUpdate{
+		Existing: model.ExistingIssue{
+			StateName: "Todo",
+		},
+		Desired: model.DesiredIssue{
+			State:       model.StateDone,
+			StateReason: "", // no reason provided
+		},
+		Diff: &model.IssueDiff{
+			StateChanged: true,
+			StateFrom:    "Todo",
+			StateTo:      "done",
+		},
+	}
+
+	comment := buildChangeComment(update)
+	if !strings.Contains(comment, "Moved to **done**") {
+		t.Fatalf("comment missing state change: %s", comment)
+	}
+	// Should NOT contain an em-dash reason when reason is empty
+	if strings.Contains(comment, "Moved to **done** —") {
+		t.Fatalf("comment should not have reason suffix when empty: %s", comment)
 	}
 }
 
