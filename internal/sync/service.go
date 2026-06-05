@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1079,12 +1080,7 @@ func wasAwaitingFix(managedLabels []string, awaitingFixLabel string) bool {
 		return false
 	}
 	normalized := model.NormalizeLabelName(awaitingFixLabel)
-	for _, label := range model.NormalizeManagedLabelNames(managedLabels) {
-		if label == normalized {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(model.NormalizeManagedLabelNames(managedLabels), normalized)
 }
 
 // isNonTerminalModelState reports whether the desired model state is
