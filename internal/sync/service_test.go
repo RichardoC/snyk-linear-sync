@@ -795,6 +795,66 @@ func TestUpsertManagedMetadataRemovesVisibleFingerprintFooter(t *testing.T) {
 	}
 }
 
+// TestUpsertManagedMetadataIgnoresInlineMarker verifies that the metadata
+// marker appearing mid-sentence in user text does not corrupt the description.
+// The marker must be at the start of a line to be treated as a metadata block.
+func TestUpsertManagedMetadataIgnoresInlineMarker(t *testing.T) {
+	description := "See <!-- snyk-linear-sync notes --> for details\n\nStatus: `open`"
+
+	got := upsertManagedMetadata(description, "snyk:project-a:issue-1", []string{"snyk-automation"})
+
+	// The inline marker should NOT be replaced; it should remain intact.
+	if !strings.Contains(got, "See <!-- snyk-linear-sync notes -->") {
+		t.Fatalf("upsertManagedMetadata() corrupted inline marker: %s", got)
+	}
+	// A proper metadata block should be appended at the end.
+	if !strings.Contains(got, "<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1") {
+		t.Fatalf("upsertManagedMetadata() missing proper metadata block: %s", got)
+	}
+}
+
+func TestFindMetadataBlockStartAnchoredToLineBoundary(t *testing.T) {
+	cases := []struct {
+		name        string
+		description string
+		wantIdx     int
+	}{
+		{
+			name:        "marker at start of description",
+			description: "<!-- snyk-linear-sync\nfingerprint: test\n-->",
+			wantIdx:     0,
+		},
+		{
+			name:        "marker at start of line",
+			description: "Some text\n<!-- snyk-linear-sync\nfingerprint: test\n-->",
+			wantIdx:     10, // after "Some text\n"
+		},
+		{
+			name:        "marker mid-sentence should not match",
+			description: "See <!-- snyk-linear-sync notes --> for details",
+			wantIdx:     -1,
+		},
+		{
+			name:        "no marker at all",
+			description: "Just a normal description",
+			wantIdx:     -1,
+		},
+		{
+			name:        "inline marker followed by real block",
+			description: "See <!-- snyk-linear-sync notes -->\n<!-- snyk-linear-sync\nfingerprint: test\n-->",
+			wantIdx:     36, // the real block, not the inline one
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findMetadataBlockStart(tc.description)
+			if got != tc.wantIdx {
+				t.Fatalf("findMetadataBlockStart() = %d, want %d", got, tc.wantIdx)
+			}
+		})
+	}
+}
+
 func TestNeedsUpdateDetectsManagedLabelChange(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:         "title",
@@ -2422,6 +2482,46 @@ func TestComputeDiffDetectsLabelNotOnIssue(t *testing.T) {
 	}
 	if len(diff.LabelsRemoved) != 0 {
 		t.Fatalf("LabelsRemoved = %v, want empty", diff.LabelsRemoved)
+	}
+}
+
+// TestComputeDiffNoFalseLabelRemovalWhenLabelAlreadyGone verifies that a
+// previously managed label that is no longer desired AND already manually
+// removed from the issue is NOT reported as LabelsRemoved. This prevents
+// misleading change comments like "Removed X — no longer applicable" when
+// the label isn't actually on the issue anymore.
+func TestComputeDiffNoFalseLabelRemovalWhenLabelAlreadyGone(t *testing.T) {
+	existing := model.ExistingIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		StateName:     "Todo",
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation", "snyk-code"},
+		// snyk-code was previously managed but has been manually removed.
+		Labels: []model.IssueLabel{
+			{ID: "l1", Name: "snyk-automation"},
+		},
+	}
+	desired := model.DesiredIssue{
+		Title:         "title",
+		Description:   "desc",
+		DueDate:       "2026-04-01",
+		State:         model.StateTodo,
+		Priority:      2,
+		ManagedLabels: []string{"snyk-automation"},
+	}
+
+	diff := ComputeDiff(existing, desired)
+
+	if len(diff.LabelsRemoved) != 0 {
+		t.Fatalf("LabelsRemoved = %v, want empty (snyk-code is not on the issue)", diff.LabelsRemoved)
+	}
+	// LabelsNeedUpdate should be false because snyk-code is already absent from
+	// the issue and snyk-automation is still present. The metadata block change
+	// is captured by DescriptionChanged, not LabelsNeedUpdate.
+	if diff.LabelsNeedUpdate {
+		t.Fatal("expected no LabelsNeedUpdate since the label IDs on the issue are already correct")
 	}
 }
 

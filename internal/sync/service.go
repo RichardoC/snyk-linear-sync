@@ -338,9 +338,12 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
 				refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
 				if err != nil {
-					return result, err
+					s.logger.Warn("cache refresh failed after successful sync, will use pre-write Linear hashes; cache will self-correct on the next run",
+						slog.Any("error", err),
+					)
+				} else {
+					cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
 				}
-				cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
 			}
 			nextSnapshot := cache.Snapshot{
 				SchemaSignature: cacheSignature,
@@ -915,7 +918,14 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *mode
 	for _, label := range existing.ManagedLabels {
 		norm := model.NormalizeLabelName(label)
 		if _, exists := desiredLabelSet[norm]; !exists {
-			d.LabelsRemoved = append(d.LabelsRemoved, norm)
+			// Only report as removed if the label is actually present on the
+			// issue. If it was previously managed but has already been manually
+			// removed, reporting it as "removed" produces a misleading change
+			// comment even though the mutation is correct (it simply omits the
+			// label from the new label set).
+			if _, inExisting := existingLabels[norm]; inExisting {
+				d.LabelsRemoved = append(d.LabelsRemoved, norm)
+			}
 		}
 	}
 
@@ -1111,7 +1121,7 @@ func upsertManagedMetadata(description, fingerprint string, managedLabels []stri
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
 	block := metadataBlock(fingerprint, managedLabels)
 
-	start := strings.Index(description, metadataHeaderStart())
+	start := findMetadataBlockStart(description)
 	if start >= 0 {
 		if relEnd := strings.Index(description[start:], "-->"); relEnd >= 0 {
 			end := start + relEnd + len("-->")
@@ -1126,6 +1136,29 @@ func upsertManagedMetadata(description, fingerprint string, managedLabels []stri
 	}
 	description = stripVisibleFingerprintLine(description)
 	return strings.TrimSpace(strings.Join([]string{description, "", block}, "\n"))
+}
+
+// findMetadataBlockStart locates the snyk-linear-sync metadata block start
+// marker in the description, anchored to the beginning of a line. This
+// prevents false matches where the marker string appears mid-sentence in
+// user-written text (e.g. "See <!-- snyk-linear-sync notes -->"), which
+// could corrupt the description if treated as a metadata block.
+func findMetadataBlockStart(description string) int {
+	header := metadataHeaderStart()
+	for i := 0; i <= len(description)-len(header); {
+		idx := strings.Index(description[i:], header)
+		if idx < 0 {
+			return -1
+		}
+		absIdx := i + idx
+		// The marker must be at the start of a line: either position 0
+		// or preceded by a newline.
+		if absIdx == 0 || description[absIdx-1] == '\n' {
+			return absIdx
+		}
+		i = absIdx + 1
+	}
+	return -1
 }
 
 func metadataHeaderStart() string {
