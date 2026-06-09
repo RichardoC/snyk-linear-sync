@@ -67,6 +67,7 @@ type LinearConfig struct {
 	APIKey           string
 	TeamID           string
 	UnsubscribeActor bool
+	CommentsEnabled  bool
 	States           StateConfig
 	Labels           LabelConfig
 	Due              DueDateConfig
@@ -151,6 +152,7 @@ func Load(args []string) (Config, error) {
 			APIKey:           os.Getenv("LINEAR_API_KEY"),
 			TeamID:           os.Getenv("LINEAR_TEAM_ID"),
 			UnsubscribeActor: getEnvBool("LINEAR_UNSUBSCRIBE_ACTOR", true),
+			CommentsEnabled:  getEnvBool("LINEAR_COMMENTS", false),
 			States: StateConfig{
 				Todo:      getEnv("LINEAR_STATE_TODO", defaultLinearTodoState),
 				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
