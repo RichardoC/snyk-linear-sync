@@ -420,7 +420,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 					)
 				}
 			}
-		} else {
+		} else if s.cfg.Linear.CommentsEnabled {
 			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
 				s.logger.Warn("batch comment post failed, retrying individually",
 					slog.Int("batch_size", len(job.updateBatch)),

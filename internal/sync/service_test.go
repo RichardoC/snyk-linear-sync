@@ -2427,6 +2427,7 @@ func TestComputeDiffDetectsLabelNotOnIssue(t *testing.T) {
 
 func TestRunPostsChangeCommentsOnUpdate(t *testing.T) {
 	cfg := minimalCfg()
+	cfg.Linear.CommentsEnabled = true
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	snyk := fakeSnyk{
