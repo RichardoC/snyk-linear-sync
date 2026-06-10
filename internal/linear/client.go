@@ -374,11 +374,6 @@ query existingIssues($filter: IssueFilter!, $after: String) {
           name
         }
       }
-      subscribers(first: 100) {
-        nodes {
-          id
-        }
-      }
     }
     pageInfo {
       hasNextPage
@@ -409,11 +404,6 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 							Name string `json:"name"`
 						} `json:"nodes"`
 					} `json:"labels"`
-					Subscribers struct {
-						Nodes []struct {
-							ID string `json:"id"`
-						} `json:"nodes"`
-					} `json:"subscribers"`
 				} `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool    `json:"hasNextPage"`
@@ -434,13 +424,6 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 					Name: label.Name,
 				})
 			}
-			subscriberIDs := make([]string, 0, len(issue.Subscribers.Nodes))
-			for _, subscriber := range issue.Subscribers.Nodes {
-				if strings.TrimSpace(subscriber.ID) == "" {
-					continue
-				}
-				subscriberIDs = append(subscriberIDs, subscriber.ID)
-			}
 			existing := model.ExistingIssue{
 				ID:            issue.ID,
 				Identifier:    issue.Identifier,
@@ -453,7 +436,6 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 				DueDate:       deref(issue.DueDate),
 				Fingerprint:   extractFingerprint(description),
 				ManagedLabels: extractManagedLabels(description),
-				SubscriberIDs: subscriberIDs,
 				Labels:        labels,
 			}
 			issues = append(issues, existing)

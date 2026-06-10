@@ -198,7 +198,6 @@ func TestUpdateIssuesDoesNotSendSubscriberIdsInPayload(t *testing.T) {
 		Existing: model.ExistingIssue{
 			ID:            "issue-1",
 			Identifier:    "SNYK-1",
-			SubscriberIDs: []string{"user-1", "user-2"},
 			ManagedLabels: []string{"snyk-automation"},
 			Labels:        []model.IssueLabel{{ID: "label-1", Name: "snyk-automation"}},
 		},

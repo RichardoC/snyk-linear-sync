@@ -14,3 +14,7 @@ data/
 
 # binary
 /snyk-linear-sync
+
+# Bots suggesting commit messages
+COMMIT_MSG
+COMMIT_MSG.md
