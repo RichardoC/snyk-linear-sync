@@ -6,12 +6,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	sq "github.com/Masterminds/squirrel"
 	_ "modernc.org/sqlite"
 )
 
 const schemaVersion = "v1"
+
+// IgnoreMeta stores the v1 ignore fields that must survive a flaky Snyk API.
+// It is kept in the cache package to avoid an import cycle with the snyk package.
+type IgnoreMeta struct {
+	IssueKey           string
+	ExpiresAt          time.Time
+	DisregardIfFixable bool
+	CreatedAt          time.Time
+}
 
 type Snapshot struct {
 	SchemaSignature string
@@ -222,6 +232,14 @@ func (s *Store) init(ctx context.Context) error {
 			fingerprint TEXT PRIMARY KEY,
 			hash TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS snyk_ignores (
+			project_id TEXT NOT NULL,
+			issue_key TEXT NOT NULL,
+			expires_at TEXT,
+			disregard_if_fixable INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT,
+			PRIMARY KEY (project_id, issue_key)
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -243,5 +261,108 @@ func (s *Store) init(ctx context.Context) error {
 		return fmt.Errorf("initialize sqlite cache: %w", err)
 	}
 
+	return nil
+}
+
+// LoadIgnores returns the cached v1 ignore metadata for a project.
+func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]IgnoreMeta, error) {
+	out := make(map[string]IgnoreMeta)
+
+	query, args, err := s.builder.
+		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at").
+		From("snyk_ignores").
+		Where(sq.Eq{"project_id": projectID}).
+		ToSql()
+	if err != nil {
+		return nil, fmt.Errorf("build cache ignores query: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load cache ignores: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var issueKey string
+		var expiresAtRaw, createdAtRaw string
+		var disregardIfFixable int
+		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw); err != nil {
+			return nil, fmt.Errorf("scan cache ignore row: %w", err)
+		}
+
+		meta := IgnoreMeta{
+			IssueKey:           issueKey,
+			DisregardIfFixable: disregardIfFixable != 0,
+		}
+		if expiresAtRaw != "" {
+			meta.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAtRaw)
+		}
+		if createdAtRaw != "" {
+			meta.CreatedAt, _ = time.Parse(time.RFC3339, createdAtRaw)
+		}
+		out[issueKey] = meta
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cache ignores rows: %w", err)
+	}
+
+	return out, nil
+}
+
+// SaveIgnores stores v1 ignore metadata for a project, replacing any existing rows.
+func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[string]IgnoreMeta) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin cache ignores transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	query, args, err := s.builder.
+		Delete("snyk_ignores").
+		Where(sq.Eq{"project_id": projectID}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build clear cache ignores query: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("clear cache ignores: %w", err)
+	}
+
+	for issueKey, meta := range ignores {
+		expiresAtRaw := ""
+		if !meta.ExpiresAt.IsZero() {
+			expiresAtRaw = meta.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		createdAtRaw := ""
+		if !meta.CreatedAt.IsZero() {
+			createdAtRaw = meta.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		var disregard int64
+		if meta.DisregardIfFixable {
+			disregard = 1
+		}
+
+		query, args, err = s.builder.
+			Insert("snyk_ignores").
+			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at").
+			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw).
+			ToSql()
+		if err != nil {
+			return fmt.Errorf("build insert cache ignore row: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("insert cache ignore row: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit cache ignores transaction: %w", err)
+	}
 	return nil
 }

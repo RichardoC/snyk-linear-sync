@@ -12,6 +12,7 @@ import (
 
 	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 
+	"github.com/RichardoC/snyk-linear-sync/internal/cache"
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
@@ -259,7 +260,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				v1IgnoresCache[projectID] = ignores
 			}
 			for issueKey, entries := range ignores {
-				if meta := latestIgnoreMeta(entries); !meta.ExpiresAt.IsZero() || meta.DisregardIfFixable {
+				if meta := maxExpiryIgnoreMeta(entries); !meta.ExpiresAt.IsZero() || meta.DisregardIfFixable {
 					ignoreMetaByKey[issueKey] = meta
 				}
 			}
@@ -349,41 +350,261 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 }
 
 func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1ProjectIgnores, error) {
+	var cached v1ProjectIgnores
+	if c.cache != nil {
+		cachedMeta, err := c.cache.LoadIgnores(ctx, projectID)
+		if err != nil {
+			c.logger.Warn("failed to load cached v1 ignores",
+				"project_id", projectID,
+				"error", err,
+			)
+		} else if len(cachedMeta) > 0 {
+			cached = cacheIgnoresToV1(cachedMeta)
+		}
+	}
+
+	// The Snyk v1 ignores endpoint sometimes returns inconsistent expiry dates
+	// for the same ignore. Make a few attempts and take the maximum expiry seen
+	// across all successful responses so the first run is seeded with the
+	// highest reasonable value. This is still Snyk-only data and does not trust
+	// mutable Linear state.
+	const maxAttempts = 2
+	apiIgnores, err := c.fetchProjectIgnoresWithRetry(ctx, projectID, maxAttempts)
+	if err != nil {
+		if len(cached) > 0 {
+			c.logger.Warn("v1 ignores API failed, falling back to cached ignores",
+				"project_id", projectID,
+				"error", err,
+			)
+			return cached, nil
+		}
+		return nil, err
+	}
+
+	merged := mergeIgnores(apiIgnores, cached)
+
+	if c.cache != nil {
+		if err := c.cache.SaveIgnores(ctx, projectID, v1IgnoresToCache(merged)); err != nil {
+			c.logger.Warn("failed to cache v1 ignores",
+				"project_id", projectID,
+				"error", err,
+			)
+		}
+	}
+
+	return merged, nil
+}
+
+func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID string, maxAttempts int) (v1ProjectIgnores, error) {
 	endpoint, err := c.v1Base.Parse(fmt.Sprintf("org/%s/project/%s/ignores", c.orgID, projectID))
 	if err != nil {
 		return nil, fmt.Errorf("build v1 ignores URL: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, err
-	}
+	var apiIgnores v1ProjectIgnores
+	var lastErr error
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			}
+		}
 
-	if resp.StatusCode == http.StatusNotFound {
-		c.logger.Warn("v1 ignores endpoint returned 404, treating project ignores as unavailable",
-			"project_id", projectID,
-		)
-		return v1ProjectIgnores{}, nil
-	}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return nil, err
+		}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			c.logger.Warn("v1 ignores request failed, retrying",
+				"project_id", projectID,
+				"attempt", attempt+1,
+				"max_attempts", maxAttempts,
+				"error", err,
+			)
+			continue
+		}
+
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("snyk v1 ignores API %s %s failed with %d: %s",
-			resp.Request.Method, resp.Request.URL, resp.StatusCode, strings.TrimSpace(string(body)))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			c.logger.Warn("v1 ignores endpoint returned 404, treating project ignores as unavailable",
+				"project_id", projectID,
+			)
+			return v1ProjectIgnores{}, nil
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("snyk v1 ignores API %s %s failed with %d: %s",
+				resp.Request.Method, resp.Request.URL, resp.StatusCode, strings.TrimSpace(string(body)))
+			c.logger.Warn("v1 ignores request failed, retrying",
+				"project_id", projectID,
+				"attempt", attempt+1,
+				"max_attempts", maxAttempts,
+				"status", resp.StatusCode,
+			)
+			continue
+		}
+
+		var attemptIgnores v1ProjectIgnores
+		if err := json.Unmarshal(body, &attemptIgnores); err != nil {
+			lastErr = fmt.Errorf("decode v1 ignores: %w", err)
+			c.logger.Warn("v1 ignores decode failed, retrying",
+				"project_id", projectID,
+				"attempt", attempt+1,
+				"max_attempts", maxAttempts,
+				"error", err,
+			)
+			continue
+		}
+
+		apiIgnores = mergeIgnores(apiIgnores, attemptIgnores)
+		lastErr = nil
 	}
 
-	var ignores v1ProjectIgnores
-	if err := json.NewDecoder(resp.Body).Decode(&ignores); err != nil {
-		return nil, fmt.Errorf("decode v1 ignores: %w", err)
+	if lastErr != nil {
+		return nil, fmt.Errorf("v1 ignores API failed after %d attempts: %w", maxAttempts, lastErr)
 	}
 
-	return ignores, nil
+	return apiIgnores, nil
+}
+
+// mergeIgnores combines live API ignores with cached ignores. For each issue
+// key, it synthesizes a single merged entry with:
+//   - the maximum expiry seen from either source (high-water mark), so the
+//     due date never moves earlier because of a stale API response;
+//   - the most recently created timestamp and disregard-if-fixable flag from
+//     the source that has the most recent created timestamp.
+//
+// Cached entries are kept for keys that disappear from the API response so a
+// partial response does not wipe stable data.
+func mergeIgnores(api, cached v1ProjectIgnores) v1ProjectIgnores {
+	allKeys := make(map[string]struct{}, len(api)+len(cached))
+	for key := range api {
+		allKeys[key] = struct{}{}
+	}
+	for key := range cached {
+		allKeys[key] = struct{}{}
+	}
+
+	merged := make(v1ProjectIgnores, len(allKeys))
+	for key := range allKeys {
+		apiMeta := maxExpiryIgnoreMeta(api[key])
+		cachedMeta := maxExpiryIgnoreMeta(cached[key])
+
+		var disregard bool
+		var createdAt time.Time
+		if apiMeta.CreatedAt.After(cachedMeta.CreatedAt) {
+			disregard = apiMeta.DisregardIfFixable
+			createdAt = apiMeta.CreatedAt
+		} else {
+			disregard = cachedMeta.DisregardIfFixable
+			createdAt = cachedMeta.CreatedAt
+		}
+
+		maxExpiry := apiMeta.ExpiresAt
+		if cachedMeta.ExpiresAt.After(maxExpiry) {
+			maxExpiry = cachedMeta.ExpiresAt
+		}
+
+		if maxExpiry.IsZero() && !disregard {
+			continue
+		}
+
+		entry := v1IgnoreEntry{
+			DisregardIfFixable: disregard,
+		}
+		if !maxExpiry.IsZero() {
+			entry.Expires = maxExpiry.UTC().Format(time.RFC3339)
+		}
+		if !createdAt.IsZero() {
+			entry.Created = createdAt.UTC().Format(time.RFC3339)
+		}
+		merged[key] = []v1IgnoreEntry{entry}
+	}
+
+	return merged
+}
+
+// maxExpiryIgnoreMeta returns the maximum ignore expiry and the metadata of
+// the most recently created entry. These may come from different entries, so
+// the returned ExpiresAt is the high-water mark while DisregardIfFixable is
+// the value from the latest created entry.
+func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
+	var meta ignoreMetadata
+	var latestCreated time.Time
+	var maxExpiry time.Time
+
+	for _, entry := range entries {
+		createdAt, errCreated := parseTime(entry.Created)
+		if errCreated == nil {
+			if latestCreated.IsZero() || createdAt.After(latestCreated) {
+				latestCreated = createdAt
+				meta.CreatedAt = createdAt
+				meta.DisregardIfFixable = entry.DisregardIfFixable
+			}
+		}
+
+		if entry.Expires == "" {
+			continue
+		}
+		expiresAt, err := parseTime(entry.Expires)
+		if err != nil {
+			continue
+		}
+		if expiresAt.After(maxExpiry) {
+			maxExpiry = expiresAt
+			meta.ExpiresAt = expiresAt
+		}
+	}
+
+	return meta
+}
+
+// v1IgnoresToCache converts v1 ignore entries into a cache-friendly map keyed
+// by issue key. Only entries with an expiry or a disregard-if-fixable flag are
+// kept, because those are the only fields the sync uses.
+func v1IgnoresToCache(ignores v1ProjectIgnores) map[string]cache.IgnoreMeta {
+	out := make(map[string]cache.IgnoreMeta, len(ignores))
+	for issueKey, entries := range ignores {
+		meta := maxExpiryIgnoreMeta(entries)
+		if meta.ExpiresAt.IsZero() && !meta.DisregardIfFixable {
+			continue
+		}
+		out[issueKey] = cache.IgnoreMeta{
+			IssueKey:           issueKey,
+			ExpiresAt:          meta.ExpiresAt,
+			DisregardIfFixable: meta.DisregardIfFixable,
+			CreatedAt:          meta.CreatedAt,
+		}
+	}
+	return out
+}
+
+// cacheIgnoresToV1 reconstructs the v1 ignore response shape from cached
+// metadata. Each cached issue key becomes a single-entry array so that the
+// rest of the sync logic can use maxExpiryIgnoreMeta unchanged.
+func cacheIgnoresToV1(cached map[string]cache.IgnoreMeta) v1ProjectIgnores {
+	out := make(v1ProjectIgnores, len(cached))
+	for issueKey, meta := range cached {
+		entry := v1IgnoreEntry{
+			DisregardIfFixable: meta.DisregardIfFixable,
+		}
+		if !meta.ExpiresAt.IsZero() {
+			entry.Expires = meta.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		if !meta.CreatedAt.IsZero() {
+			entry.Created = meta.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		out[issueKey] = []v1IgnoreEntry{entry}
+	}
+	return out
 }
 
 // ignoreMetadata carries the v1 ignore fields that the sync logic needs:
@@ -392,37 +613,7 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 type ignoreMetadata struct {
 	ExpiresAt          time.Time
 	DisregardIfFixable bool
-}
-
-// latestIgnoreMeta returns the metadata of the most recently created ignore
-// entry among the provided ignore entries.
-func latestIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
-	var latestCreated time.Time
-	var meta ignoreMetadata
-
-	for _, entry := range entries {
-		createdAt, err := parseTime(entry.Created)
-		if err != nil {
-			continue
-		}
-
-		if latestCreated.IsZero() || createdAt.After(latestCreated) {
-			latestCreated = createdAt
-			meta.DisregardIfFixable = entry.DisregardIfFixable
-			if entry.Expires != "" {
-				expiresAt, err := parseTime(entry.Expires)
-				if err == nil {
-					meta.ExpiresAt = expiresAt
-				} else {
-					meta.ExpiresAt = time.Time{}
-				}
-			} else {
-				meta.ExpiresAt = time.Time{}
-			}
-		}
-	}
-
-	return meta
+	CreatedAt          time.Time
 }
 
 func parseTime(raw string) (time.Time, error) {

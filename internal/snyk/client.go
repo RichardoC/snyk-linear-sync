@@ -14,6 +14,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 
+	"github.com/RichardoC/snyk-linear-sync/internal/cache"
 	"github.com/RichardoC/snyk-linear-sync/internal/config"
 	"github.com/RichardoC/snyk-linear-sync/internal/httpx"
 )
@@ -27,6 +28,7 @@ type Client struct {
 	v1Base     *url.URL
 	sdk        *snyksdk.Client
 	logger     *slog.Logger
+	cache      *cache.Store
 }
 
 func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, error) {
@@ -82,6 +84,13 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, 
 		sdk:        sdkClient,
 		logger:     logger,
 	}, nil
+}
+
+// SetCache attaches a SQLite cache store so the client can persist v1 ignore
+// metadata. This lets the sync survive flaky 404s from the Snyk v1 ignores
+// endpoint without losing snooze expiries or disregard-if-fixable flags.
+func (c *Client) SetCache(store *cache.Store) {
+	c.cache = store
 }
 
 func findRegion(alias string) (snyksdk.Region, bool) {

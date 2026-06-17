@@ -12,5 +12,6 @@ logs/
 # contains the sqlite3 db for the cache
 data/
 
-# binary
+# binaries
 /snyk-linear-sync
+/investigate-duedate
