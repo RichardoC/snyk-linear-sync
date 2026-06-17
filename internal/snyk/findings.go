@@ -404,7 +404,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 	var apiIgnores v1ProjectIgnores
 	var lastErr error
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := range maxAttempts {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():

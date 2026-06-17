@@ -82,14 +82,21 @@ go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
 
 ## Validation
 
-Required after code changes:
+Run these before every commit. `go fix ./...` may automatically rewrite code
+(for example, modernising loop syntax), so run it first, review the resulting
+`git diff`, and include any changes in the same commit. Repeat until
+`git diff --exit-code` is clean.
 
 ```bash
 go fix ./...
+git diff --exit-code
 go test ./...
 go vet ./...
 go fmt ./...
 ```
+
+CI enforces this: the `go fix` check runs `go fix ./...` and then
+`git diff --exit-code`, so any unfixed code will fail the build.
 
 ## Current Behavior
 
