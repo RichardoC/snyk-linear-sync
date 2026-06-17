@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,34 @@ type Client struct {
 	blockedUntil    time.Time
 }
 
+// linearIssueNode is the shared GraphQL shape for an issue returned by
+// Linear queries. It is kept unexported so both bulk and single-issue lookups
+// can share the same conversion logic.
+type linearIssueNode struct {
+	ID          string  `json:"id"`
+	Identifier  string  `json:"identifier"`
+	Title       string  `json:"title"`
+	Description *string `json:"description"`
+	URL         string  `json:"url"`
+	Priority    int     `json:"priority"`
+	DueDate     *string `json:"dueDate"`
+	State       struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"state"`
+	Labels struct {
+		Nodes []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"nodes"`
+	} `json:"labels"`
+	Subscribers struct {
+		Nodes []struct {
+			ID string `json:"id"`
+		} `json:"nodes"`
+	} `json:"subscribers"`
+}
+
 func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Client {
 	base := httpx.NewAdaptiveTransport("linear", maxConcurrency, logger, nil)
 	httpClient := &http.Client{
@@ -63,6 +92,129 @@ func (c *Client) LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error
 		return nil, err
 	}
 	return c.loadIssues(ctx)
+}
+
+// LoadIssueByIdentifier fetches a single Linear issue by its identifier (e.g.
+// "SNYK-12127"). Linear's IssueFilter does not expose an identifier field, so
+// the identifier is split into its team key and number and queried by those.
+// It does not require states to be loaded, so it is suitable for diagnostic
+// tools that only need to inspect one issue.
+func (c *Client) LoadIssueByIdentifier(ctx context.Context, identifier string) (model.ExistingIssue, error) {
+	teamKey, number, err := parseLinearIdentifier(identifier)
+	if err != nil {
+		return model.ExistingIssue{}, err
+	}
+
+	filter := linearapi.IssueFilter{
+		Team: &linearapi.TeamFilter{
+			Key: &linearapi.StringComparator{EqIgnoreCase: &teamKey},
+		},
+		Number: &linearapi.NumberComparator{Eq: &number},
+	}
+
+	op := gqlclient.NewOperation(`
+query issueByIdentifier($filter: IssueFilter!) {
+  issues(filter: $filter, first: 1) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      url
+      priority
+      dueDate
+      state {
+        id
+        name
+      }
+      labels {
+        nodes {
+          id
+          name
+        }
+      }
+      subscribers(first: 100) {
+        nodes {
+          id
+        }
+      }
+    }
+  }
+}`)
+	op.Var("filter", filter)
+
+	var resp struct {
+		Issues struct {
+			Nodes []linearIssueNode `json:"nodes"`
+		} `json:"issues"`
+	}
+	if err := c.execute(ctx, op, &resp); err != nil {
+		return model.ExistingIssue{}, fmt.Errorf("fetch Linear issue %q: %w", identifier, err)
+	}
+	if len(resp.Issues.Nodes) == 0 {
+		return model.ExistingIssue{}, fmt.Errorf("Linear issue %q not found", identifier)
+	}
+
+	return linearIssueToModel(resp.Issues.Nodes[0]), nil
+}
+
+// parseLinearIdentifier splits a Linear identifier such as "SNYK-12127" into
+// its team key ("SNYK") and issue number (12127).
+func parseLinearIdentifier(identifier string) (string, float64, error) {
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return "", 0, fmt.Errorf("empty Linear identifier")
+	}
+	// Linear identifiers are TEAMKEY-NUMBER. The number is always the part
+	// after the final dash so identifiers like "FOO-BAR-123" are still handled
+	// correctly (team key "FOO-BAR", number 123), although this is unlikely.
+	idx := strings.LastIndex(identifier, "-")
+	if idx <= 0 || idx == len(identifier)-1 {
+		return "", 0, fmt.Errorf("identifier %q is not a valid Linear identifier (expected TEAMKEY-NUMBER)", identifier)
+	}
+	teamKey := strings.TrimSpace(identifier[:idx])
+	numberStr := strings.TrimSpace(identifier[idx+1:])
+	if teamKey == "" {
+		return "", 0, fmt.Errorf("identifier %q is missing a team key", identifier)
+	}
+	number, err := strconv.ParseFloat(numberStr, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("identifier %q has an invalid issue number: %w", identifier, err)
+	}
+	return teamKey, number, nil
+}
+
+func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
+	description := deref(issue.Description)
+	labels := make([]model.IssueLabel, 0, len(issue.Labels.Nodes))
+	for _, label := range issue.Labels.Nodes {
+		labels = append(labels, model.IssueLabel{
+			ID:   label.ID,
+			Name: label.Name,
+		})
+	}
+	subscriberIDs := make([]string, 0, len(issue.Subscribers.Nodes))
+	for _, subscriber := range issue.Subscribers.Nodes {
+		if strings.TrimSpace(subscriber.ID) == "" {
+			continue
+		}
+		subscriberIDs = append(subscriberIDs, subscriber.ID)
+	}
+	return model.ExistingIssue{
+		ID:            issue.ID,
+		Identifier:    issue.Identifier,
+		Title:         issue.Title,
+		URL:           issue.URL,
+		StateID:       issue.State.ID,
+		StateName:     issue.State.Name,
+		Description:   description,
+		Priority:      issue.Priority,
+		DueDate:       deref(issue.DueDate),
+		Fingerprint:   extractFingerprint(description),
+		ManagedLabels: extractManagedLabels(description),
+		SubscriberIDs: subscriberIDs,
+		Labels:        labels,
+	}
 }
 
 func (c *Client) StateID(state model.IssueState) (string, error) {
@@ -391,30 +543,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 
 		var resp struct {
 			Issues struct {
-				Nodes []struct {
-					ID          string  `json:"id"`
-					Identifier  string  `json:"identifier"`
-					Title       string  `json:"title"`
-					Description *string `json:"description"`
-					URL         string  `json:"url"`
-					Priority    int     `json:"priority"`
-					DueDate     *string `json:"dueDate"`
-					State       struct {
-						ID   string `json:"id"`
-						Name string `json:"name"`
-					} `json:"state"`
-					Labels struct {
-						Nodes []struct {
-							ID   string `json:"id"`
-							Name string `json:"name"`
-						} `json:"nodes"`
-					} `json:"labels"`
-					Subscribers struct {
-						Nodes []struct {
-							ID string `json:"id"`
-						} `json:"nodes"`
-					} `json:"subscribers"`
-				} `json:"nodes"`
+				Nodes    []linearIssueNode `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool    `json:"hasNextPage"`
 					EndCursor   *string `json:"endCursor"`
@@ -426,37 +555,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 		}
 
 		for _, issue := range resp.Issues.Nodes {
-			description := deref(issue.Description)
-			labels := make([]model.IssueLabel, 0, len(issue.Labels.Nodes))
-			for _, label := range issue.Labels.Nodes {
-				labels = append(labels, model.IssueLabel{
-					ID:   label.ID,
-					Name: label.Name,
-				})
-			}
-			subscriberIDs := make([]string, 0, len(issue.Subscribers.Nodes))
-			for _, subscriber := range issue.Subscribers.Nodes {
-				if strings.TrimSpace(subscriber.ID) == "" {
-					continue
-				}
-				subscriberIDs = append(subscriberIDs, subscriber.ID)
-			}
-			existing := model.ExistingIssue{
-				ID:            issue.ID,
-				Identifier:    issue.Identifier,
-				Title:         issue.Title,
-				URL:           issue.URL,
-				StateID:       issue.State.ID,
-				StateName:     issue.State.Name,
-				Description:   description,
-				Priority:      issue.Priority,
-				DueDate:       deref(issue.DueDate),
-				Fingerprint:   extractFingerprint(description),
-				ManagedLabels: extractManagedLabels(description),
-				SubscriberIDs: subscriberIDs,
-				Labels:        labels,
-			}
-			issues = append(issues, existing)
+			issues = append(issues, linearIssueToModel(issue))
 		}
 
 		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {

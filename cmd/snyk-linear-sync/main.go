@@ -48,6 +48,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 	defer cacheStore.Close()
+	snyk.SetCache(cacheStore)
 
 	linear := linearclient.New(cfg.Linear, cfg.Sync.LinearConcurrency, logger.With("service", "linear"))
 	service := syncsvc.New(cfg, logger.With("service", "sync"), snyk, linear, cacheStore)

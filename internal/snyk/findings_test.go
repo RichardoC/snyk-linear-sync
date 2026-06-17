@@ -1,6 +1,13 @@
 package snyk
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -66,7 +73,7 @@ func TestMapStatusDisregardIfFixableTakesPrecedenceOverExpiry(t *testing.T) {
 	}
 }
 
-func TestLatestIgnoreMeta(t *testing.T) {
+func TestMaxExpiryIgnoreMeta(t *testing.T) {
 	cases := []struct {
 		name    string
 		entries []v1IgnoreEntry
@@ -77,55 +84,88 @@ func TestLatestIgnoreMeta(t *testing.T) {
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 			},
-			want: ignoreMetadata{ExpiresAt: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC)},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC),
+				CreatedAt: time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC),
+			},
 		},
 		{
 			name: "permanent ignore no expires",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: ""},
 			},
-			want: ignoreMetadata{},
+			want: ignoreMetadata{
+				CreatedAt: time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC),
+			},
 		},
 		{
-			name: "multiple ignores picks latest",
+			name: "multiple ignores picks max expiry",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 				{Created: "2026-04-01T12:00:00Z", Expires: "2026-05-01T12:00:00Z"},
 			},
-			want: ignoreMetadata{ExpiresAt: time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC)},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC),
+				CreatedAt: time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
+			},
 		},
 		{
-			name: "latest has no expiry falls back to older",
+			name: "max expiry can come from an older entry",
+			entries: []v1IgnoreEntry{
+				{Created: "2026-03-18T12:00:00Z", Expires: "2026-06-17T23:00:00Z"},
+				{Created: "2026-04-01T12:00:00Z", Expires: "2026-06-14T23:00:00Z"},
+			},
+			want: ignoreMetadata{
+				ExpiresAt:          time.Date(2026, time.June, 17, 23, 0, 0, 0, time.UTC),
+				CreatedAt:          time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
+				DisregardIfFixable: false,
+			},
+		},
+		{
+			name: "latest has no expiry still uses max expiry",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 				{Created: "2026-04-01T12:00:00Z", Expires: ""},
 			},
-			want: ignoreMetadata{},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC),
+				CreatedAt: time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
+			},
 		},
 		{
 			name: "ignore until fix available",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "", DisregardIfFixable: true},
 			},
-			want: ignoreMetadata{DisregardIfFixable: true},
+			want: ignoreMetadata{
+				DisregardIfFixable: true,
+				CreatedAt:          time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC),
+			},
 		},
 		{
-			name: "disregardIfFixable from latest entry",
+			name: "disregardIfFixable from latest created entry",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z", DisregardIfFixable: true},
 				{Created: "2026-04-01T12:00:00Z", Expires: "2026-05-01T12:00:00Z", DisregardIfFixable: false},
 			},
-			want: ignoreMetadata{ExpiresAt: time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC), DisregardIfFixable: false},
+			want: ignoreMetadata{
+				ExpiresAt:          time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC),
+				CreatedAt:          time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
+				DisregardIfFixable: false,
+			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := latestIgnoreMeta(tc.entries)
+			got := maxExpiryIgnoreMeta(tc.entries)
 			if !got.ExpiresAt.Equal(tc.want.ExpiresAt) {
-				t.Fatalf("latestIgnoreMeta().ExpiresAt = %v, want %v", got.ExpiresAt, tc.want.ExpiresAt)
+				t.Fatalf("maxExpiryIgnoreMeta().ExpiresAt = %v, want %v", got.ExpiresAt, tc.want.ExpiresAt)
+			}
+			if !got.CreatedAt.Equal(tc.want.CreatedAt) {
+				t.Fatalf("maxExpiryIgnoreMeta().CreatedAt = %v, want %v", got.CreatedAt, tc.want.CreatedAt)
 			}
 			if got.DisregardIfFixable != tc.want.DisregardIfFixable {
-				t.Fatalf("latestIgnoreMeta().DisregardIfFixable = %v, want %v", got.DisregardIfFixable, tc.want.DisregardIfFixable)
+				t.Fatalf("maxExpiryIgnoreMeta().DisregardIfFixable = %v, want %v", got.DisregardIfFixable, tc.want.DisregardIfFixable)
 			}
 		})
 	}
@@ -201,5 +241,131 @@ func TestIsActiveProjectStatus(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("isActiveProjectStatus(%q) = %v, want %v", tc.status, got, tc.want)
 		}
+	}
+}
+
+func TestMergeIgnoresPicksLatestExpiry(t *testing.T) {
+	api := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{{Created: "2026-06-01T00:00:00Z", Expires: "2026-06-14T23:00:00Z"}},
+	}
+	cached := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"}},
+	}
+
+	merged := mergeIgnores(api, cached)
+	entries, ok := merged["SNYK-1"]
+	if !ok {
+		t.Fatal("merged missing SNYK-1")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Expires != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	}
+	if entries[0].Created != "2026-06-01T00:00:00Z" {
+		t.Fatalf("created = %q, want 2026-06-01T00:00:00Z (latest created from API)", entries[0].Created)
+	}
+}
+
+func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		var expires string
+		if requestCount == 1 {
+			expires = "2026-06-14T23:00:00Z"
+		} else {
+			expires = "2026-06-17T23:00:00Z"
+		}
+
+		body := map[string][]v1IgnoreEntry{
+			"SNYK-1": {
+				{Created: "2026-06-01T00:00:00Z", Expires: expires},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(body); err != nil {
+			t.Fatalf("encode mock response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("fetchProjectIgnores() error = %v", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("requestCount = %d, want 2", requestCount)
+	}
+
+	entries, ok := ignores["SNYK-1"]
+	if !ok {
+		t.Fatal("ignores missing SNYK-1")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Expires != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	}
+}
+
+func TestMergeIgnoresUsesLatestCreatedFromAPI(t *testing.T) {
+	api := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{{Created: "2026-06-15T00:00:00Z", Expires: "2026-06-14T23:00:00Z", DisregardIfFixable: true}},
+	}
+	cached := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"}},
+	}
+
+	merged := mergeIgnores(api, cached)
+	entries, ok := merged["SNYK-1"]
+	if !ok {
+		t.Fatal("merged missing SNYK-1")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Expires != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	}
+	if entries[0].Created != "2026-06-15T00:00:00Z" {
+		t.Fatalf("created = %q, want 2026-06-15T00:00:00Z (latest created from API)", entries[0].Created)
+	}
+	if !entries[0].DisregardIfFixable {
+		t.Fatalf("DisregardIfFixable = false, want true (from latest created API entry)")
+	}
+}
+
+func TestMergeIgnoresKeepsCachedKeyWhenMissingFromAPI(t *testing.T) {
+	api := v1ProjectIgnores{}
+	cached := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"}},
+	}
+
+	merged := mergeIgnores(api, cached)
+	entries, ok := merged["SNYK-1"]
+	if !ok {
+		t.Fatal("merged missing SNYK-1")
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Expires != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
 	}
 }

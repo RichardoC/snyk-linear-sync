@@ -185,6 +185,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix) {
 				desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(s.cfg.Linear.Due, finding)
 			}
+
 		}
 
 		desiredByFingerprint[finding.Fingerprint] = desired
@@ -761,6 +762,13 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 		return "", "", ""
 	}
 
+	return dueDateFromBase(baseDate, basis, dueCfg, finding)
+}
+
+// dueDateFromBase calculates the due date from a given base date, severity,
+// and SLA offsets. It returns the same value for both the effective due date
+// and the cache base so that past-SLA dates remain stable.
+func dueDateFromBase(baseDate time.Time, basis string, dueCfg config.DueDateConfig, finding model.Finding) (effective, base, reason string) {
 	var days int
 	switch issuePriority(finding.Severity) {
 	case 1:
@@ -939,7 +947,7 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *mode
 }
 
 func missingFindingState(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) (model.IssueState, string) {
-	projectID, ok := fingerprintProjectID(fingerprint)
+	projectID, ok := FingerprintProjectID(fingerprint)
 	if !ok {
 		return model.StateDone, "this Snyk finding is no longer present"
 	}
@@ -954,7 +962,8 @@ func missingFindingState(fingerprint string, activeProjects map[string]struct{},
 	return model.StateCancelled, "the Snyk project no longer exists"
 }
 
-func fingerprintProjectID(fingerprint string) (string, bool) {
+// FingerprintProjectID extracts the project ID portion of a Snyk fingerprint.
+func FingerprintProjectID(fingerprint string) (string, bool) {
 	const prefix = "snyk:"
 	if !strings.HasPrefix(fingerprint, prefix) {
 		return "", false
