@@ -151,6 +151,15 @@ type orgResponse struct {
 //
 // The custom UnmarshalJSON tries both formats and only extracts the fields
 // we need (created, expires, and disregardIfFixable).
+// projectIssueKey is the composite key for looking up v1 ignore metadata.
+// The same Snyk vulnerability key can appear in multiple projects with
+// different ignore expiries, so the project ID must be part of the key to
+// avoid cross-project collisions.
+type projectIssueKey struct {
+	ProjectID string
+	IssueKey  string
+}
+
 type v1IgnoreEntry struct {
 	Created            string `json:"created"`
 	Expires            string `json:"expires"`
@@ -229,7 +238,12 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	// ignore expires (the REST API flips ignored=false but the v1 record
 	// persists), and also captures disregardIfFixable for "ignore until fix
 	// available" ignores.
-	ignoreMetaByKey := make(map[string]ignoreMetadata)
+	//
+	// Keyed by (projectID, issueKey) because the same vulnerability key can
+	// appear in multiple projects with different ignore expiries. Using just
+	// the issueKey caused cross-project collisions where whichever project was
+	// processed last overwrote the others, producing flip-flopping due dates.
+	ignoreMetaByProjectIssue := make(map[projectIssueKey]ignoreMetadata)
 	v1IgnoresCache := make(map[string]v1ProjectIgnores)
 
 	nextCursor := ""
@@ -261,7 +275,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			}
 			for issueKey, entries := range ignores {
 				if meta := maxExpiryIgnoreMeta(entries); !meta.ExpiresAt.IsZero() || meta.DisregardIfFixable {
-					ignoreMetaByKey[issueKey] = meta
+					ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issueKey}] = meta
 				}
 			}
 		}
@@ -286,11 +300,11 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
 			}
 
-			ignoreMeta, ok := ignoreMetaByKey[issueKey]
+			ignoreMeta, ok := ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issueKey}]
 			// The v1 API uses either SNYK-* keys or issue UUIDs as top-level keys
 			// depending on project type. If the first lookup failed, try the issue ID.
 			if !ok && issue.ID != "" && issueKey != issue.ID {
-				ignoreMeta, ok = ignoreMetaByKey[issue.ID]
+				ignoreMeta, ok = ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issue.ID}]
 			}
 
 			finding := model.Finding{
@@ -364,11 +378,11 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 	}
 
 	// The Snyk v1 ignores endpoint sometimes returns inconsistent expiry dates
-	// for the same ignore. Make a few attempts and take the maximum expiry seen
-	// across all successful responses so the first run is seeded with the
+	// for the same ignore. Make several attempts and take the maximum expiry
+	// seen across all successful responses so the first run is seeded with the
 	// highest reasonable value. This is still Snyk-only data and does not trust
 	// mutable Linear state.
-	const maxAttempts = 2
+	const maxAttempts = 3
 	apiIgnores, err := c.fetchProjectIgnoresWithRetry(ctx, projectID, maxAttempts)
 	if err != nil {
 		if len(cached) > 0 {
@@ -392,7 +406,41 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 		}
 	}
 
+	if len(cached) == 0 && len(merged) > 0 {
+		c.logger.Info("seeded v1 ignores cache from API",
+			"project_id", projectID,
+			"count", len(merged),
+		)
+	} else if len(cached) > 0 {
+		cachedMeta := maxExpiryIgnoreMeta(flattenIgnores(cached))
+		mergedMeta := maxExpiryIgnoreMeta(flattenIgnores(merged))
+		if len(merged) > len(cached) {
+			c.logger.Info("v1 ignores cache gained new keys from API",
+				"project_id", projectID,
+				"cached_count", len(cached),
+				"merged_count", len(merged),
+			)
+		}
+		if !mergedMeta.ExpiresAt.IsZero() && !mergedMeta.ExpiresAt.Equal(cachedMeta.ExpiresAt) {
+			c.logger.Info("v1 ignores merged expiry changed for project",
+				"project_id", projectID,
+				"cached_expiry", cachedMeta.ExpiresAt,
+				"merged_expiry", mergedMeta.ExpiresAt,
+			)
+		}
+	}
+
 	return merged, nil
+}
+
+// flattenIgnores returns all entries from a v1ProjectIgnores map as a single
+// slice so maxExpiryIgnoreMeta can be applied across a whole project.
+func flattenIgnores(ignores v1ProjectIgnores) []v1IgnoreEntry {
+	var out []v1IgnoreEntry
+	for _, entries := range ignores {
+		out = append(out, entries...)
+	}
+	return out
 }
 
 func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID string, maxAttempts int) (v1ProjectIgnores, error) {
@@ -409,7 +457,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			case <-time.After(time.Duration(attempt) * time.Second):
 			}
 		}
 

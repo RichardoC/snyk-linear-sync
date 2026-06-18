@@ -330,32 +330,36 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	}
 
 	if !s.cfg.DryRun && s.cache != nil {
-		if result.FailedOps > 0 {
-			s.logger.Warn("skipping cache refresh because some sync operations failed",
-				slog.Int64("failed_ops", result.FailedOps),
-			)
-		} else {
-			cacheLinearHashes := currentLinearHashes
-			if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
-				refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
-				if err != nil {
-					return result, err
-				}
+		// Refresh the cache even if some Linear operations failed. Snyk data and
+		// ignore metadata are still valid and should be cached so the next run
+		// does not have to re-fetch everything. Linear hashes are taken from a
+		// fresh snapshot when possible; if the reload fails we fall back to the
+		// hashes from the initial load, which will cause the next run to retry
+		// any issues whose writes failed.
+		cacheLinearHashes := currentLinearHashes
+		if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
+			refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
+			if err != nil {
+				s.logger.Warn("failed to refresh Linear snapshot, using current hashes for cache",
+					"error", err,
+				)
+			} else {
 				cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
 			}
-			nextSnapshot := cache.Snapshot{
-				SchemaSignature: cacheSignature,
-				SnykHashes:      snykHashes,
-				LinearHashes:    cacheLinearHashes,
-			}
-			if err := s.cache.Save(runCtx, nextSnapshot); err != nil {
-				return result, err
-			}
-			s.logger.Info("refreshed sync cache",
-				slog.Int("snyk_rows", len(nextSnapshot.SnykHashes)),
-				slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
-			)
 		}
+		nextSnapshot := cache.Snapshot{
+			SchemaSignature: cacheSignature,
+			SnykHashes:      snykHashes,
+			LinearHashes:    cacheLinearHashes,
+		}
+		if err := s.cache.Save(runCtx, nextSnapshot); err != nil {
+			return result, err
+		}
+		s.logger.Info("refreshed sync cache",
+			slog.Int("snyk_rows", len(nextSnapshot.SnykHashes)),
+			slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
+			slog.Int64("failed_ops", result.FailedOps),
+		)
 	}
 
 	return result, nil
