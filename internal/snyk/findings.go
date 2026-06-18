@@ -485,6 +485,9 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 			c.logger.Warn("v1 ignores endpoint returned 404, treating project ignores as unavailable",
 				"project_id", projectID,
 			)
+			if len(apiIgnores) > 0 {
+				return apiIgnores, nil
+			}
 			return v1ProjectIgnores{}, nil
 		}
 
