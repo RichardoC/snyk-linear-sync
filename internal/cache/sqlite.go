@@ -14,6 +14,12 @@ import (
 
 const schemaVersion = "v1"
 
+// ignoreEntryTTL is how long a cached v1 ignore entry survives without being
+// seen in the Snyk API response. It must be long enough to survive transient
+// partial responses, but short enough that a deleted ignore does not stay
+// cached forever.
+const ignoreEntryTTL = 7 * 24 * time.Hour
+
 // IgnoreMeta stores the v1 ignore fields that must survive a flaky Snyk API.
 // It is kept in the cache package to avoid an import cycle with the snyk package.
 type IgnoreMeta struct {
@@ -21,6 +27,7 @@ type IgnoreMeta struct {
 	ExpiresAt          time.Time
 	DisregardIfFixable bool
 	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type Snapshot struct {
@@ -238,6 +245,7 @@ func (s *Store) init(ctx context.Context) error {
 			expires_at TEXT,
 			disregard_if_fixable INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT,
+			updated_at TEXT,
 			PRIMARY KEY (project_id, issue_key)
 		)`,
 	}
@@ -246,6 +254,10 @@ func (s *Store) init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("initialize sqlite cache: %w", err)
 		}
+	}
+
+	if err := s.migrateSnykIgnoresCache(ctx); err != nil {
+		return fmt.Errorf("migrate snyk ignores cache: %w", err)
 	}
 
 	query, args, err := s.builder.
@@ -264,12 +276,49 @@ func (s *Store) init(ctx context.Context) error {
 	return nil
 }
 
+func (s *Store) migrateSnykIgnoresCache(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(snyk_ignores)")
+	if err != nil {
+		return fmt.Errorf("check snyk_ignores columns: %w", err)
+	}
+	defer rows.Close()
+
+	var hasUpdatedAt bool
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name string
+		var typ, dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "updated_at" {
+			hasUpdatedAt = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table_info: %w", err)
+	}
+
+	if !hasUpdatedAt {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE snyk_ignores ADD COLUMN updated_at TEXT"); err != nil {
+			return fmt.Errorf("add updated_at column: %w", err)
+		}
+		if _, err := s.db.ExecContext(ctx, "UPDATE snyk_ignores SET updated_at = CURRENT_TIMESTAMP"); err != nil {
+			return fmt.Errorf("seed updated_at column: %w", err)
+		}
+	}
+	return nil
+}
+
 // LoadIgnores returns the cached v1 ignore metadata for a project.
 func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]IgnoreMeta, error) {
 	out := make(map[string]IgnoreMeta)
 
+	cutoff := time.Now().UTC().Add(-ignoreEntryTTL)
+
 	query, args, err := s.builder.
-		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at").
+		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at").
 		From("snyk_ignores").
 		Where(sq.Eq{"project_id": projectID}).
 		ToSql()
@@ -285,9 +334,9 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 
 	for rows.Next() {
 		var issueKey string
-		var expiresAtRaw, createdAtRaw string
+		var expiresAtRaw, createdAtRaw, updatedAtRaw string
 		var disregardIfFixable int
-		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw); err != nil {
+		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw, &updatedAtRaw); err != nil {
 			return nil, fmt.Errorf("scan cache ignore row: %w", err)
 		}
 
@@ -300,6 +349,13 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 		}
 		if createdAtRaw != "" {
 			meta.CreatedAt, _ = time.Parse(time.RFC3339, createdAtRaw)
+		}
+		if updatedAtRaw != "" {
+			meta.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAtRaw)
+		}
+
+		if !meta.UpdatedAt.IsZero() && meta.UpdatedAt.Before(cutoff) {
+			continue
 		}
 		out[issueKey] = meta
 	}
@@ -334,6 +390,7 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 		return fmt.Errorf("clear cache ignores: %w", err)
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339)
 	for issueKey, meta := range ignores {
 		expiresAtRaw := ""
 		if !meta.ExpiresAt.IsZero() {
@@ -343,6 +400,10 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 		if !meta.CreatedAt.IsZero() {
 			createdAtRaw = meta.CreatedAt.UTC().Format(time.RFC3339)
 		}
+		updatedAtRaw := now
+		if !meta.UpdatedAt.IsZero() {
+			updatedAtRaw = meta.UpdatedAt.UTC().Format(time.RFC3339)
+		}
 		var disregard int64
 		if meta.DisregardIfFixable {
 			disregard = 1
@@ -350,8 +411,8 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 
 		query, args, err = s.builder.
 			Insert("snyk_ignores").
-			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at").
-			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw).
+			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at").
+			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw, updatedAtRaw).
 			ToSql()
 		if err != nil {
 			return fmt.Errorf("build insert cache ignore row: %w", err)
