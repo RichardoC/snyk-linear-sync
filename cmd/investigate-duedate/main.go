@@ -194,6 +194,8 @@ func printDiagnostics(diag syncsvc.DueDateDiagnostics, cacheSnapshot cache.Snaps
 	fmt.Printf("Linear issue: %s\n", diag.Existing.Identifier)
 	fmt.Printf("URL:          %s\n", diag.Existing.URL)
 	fmt.Printf("Fingerprint:  %s\n", diag.Finding.Fingerprint)
+	fmt.Printf("Snyk issue key: %s\n", diag.Finding.SnykIssueKey)
+	fmt.Printf("Snyk issue ID:  %s\n", diag.Finding.SnykIssueID)
 	fmt.Println()
 
 	fmt.Println("Linear current state:")

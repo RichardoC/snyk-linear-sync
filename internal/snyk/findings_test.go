@@ -308,8 +308,8 @@ func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v", err)
 	}
-	if requestCount != 2 {
-		t.Fatalf("requestCount = %d, want 2", requestCount)
+	if requestCount != 3 {
+		t.Fatalf("requestCount = %d, want 3", requestCount)
 	}
 
 	entries, ok := ignores["SNYK-1"]

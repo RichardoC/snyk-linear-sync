@@ -9,7 +9,7 @@ import (
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-06-05-reason-comments-v1"
+const metadataSchemaVersion = "2026-06-17-snyk-ignores-cache-v1"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion
