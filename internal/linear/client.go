@@ -3,6 +3,7 @@ package linear
 import (
 	"context"
 	"fmt"
+	"iter"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -665,7 +666,7 @@ type issueUpdateInput struct {
 	Title       *string  `json:"title,omitempty"`
 	Description *string  `json:"description,omitempty"`
 	Priority    *int32   `json:"priority,omitempty"`
-	LabelIds    []string `json:"labelIds,omitempty"`
+	LabelIds    []string `json:"labelIds"`
 	StateId     *string  `json:"stateId,omitempty"`
 	DueDate     *string  `json:"dueDate"`
 }
@@ -695,7 +696,7 @@ func (c *Client) teamRef() string {
 }
 
 func extractFingerprint(description string) string {
-	for line := range strings.SplitSeq(description, "\n") {
+	for line := range metadataBlockLines(description) {
 		trimmed := strings.TrimSpace(line)
 		if after, ok := strings.CutPrefix(trimmed, "fingerprint:"); ok {
 			return strings.TrimSpace(after)
@@ -708,7 +709,7 @@ func extractFingerprint(description string) string {
 }
 
 func extractManagedLabels(description string) []string {
-	for line := range strings.SplitSeq(description, "\n") {
+	for line := range metadataBlockLines(description) {
 		trimmed := strings.TrimSpace(line)
 		if after, ok := strings.CutPrefix(trimmed, "managed_labels:"); ok {
 			return splitManagedLabels(after)
@@ -718,6 +719,57 @@ func extractManagedLabels(description string) []string {
 		}
 	}
 	return nil
+}
+
+// metadataBlockLines yields the lines of the snyk-linear-sync metadata block,
+// i.e. the lines between the line-anchored "<!-- snyk-linear-sync" marker and
+// its closing "-->". It mirrors the line-boundary anchoring used by
+// upsertManagedMetadata so that a marker string appearing mid-sentence in
+// user-written text cannot spoof fingerprint/label extraction. If no
+// line-anchored block is present, no lines are yielded.
+func metadataBlockLines(description string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		start := findMetadataBlockStart(description)
+		if start < 0 {
+			return
+		}
+		rest := description[start:]
+		before, _, ok := strings.Cut(rest, "-->")
+		var block string
+		if ok {
+			block = before
+		} else {
+			// Unclosed comment (e.g. truncated description): scan to end so the
+			// fingerprint is still recoverable.
+			block = rest
+		}
+		for line := range strings.SplitSeq(block, "\n") {
+			if !yield(line) {
+				return
+			}
+		}
+	}
+}
+
+// findMetadataBlockStart locates the snyk-linear-sync metadata block start
+// marker in the description, anchored to the beginning of a line. This
+// prevents false matches where the marker string appears mid-sentence in
+// user-written text (e.g. "See <!-- snyk-linear-sync notes -->"), which
+// could spoof fingerprint/label extraction if treated as a metadata block.
+func findMetadataBlockStart(description string) int {
+	header := metadataHeader
+	for i := 0; i <= len(description)-len(header); {
+		idx := strings.Index(description[i:], header)
+		if idx < 0 {
+			return -1
+		}
+		absIdx := i + idx
+		if absIdx == 0 || description[absIdx-1] == '\n' {
+			return absIdx
+		}
+		i = absIdx + 1
+	}
+	return -1
 }
 
 func (c *Client) ensureStatesLoaded(ctx context.Context) error {

@@ -81,6 +81,98 @@ func TestDesiredLabelIDsRemovesManagedLabelWhenDisabled(t *testing.T) {
 	}
 }
 
+// TestIssueUpdateInputSerializesEmptyLabelIdsAsArray guards against a regression
+// where an empty LabelIds slice was omitted from the update mutation via
+// `omitempty`. When an issue carried only managed labels and they are all
+// being removed (no unrelated labels to preserve), desiredLabelIDs returns a
+// non-nil empty slice. With omitempty that slice was dropped from the payload,
+// so Linear never received a labelIds field and left the stale managed labels
+// on the issue. The JSON must serialize as "labelIds":[] so Linear clears them.
+func TestIssueUpdateInputSerializesEmptyLabelIdsAsArray(t *testing.T) {
+	input := issueUpdateInput{
+		LabelIds: make([]string, 0, 4), // non-nil empty slice, as desiredLabelIDs returns
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"labelIds":[]`) {
+		t.Fatalf("issueUpdateInput JSON must include \"labelIds\":[] for an empty slice so Linear clears labels, got: %s", raw)
+	}
+}
+
+// TestUpdateIssuesClearsManagedLabelsWhenNoneDesired verifies the end-to-end
+// behavior: an issue that had only managed labels, with label management now
+// disabled, must send labelIds:[] in the update mutation so Linear removes them.
+func TestUpdateIssuesClearsManagedLabelsWhenNoneDesired(t *testing.T) {
+	var capturedInput map[string]any
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{
+				Todo: "Todo",
+			},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					for key, val := range payload.Variables {
+						if strings.HasPrefix(key, "input") {
+							capturedInput, _ = val.(map[string]any)
+						}
+					}
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-1"},
+		statesByType: map[string]string{"unstarted": "state-1"},
+	}
+
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{
+			ID:            "issue-1",
+			Identifier:    "SNYK-1",
+			ManagedLabels: []string{"snyk-automation"},
+			Labels:        []model.IssueLabel{{ID: "label-1", Name: "snyk-automation"}},
+		},
+		Desired: model.DesiredIssue{
+			Fingerprint:   "snyk:proj-1:issue-1",
+			Title:         "Snyk: title",
+			Description:   "body",
+			State:         model.StateTodo,
+			ManagedLabels: nil, // label management off / none desired
+			Priority:      2,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
+	}
+	if capturedInput == nil {
+		t.Fatal("no update input captured")
+	}
+	rawLabelIds, has := capturedInput["labelIds"]
+	if !has {
+		t.Fatalf("update mutation must include labelIds to clear managed labels, got: %#v", capturedInput)
+	}
+	arr, ok := rawLabelIds.([]any)
+	if !ok || len(arr) != 0 {
+		t.Fatalf("labelIds must be an empty array to clear labels, got: %#v", rawLabelIds)
+	}
+}
+
 func TestExtractFingerprintPrefersMetadataBlock(t *testing.T) {
 	description := "## Example\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,snyk-code\n-->"
 
@@ -97,6 +189,44 @@ func TestExtractManagedLabelsSupportsLegacyAndNewMetadata(t *testing.T) {
 	}
 	if got := extractManagedLabels("<!-- snyk-linear-sync\nmanaged_labels: snyk-automation,snyk-code\n-->"); !slices.Equal(got, []string{"snyk-automation", "snyk-code"}) {
 		t.Fatalf("extractManagedLabels(new) = %#v", got)
+	}
+}
+
+// TestExtractFingerprintIgnoresLinesOutsideMetadataBlock verifies that a
+// "Fingerprint:" line appearing in user-written body text is not extracted as
+// the managed fingerprint. Only the fingerprint inside the line-anchored
+// metadata block counts. This mirrors the line-boundary hardening applied to
+// upsertManagedMetadata so user text cannot spoof deduplication.
+func TestExtractFingerprintIgnoresLinesOutsideMetadataBlock(t *testing.T) {
+	description := "Notes\nFingerprint: fake-from-user-text\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation\n-->"
+
+	if got := extractFingerprint(description); got != "snyk:project-a:issue-1" {
+		t.Fatalf("extractFingerprint() = %q, want the metadata-block fingerprint", got)
+	}
+}
+
+// TestExtractFingerprintIgnoresInlineMarker verifies that an inline marker
+// (mid-sentence) is not treated as a metadata block, so no fingerprint is
+// extracted from a description that has no real line-anchored block.
+func TestExtractFingerprintIgnoresInlineMarker(t *testing.T) {
+	description := "See <!-- snyk-linear-sync notes --> for context\nFingerprint: not-a-real-block"
+
+	if got := extractFingerprint(description); got != "" {
+		t.Fatalf("extractFingerprint() = %q, want empty (no line-anchored block)", got)
+	}
+	if got := extractManagedLabels(description); got != nil {
+		t.Fatalf("extractManagedLabels() = %#v, want nil (no line-anchored block)", got)
+	}
+}
+
+// TestExtractManagedLabelsIgnoresLinesOutsideMetadataBlock verifies that a
+// "managed_labels:" line in user body text does not override the real
+// metadata block value.
+func TestExtractManagedLabelsIgnoresLinesOutsideMetadataBlock(t *testing.T) {
+	description := "managed_labels: fake-from-user\n\n<!-- snyk-linear-sync\nmanaged_labels: snyk-automation,snyk-code\n-->"
+
+	if got := extractManagedLabels(description); !slices.Equal(got, []string{"snyk-automation", "snyk-code"}) {
+		t.Fatalf("extractManagedLabels() = %#v, want the metadata-block labels", got)
 	}
 }
 
