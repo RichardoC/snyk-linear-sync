@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -53,6 +54,10 @@ type issueAttributes struct {
 	Problems          []problem      `json:"problems"`
 	Coordinates       []coordinate   `json:"coordinates"`
 	Resolution        resolution     `json:"resolution"`
+	Classes           []classEntry   `json:"classes"`
+	Description       string         `json:"description"`
+	Remediation       string         `json:"remediation"`
+	CVSS              *float64       `json:"cvss"`
 }
 
 type exploitDetails struct {
@@ -69,6 +74,15 @@ type problem struct {
 	Title    string `json:"title"`
 	Severity string `json:"severity"`
 	Source   string `json:"source"`
+}
+
+// classEntry is a Snyk weakness class attached to an issue. The ID is the
+// durable identifier such as "CWE-22" and Source identifies the taxonomy
+// (e.g. "CWE").
+type classEntry struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Source string `json:"source"`
 }
 
 type coordinate struct {
@@ -321,6 +335,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				Repository:         project.Repository,
 				IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
 				Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
+				CVSS:               cvssScore(issue.Attributes.CVSS),
 				ExploitMaturity:    exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
 				PackageName:        packageName(issue.Attributes.Coordinates),
 				VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
@@ -337,6 +352,15 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				SourceColumnEnd:    source.Region.End.Column,
 				IgnoreExpiresAt:    ignoreMeta.ExpiresAt,
 				DisregardIfFixable: ignoreMeta.DisregardIfFixable,
+				Classes:            issueClasses(issue.Attributes.Classes),
+				CVEs:               cveIDs(issue.Attributes.Problems),
+				Description:        strings.TrimSpace(issue.Attributes.Description),
+				Remediation:        strings.TrimSpace(issue.Attributes.Remediation),
+				HasCoordinates:     len(issue.Attributes.Coordinates) > 0,
+				IsFixableManually:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
+				IsFixableSnyk:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
+				IsFixableUpstream:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
+				IsPatchable:        anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
 			}
 
 			findings = append(findings, finding)
@@ -916,6 +940,71 @@ func firstProblemSeverity(problems []problem) string {
 		}
 	}
 	return ""
+}
+
+// issueClasses copies Snyk weakness class entries into the model shape,
+// dropping empty IDs. Class entries are not deduplicated or sorted here so
+// the rendering can preserve Snyk's ordering.
+func issueClasses(classes []classEntry) []model.IssueClass {
+	out := make([]model.IssueClass, 0, len(classes))
+	for _, class := range classes {
+		id := strings.TrimSpace(class.ID)
+		if id == "" {
+			continue
+		}
+		out = append(out, model.IssueClass{
+			ID:     id,
+			Title:  strings.TrimSpace(class.Title),
+			Source: strings.TrimSpace(class.Source),
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// cveIDs extracts CVE identifiers from a Snyk issue's problems list. Snyk
+// records each CVE as a problem with Source "CVE" and the CVE id in the ID
+// field.
+func cveIDs(problems []problem) []string {
+	seen := make(map[string]struct{}, len(problems))
+	out := make([]string, 0, len(problems))
+	for _, problem := range problems {
+		if !strings.EqualFold(strings.TrimSpace(problem.Source), "CVE") {
+			continue
+		}
+		id := strings.TrimSpace(problem.ID)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// anyFixable reports whether any coordinate satisfies the predicate. It is
+// used to aggregate per-coordinate is_fixable_* flags into a single
+// finding-level boolean.
+func anyFixable(coords []coordinate, ok func(coordinate) bool) bool {
+	return slices.ContainsFunc(coords, ok)
+}
+
+// cvssScore dereferences a nullable CVSS score. Snyk does not always expose
+// a numeric CVSS score on the issue resource; a nil pointer means the field
+// was absent and the caller should treat the score as unknown.
+func cvssScore(score *float64) float64 {
+	if score == nil {
+		return 0
+	}
+	return *score
 }
 
 func (c *Client) issueAPIURL(issueID string) string {

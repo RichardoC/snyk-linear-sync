@@ -14,6 +14,7 @@ github.com/RichardoC/snyk-linear-sync
 - Reads all projects in one configured Snyk org.
 - Normalizes Snyk findings into one Linear issue per `project + issue`.
 - Stores a stable fingerprint in a hidden metadata block in the Linear issue description.
+- Embeds Snyk issue details (fix availability, CVSS, CWE class(es), CVE identifier(s), vulnerability description, and remediation guidance) in the Linear ticket body so consumers do not each need Snyk API credentials.
 - Optionally renders GitHub source file and commit links when source hosting is configured as `github`.
 - Creates missing Linear issues.
 - Updates existing Linear issues when managed fields change.
@@ -128,6 +129,8 @@ Each managed issue contains:
 - repo, ref, and file or target-file context near the top
 - Snyk UI and API links grouped together
 - package/version details when available
+- fix availability, CVSS, CWE class(es), and CVE identifier(s) when Snyk reports them
+- vulnerability description and remediation guidance sections when Snyk reports them, so ticket consumers do not each need Snyk API credentials
 - project and issue identifiers lower in the body
 - GitHub repository, source file, and commit links when `SOURCE_PROVIDER=github` and the finding includes repository, file, and commit data
 - GitHub project target file links when `SOURCE_PROVIDER=github` and Snyk provides repository, branch/reference, and target file data but not a precise source location
@@ -161,7 +164,8 @@ The synced issue body is optimized for fast developer triage:
 - heading first: vulnerability title plus severity
 - repo, ref, and file or target file immediately below
 - Snyk UI and API links grouped together
-- package and fix context next
+- package and fix context next, plus fix availability, CVSS, CWE class(es), and CVE identifier(s) when Snyk reports them
+- vulnerability description and remediation guidance sections lower in the body when Snyk reports them, so consumers do not need Snyk API credentials to triage
 - project and issue IDs lower in the body for debugging and API work
 
 The synced title includes the most useful source context when Snyk provides it:
