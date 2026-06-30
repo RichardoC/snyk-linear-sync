@@ -244,6 +244,116 @@ func TestIsActiveProjectStatus(t *testing.T) {
 	}
 }
 
+func TestIssueClasses(t *testing.T) {
+	cases := []struct {
+		name    string
+		classes []classEntry
+		want    []model.IssueClass
+	}{
+		{
+			name:    "nil",
+			classes: nil,
+			want:    nil,
+		},
+		{
+			name: "drops empty ids",
+			classes: []classEntry{
+				{ID: "", Title: "Missing", Source: "CWE"},
+				{ID: "CWE-22", Title: "Path Traversal", Source: "CWE"},
+			},
+			want: []model.IssueClass{{ID: "CWE-22", Title: "Path Traversal", Source: "CWE"}},
+		},
+		{
+			name: "preserves ordering and trims whitespace",
+			classes: []classEntry{
+				{ID: "  CWE-22  ", Title: "  Path Traversal ", Source: " CWE "},
+				{ID: "CWE-78", Title: "OS Command Injection", Source: "CWE"},
+			},
+			want: []model.IssueClass{
+				{ID: "CWE-22", Title: "Path Traversal", Source: "CWE"},
+				{ID: "CWE-78", Title: "OS Command Injection", Source: "CWE"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := issueClasses(tc.classes)
+			if len(got) != len(tc.want) {
+				t.Fatalf("issueClasses() = %+v, want %+v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("issueClasses()[%d] = %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestCVEIDs(t *testing.T) {
+	cases := []struct {
+		name     string
+		problems []problem
+		want     []string
+	}{
+		{
+			name:     "no problems",
+			problems: nil,
+			want:     nil,
+		},
+		{
+			name: "filters to CVE source and deduplicates",
+			problems: []problem{
+				{ID: "SNYK-DEBIAN-ZLIB-1", Source: "SNYK"},
+				{ID: "CVE-2024-12345", Source: "CVE"},
+				{ID: "CVE-2024-12345", Source: "cve"},
+				{ID: "CVE-2024-99999", Source: "CVE"},
+				{ID: "", Source: "CVE"},
+			},
+			want: []string{"CVE-2024-12345", "CVE-2024-99999"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cveIDs(tc.problems)
+			if len(got) != len(tc.want) {
+				t.Fatalf("cveIDs() = %+v, want %+v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("cveIDs()[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestAnyFixable(t *testing.T) {
+	coords := []coordinate{
+		{IsFixableManually: false, IsFixableSnyk: false},
+		{IsFixableManually: true, IsFixableSnyk: false},
+	}
+	if !anyFixable(coords, func(c coordinate) bool { return c.IsFixableManually }) {
+		t.Fatal("anyFixable(IsFixableManually) = false, want true")
+	}
+	if anyFixable(coords, func(c coordinate) bool { return c.IsFixableSnyk }) {
+		t.Fatal("anyFixable(IsFixableSnyk) = true, want false")
+	}
+	if anyFixable(nil, func(c coordinate) bool { return c.IsFixableSnyk }) {
+		t.Fatal("anyFixable(nil) = true, want false")
+	}
+}
+
+func TestCVSSScore(t *testing.T) {
+	if got := cvssScore(nil); got != 0 {
+		t.Fatalf("cvssScore(nil) = %v, want 0", got)
+	}
+	score := 7.5
+	if got := cvssScore(&score); got != 7.5 {
+		t.Fatalf("cvssScore(&7.5) = %v, want 7.5", got)
+	}
+}
+
 func TestMergeIgnoresPicksLatestExpiry(t *testing.T) {
 	api := v1ProjectIgnores{
 		"SNYK-1": []v1IgnoreEntry{{Created: "2026-06-01T00:00:00Z", Expires: "2026-06-14T23:00:00Z"}},
