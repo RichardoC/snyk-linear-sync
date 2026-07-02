@@ -61,13 +61,14 @@ type Finding struct {
 	IsFixableSnyk     bool
 	IsFixableUpstream bool
 	IsPatchable       bool
+	IsPinnable        bool
+	IsUpgradeable     bool
 }
 
 // IssueClass is a Snyk weakness class entry (e.g. a CWE) attached to an
 // issue. The ID is the durable identifier such as "CWE-22".
 type IssueClass struct {
 	ID     string
-	Title  string
 	Source string
 }
 

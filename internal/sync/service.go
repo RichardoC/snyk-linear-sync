@@ -740,6 +740,12 @@ func fixAvailabilitySummary(finding model.Finding) string {
 	if finding.IsFixableUpstream {
 		parts = append(parts, "upstream fix available")
 	}
+	if finding.IsUpgradeable {
+		parts = append(parts, "upgrade available")
+	}
+	if finding.IsPinnable {
+		parts = append(parts, "pin available")
+	}
 	if finding.IsFixableManually {
 		parts = append(parts, "manual fix")
 	}

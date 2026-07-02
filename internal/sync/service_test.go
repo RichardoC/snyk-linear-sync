@@ -746,8 +746,8 @@ func TestIssueDescriptionEmbedsSnykIssueDetails(t *testing.T) {
 		FixedVersion:      "4.17.21",
 		CVSS:              7.5,
 		Classes: []model.IssueClass{
-			{ID: "CWE-1321", Title: "Improperly Controlled Modification of Object Prototype Attributes", Source: "CWE"},
-			{ID: "CWE-915", Title: "Improperly Controlled Controlled Modification of Dynamically-Determined Object Attributes", Source: "CWE"},
+			{ID: "CWE-1321", Source: "CWE"},
+			{ID: "CWE-915", Source: "CWE"},
 		},
 		CVEs:              []string{"CVE-2020-8203", "CVE-2021-23337"},
 		Description:       "Prototype pollution in lodash allows an attacker to merge recursive objects.",

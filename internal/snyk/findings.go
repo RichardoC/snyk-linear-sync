@@ -42,22 +42,21 @@ type issueResource struct {
 }
 
 type issueAttributes struct {
-	CreatedAt         string         `json:"created_at"`
-	UpdatedAt         string         `json:"updated_at"`
-	EffectiveSeverity string         `json:"effective_severity_level"`
-	Ignored           bool           `json:"ignored"`
-	Status            string         `json:"status"`
-	Title             string         `json:"title"`
-	Key               string         `json:"key"`
-	Type              string         `json:"type"`
-	ExploitDetails    exploitDetails `json:"exploit_details"`
-	Problems          []problem      `json:"problems"`
-	Coordinates       []coordinate   `json:"coordinates"`
-	Resolution        resolution     `json:"resolution"`
-	Classes           []classEntry   `json:"classes"`
-	Description       string         `json:"description"`
-	Remediation       string         `json:"remediation"`
-	CVSS              *float64       `json:"cvss"`
+	CreatedAt         string          `json:"created_at"`
+	UpdatedAt         string          `json:"updated_at"`
+	EffectiveSeverity string          `json:"effective_severity_level"`
+	Ignored           bool            `json:"ignored"`
+	Status            string          `json:"status"`
+	Title             string          `json:"title"`
+	Key               string          `json:"key"`
+	Type              string          `json:"type"`
+	ExploitDetails    exploitDetails  `json:"exploit_details"`
+	Problems          []problem       `json:"problems"`
+	Coordinates       []coordinate    `json:"coordinates"`
+	Resolution        resolution      `json:"resolution"`
+	Classes           []classEntry    `json:"classes"`
+	Description       string          `json:"description"`
+	Severities        []severityEntry `json:"severities"`
 }
 
 type exploitDetails struct {
@@ -78,11 +77,20 @@ type problem struct {
 
 // classEntry is a Snyk weakness class attached to an issue. The ID is the
 // durable identifier such as "CWE-22" and Source identifies the taxonomy
-// (e.g. "CWE").
+// (e.g. "CWE"). The Snyk REST schema (Class) exposes id, source, type, and
+// url only — there is no title field — so callers should treat the ID as the
+// displayable identifier.
 type classEntry struct {
 	ID     string `json:"id"`
-	Title  string `json:"title"`
 	Source string `json:"source"`
+}
+
+// severityEntry is one CVSS score reported for an issue. Snyk can emit
+// several entries from different sources (e.g. "Snyk", "NVD", "Red Hat")
+// and CVSS versions (3.1, 4.0); selectCVSS picks one for display.
+type severityEntry struct {
+	Source string   `json:"source"`
+	Score  *float64 `json:"score"`
 }
 
 type coordinate struct {
@@ -90,6 +98,8 @@ type coordinate struct {
 	IsFixableSnyk       bool             `json:"is_fixable_snyk"`
 	IsFixableUpstream   bool             `json:"is_fixable_upstream"`
 	IsPatchable         bool             `json:"is_patchable"`
+	IsPinnable          bool             `json:"is_pinnable"`
+	IsUpgradeable       bool             `json:"is_upgradeable"`
 	State               string           `json:"state"`
 	LastResolvedAt      string           `json:"last_resolved_at"`
 	LastResolvedDetails string           `json:"last_resolved_details"`
@@ -98,7 +108,8 @@ type coordinate struct {
 }
 
 type remedy struct {
-	Details remedyDetails `json:"details"`
+	Description string        `json:"description"`
+	Details     remedyDetails `json:"details"`
 }
 
 type remedyDetails struct {
@@ -308,7 +319,6 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 
 			project := projectDetails[projectID]
 			issueKey := coalesce(issue.Attributes.Key, firstProblemID(issue.Attributes.Problems), issue.ID)
-			source := sourceLocation(issue.Attributes.Coordinates)
 			createdAt, err := parseIssueCreatedAt(issue.Attributes.CreatedAt)
 			if err != nil {
 				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
@@ -321,47 +331,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				ignoreMeta, ok = ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issue.ID}]
 			}
 
-			finding := model.Finding{
-				Fingerprint:        model.Fingerprint(projectID, issue.ID),
-				SnykIssueID:        issue.ID,
-				SnykIssueKey:       issueKey,
-				IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
-				CreatedAt:          createdAt,
-				ProjectID:          projectID,
-				ProjectName:        project.Name,
-				ProjectOrigin:      project.Origin,
-				ProjectReference:   project.TargetReference,
-				ProjectTargetFile:  project.TargetFile,
-				Repository:         project.Repository,
-				IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
-				Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
-				CVSS:               cvssScore(issue.Attributes.CVSS),
-				ExploitMaturity:    exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
-				PackageName:        packageName(issue.Attributes.Coordinates),
-				VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
-				FixedVersion:       fixedVersion(issue.Attributes.Coordinates),
-				IssueURL:           c.issueUIURL(orgSlug, projectID, issueKey),
-				IssueAPIURL:        c.issueAPIURL(issue.ID),
-				Status:             mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
-				IntroducedThrough:  introducedThrough(issue.Attributes.Coordinates),
-				SourceFile:         source.File,
-				SourceCommitID:     source.CommitID,
-				SourceLineStart:    source.Region.Start.Line,
-				SourceColumnStart:  source.Region.Start.Column,
-				SourceLineEnd:      source.Region.End.Line,
-				SourceColumnEnd:    source.Region.End.Column,
-				IgnoreExpiresAt:    ignoreMeta.ExpiresAt,
-				DisregardIfFixable: ignoreMeta.DisregardIfFixable,
-				Classes:            issueClasses(issue.Attributes.Classes),
-				CVEs:               cveIDs(issue.Attributes.Problems),
-				Description:        strings.TrimSpace(issue.Attributes.Description),
-				Remediation:        strings.TrimSpace(issue.Attributes.Remediation),
-				HasCoordinates:     len(issue.Attributes.Coordinates) > 0,
-				IsFixableManually:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
-				IsFixableSnyk:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
-				IsFixableUpstream:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
-				IsPatchable:        anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
-			}
+			finding := c.findingFromIssue(issue, projectID, project, orgSlug, issueKey, createdAt, ignoreMeta)
 
 			findings = append(findings, finding)
 		}
@@ -385,6 +355,66 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 		return nil, err
 	}
 	return snapshot.Findings, nil
+}
+
+// findingFromIssue maps a decoded Snyk REST issue resource into the sync's
+// model.Finding shape. It is split out from LoadSnapshot so the JSON decode
+// → Finding mapping is unit-testable against a response fixture without
+// needing a live Snyk org (see TestFindingFromIssueDecodesRealIssueShape).
+// createdAt is passed in rather than re-parsed because LoadSnapshot already
+// validates it.
+func (c *Client) findingFromIssue(
+	issue issueResource,
+	projectID string,
+	project projectRef,
+	orgSlug, issueKey string,
+	createdAt time.Time,
+	ignoreMeta ignoreMetadata,
+) model.Finding {
+	source := sourceLocation(issue.Attributes.Coordinates)
+	return model.Finding{
+		Fingerprint:        model.Fingerprint(projectID, issue.ID),
+		SnykIssueID:        issue.ID,
+		SnykIssueKey:       issueKey,
+		IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
+		CreatedAt:          createdAt,
+		ProjectID:          projectID,
+		ProjectName:        project.Name,
+		ProjectOrigin:      project.Origin,
+		ProjectReference:   project.TargetReference,
+		ProjectTargetFile:  project.TargetFile,
+		Repository:         project.Repository,
+		IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
+		Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
+		CVSS:               selectCVSS(issue.Attributes.Severities),
+		ExploitMaturity:    exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
+		PackageName:        packageName(issue.Attributes.Coordinates),
+		VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
+		FixedVersion:       fixedVersion(issue.Attributes.Coordinates),
+		IssueURL:           c.issueUIURL(orgSlug, projectID, issueKey),
+		IssueAPIURL:        c.issueAPIURL(issue.ID),
+		Status:             mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
+		IntroducedThrough:  introducedThrough(issue.Attributes.Coordinates),
+		SourceFile:         source.File,
+		SourceCommitID:     source.CommitID,
+		SourceLineStart:    source.Region.Start.Line,
+		SourceColumnStart:  source.Region.Start.Column,
+		SourceLineEnd:      source.Region.End.Line,
+		SourceColumnEnd:    source.Region.End.Column,
+		IgnoreExpiresAt:    ignoreMeta.ExpiresAt,
+		DisregardIfFixable: ignoreMeta.DisregardIfFixable,
+		Classes:            issueClasses(issue.Attributes.Classes),
+		CVEs:               cveIDs(issue.Attributes.Problems),
+		Description:        strings.TrimSpace(issue.Attributes.Description),
+		Remediation:        remediationDescription(issue.Attributes.Coordinates),
+		HasCoordinates:     len(issue.Attributes.Coordinates) > 0,
+		IsFixableManually:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
+		IsFixableSnyk:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
+		IsFixableUpstream:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
+		IsPatchable:        anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
+		IsPinnable:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPinnable }),
+		IsUpgradeable:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsUpgradeable }),
+	}
 }
 
 func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1ProjectIgnores, error) {
@@ -954,7 +984,6 @@ func issueClasses(classes []classEntry) []model.IssueClass {
 		}
 		out = append(out, model.IssueClass{
 			ID:     id,
-			Title:  strings.TrimSpace(class.Title),
 			Source: strings.TrimSpace(class.Source),
 		})
 	}
@@ -965,17 +994,17 @@ func issueClasses(classes []classEntry) []model.IssueClass {
 }
 
 // cveIDs extracts CVE identifiers from a Snyk issue's problems list. Snyk
-// records each CVE as a problem with Source "CVE" and the CVE id in the ID
-// field.
+// reports each CVE as a problem whose id is the CVE identifier (e.g.
+// "CVE-2025-7783"); the problems[].source field names the reporting database
+// (commonly "NVD"), not the literal string "CVE", so matching by source is
+// unreliable. We therefore match on a case-insensitive "CVE-" id prefix,
+// which is source-agnostic and robust.
 func cveIDs(problems []problem) []string {
 	seen := make(map[string]struct{}, len(problems))
 	out := make([]string, 0, len(problems))
 	for _, problem := range problems {
-		if !strings.EqualFold(strings.TrimSpace(problem.Source), "CVE") {
-			continue
-		}
 		id := strings.TrimSpace(problem.ID)
-		if id == "" {
+		if id == "" || !strings.HasPrefix(strings.ToUpper(id), "CVE-") {
 			continue
 		}
 		if _, exists := seen[id]; exists {
@@ -997,14 +1026,81 @@ func anyFixable(coords []coordinate, ok func(coordinate) bool) bool {
 	return slices.ContainsFunc(coords, ok)
 }
 
-// cvssScore dereferences a nullable CVSS score. Snyk does not always expose
-// a numeric CVSS score on the issue resource; a nil pointer means the field
-// was absent and the caller should treat the score as unknown.
-func cvssScore(score *float64) float64 {
-	if score == nil {
-		return 0
+// selectCVSS picks a single CVSS score to display from the severities Snyk
+// reports for an issue. Snyk may emit several entries from different sources
+// (e.g. "Snyk", "NVD", "Red Hat") and CVSS versions (3.1, 4.0). We prefer a
+// NVD score, then Red Hat, then Snyk, then any other source; within a source
+// we take the highest score so a more severe, well-sourced score wins. 0 is
+// returned (and the renderer omits the line) when Snyk reports no scores —
+// which is legitimate for non-vulnerability issue types.
+func selectCVSS(severities []severityEntry) float64 {
+	const (
+		scoreSnyk = iota
+		scoreRedHat
+		scoreNVD
+		scoreOther
+	)
+	rank := func(source string) int {
+		switch strings.ToLower(strings.TrimSpace(source)) {
+		case "snyk":
+			return scoreSnyk
+		case "red hat":
+			return scoreRedHat
+		case "nvd":
+			return scoreNVD
+		default:
+			return scoreOther
+		}
 	}
-	return *score
+
+	var bestRank = -1
+	var best float64
+	found := false
+	for _, sev := range severities {
+		if sev.Score == nil {
+			continue
+		}
+		score := *sev.Score
+		r := rank(sev.Source)
+		if !found || r < bestRank || (r == bestRank && score > best) {
+			bestRank = r
+			best = score
+			found = true
+		}
+	}
+	return best
+}
+
+// remediationDescription aggregates every non-empty remedy description
+// across a finding's coordinates. Snyk exposes remediation prose at
+// coordinates[].remedies[].description (a markdown string); there is no
+// top-level remediation field on the issue resource. Code and cloud findings
+// carry prose here; package_vulnerability findings usually carry only a
+// details.upgrade_package (already surfaced as Fix version) and no prose.
+//
+// A finding can carry several distinct remedy descriptions (e.g. a cloud
+// finding with Terraform, CloudFormation, and inline-rule messages). Rather
+// than dropping all but the first, we collect them in Snyk's order and join
+// with a blank line so the Linear ### Remediation section is self-sufficient.
+// Descriptions are deduplicated by trimmed content so repeated remedies across
+// coordinates collapse to one entry.
+func remediationDescription(coords []coordinate) string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, coord := range coords {
+		for _, remedy := range coord.Remedies {
+			desc := strings.TrimSpace(remedy.Description)
+			if desc == "" {
+				continue
+			}
+			if _, exists := seen[desc]; exists {
+				continue
+			}
+			seen[desc] = struct{}{}
+			out = append(out, desc)
+		}
+	}
+	return strings.Join(out, "\n\n")
 }
 
 func (c *Client) issueAPIURL(issueID string) string {
