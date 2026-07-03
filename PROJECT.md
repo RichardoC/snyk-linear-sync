@@ -93,6 +93,8 @@ It includes:
 - human-usable Snyk UI link
 - Snyk REST API link
 - package/version details
+- fix availability, CVSS, CWE class(es), and CVE identifier(s) when Snyk reports them
+- vulnerability description and remediation guidance sections when Snyk reports them
 - project identifiers
 - issue identifiers
 - GitHub repository links when `SOURCE_PROVIDER=github`

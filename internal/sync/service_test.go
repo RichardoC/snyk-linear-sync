@@ -722,6 +722,96 @@ func TestDesiredIssueAddsGitHubSourceLinksWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestIssueDescriptionEmbedsSnykIssueDetails(t *testing.T) {
+	cfg := config.Config{
+		Source: config.SourceConfig{Provider: "github"},
+		Linear: config.LinearConfig{
+			Labels: config.LabelConfig{Managed: "snyk-automation"},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint:       "snyk:project-a:issue-1",
+		SnykIssueID:       "issue-1",
+		SnykIssueKey:      "SNYK-JS-LODASH-1",
+		IssueType:         "package_vulnerability",
+		ProjectID:         "project-a",
+		ProjectName:       "owner/repo(main):package-lock.json",
+		IssueTitle:        "Prototype Pollution",
+		Severity:          "high",
+		Status:            model.FindingOpen,
+		IssueURL:          "https://app.example.test/issue-1",
+		IssueAPIURL:       "https://api.example.test/issue-1",
+		PackageName:       "lodash",
+		VulnerableVersion: "4.17.20",
+		FixedVersion:      "4.17.21",
+		CVSS:              7.5,
+		Classes: []model.IssueClass{
+			{ID: "CWE-1321", Source: "CWE"},
+			{ID: "CWE-915", Source: "CWE"},
+		},
+		CVEs:              []string{"CVE-2020-8203", "CVE-2021-23337"},
+		Description:       "Prototype pollution in lodash allows an attacker to merge recursive objects.",
+		Remediation:       "Upgrade lodash to version 4.17.21 or higher.",
+		HasCoordinates:    true,
+		IsFixableSnyk:     true,
+		IsFixableManually: true,
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	checks := map[string]string{
+		"fix availability": "Fix availability: `Snyk automatic fix, manual fix`",
+		"cvss":             "CVSS: `7.5`",
+		"cwe":              "CWE: `CWE-1321, CWE-915`",
+		"cve":              "CVE: `CVE-2020-8203, CVE-2021-23337`",
+		"description":      "### Description\nPrototype pollution in lodash allows an attacker to merge recursive objects.",
+		"remediation":      "### Remediation\nUpgrade lodash to version 4.17.21 or higher.",
+	}
+	for name, want := range checks {
+		if !strings.Contains(desired.Description, want) {
+			t.Fatalf("description missing %s line: want %q\ngot:\n%s", name, want, desired.Description)
+		}
+	}
+}
+
+func TestIssueDescriptionOmitsFixAvailabilityWithoutCoordinates(t *testing.T) {
+	cfg := config.Config{
+		Source: config.SourceConfig{Provider: "github"},
+		Linear: config.LinearConfig{
+			Labels: config.LabelConfig{Managed: "snyk-automation"},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "owner/repo",
+		IssueTitle:  "Some issue",
+		Severity:    "medium",
+		Status:      model.FindingOpen,
+		IssueURL:    "https://app.example.test/issue-1",
+		// HasCoordinates false, no fixable flags, no CVSS, no classes/CVEs, no description/remediation.
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if strings.Contains(desired.Description, "Fix availability:") {
+		t.Fatalf("description should omit fix availability when Snyk reports no coordinates:\n%s", desired.Description)
+	}
+	if strings.Contains(desired.Description, "CVSS:") {
+		t.Fatalf("description should omit CVSS when not reported:\n%s", desired.Description)
+	}
+	if strings.Contains(desired.Description, "CWE:") {
+		t.Fatalf("description should omit CWE when none reported:\n%s", desired.Description)
+	}
+	if strings.Contains(desired.Description, "### Description") {
+		t.Fatalf("description should omit Description section when not reported:\n%s", desired.Description)
+	}
+	if strings.Contains(desired.Description, "### Remediation") {
+		t.Fatalf("description should omit Remediation section when not reported:\n%s", desired.Description)
+	}
+}
+
 func TestDesiredIssueAddsGitHubProjectTargetFileLinkWhenNoSourceLocationExists(t *testing.T) {
 	cfg := config.Config{
 		Source: config.SourceConfig{

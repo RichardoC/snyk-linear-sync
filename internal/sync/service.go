@@ -626,8 +626,20 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 	if finding.FixedVersion != "" {
 		lines = append(lines, fmt.Sprintf("Fix version: `%s`", finding.FixedVersion))
 	}
+	if summary := fixAvailabilitySummary(finding); summary != "" {
+		lines = append(lines, fmt.Sprintf("Fix availability: `%s`", summary))
+	}
 	if finding.ExploitMaturity != "" {
 		lines = append(lines, fmt.Sprintf("Exploit maturity: `%s`", finding.ExploitMaturity))
+	}
+	if finding.CVSS > 0 {
+		lines = append(lines, fmt.Sprintf("CVSS: `%.1f`", finding.CVSS))
+	}
+	if ids := classIDs(finding.Classes); len(ids) > 0 {
+		lines = append(lines, fmt.Sprintf("CWE: `%s`", strings.Join(ids, ", ")))
+	}
+	if ids := finding.CVEs; len(ids) > 0 {
+		lines = append(lines, fmt.Sprintf("CVE: `%s`", strings.Join(ids, ", ")))
 	}
 
 	lines = append(lines, "")
@@ -638,6 +650,13 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 	}
 	if finding.ProjectOrigin != "" {
 		lines = append(lines, fmt.Sprintf("Project origin: `%s`", finding.ProjectOrigin))
+	}
+
+	if finding.Description != "" {
+		lines = append(lines, "", "### Description", finding.Description)
+	}
+	if finding.Remediation != "" {
+		lines = append(lines, "", "### Remediation", finding.Remediation)
 	}
 
 	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabels))
@@ -687,6 +706,56 @@ func metadataBlock(fingerprint string, managedLabels []string) string {
 	}
 	lines = append(lines, "-->")
 	return strings.Join(lines, "\n")
+}
+
+// classIDs returns the durable identifiers (e.g. "CWE-22") for a set of
+// Snyk weakness classes, preserving Snyk's ordering without deduplication.
+func classIDs(classes []model.IssueClass) []string {
+	out := make([]string, 0, len(classes))
+	for _, class := range classes {
+		id := strings.TrimSpace(class.ID)
+		if id == "" {
+			continue
+		}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// fixAvailabilitySummary reduces the per-coordinate is_fixable_* flags into a
+// concise, human-readable summary. It returns an empty string when Snyk did
+// not report any coordinates for the finding, so the line is omitted rather
+// than implying a fixability state the upstream data does not support.
+func fixAvailabilitySummary(finding model.Finding) string {
+	if !finding.HasCoordinates {
+		return ""
+	}
+	var parts []string
+	if finding.IsFixableSnyk {
+		parts = append(parts, "Snyk automatic fix")
+	}
+	if finding.IsFixableUpstream {
+		parts = append(parts, "upstream fix available")
+	}
+	if finding.IsUpgradeable {
+		parts = append(parts, "upgrade available")
+	}
+	if finding.IsPinnable {
+		parts = append(parts, "pin available")
+	}
+	if finding.IsFixableManually {
+		parts = append(parts, "manual fix")
+	}
+	if finding.IsPatchable {
+		parts = append(parts, "patch available")
+	}
+	if len(parts) == 0 {
+		return "no fix available"
+	}
+	return strings.Join(parts, ", ")
 }
 
 func issueState(status model.FindingStatus) model.IssueState {

@@ -48,6 +48,28 @@ type Finding struct {
 	SourceColumnEnd    int
 	IgnoreExpiresAt    time.Time
 	DisregardIfFixable bool
+
+	// Issue detail fields surfaced from the Snyk REST issue resource so
+	// consumers of the Linear ticket do not each need Snyk API credentials.
+	// See https://github.com/RichardoC/snyk-linear-sync/issues/26.
+	Classes           []IssueClass
+	CVEs              []string
+	Description       string
+	Remediation       string
+	HasCoordinates    bool
+	IsFixableManually bool
+	IsFixableSnyk     bool
+	IsFixableUpstream bool
+	IsPatchable       bool
+	IsPinnable        bool
+	IsUpgradeable     bool
+}
+
+// IssueClass is a Snyk weakness class entry (e.g. a CWE) attached to an
+// issue. The ID is the durable identifier such as "CWE-22".
+type IssueClass struct {
+	ID     string
+	Source string
 }
 
 type SnykSnapshot struct {
