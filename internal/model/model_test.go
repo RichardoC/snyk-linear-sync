@@ -46,4 +46,3 @@ func TestCoarseFingerprint(t *testing.T) {
 		})
 	}
 }
-
