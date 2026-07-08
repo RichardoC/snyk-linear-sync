@@ -549,3 +549,67 @@ func TestMergeIgnoresKeepsCachedKeyWhenMissingFromAPI(t *testing.T) {
 		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
 	}
 }
+
+func TestLocationKey(t *testing.T) {
+	tests := []struct {
+		name   string
+		coords []coordinate
+		want   string
+	}{
+		{
+			"source file",
+			[]coordinate{{
+				Representations: []representation{{
+					SourceLocation: sourceLocationRepresentation{File: "e2e/prerequisite_gate.py"},
+				}},
+			}},
+			"e2e/prerequisite_gate.py",
+		},
+		{
+			"dependency with version",
+			[]coordinate{{
+				Representations: []representation{{
+					Dependency: dependencyRepresentation{PackageName: "lodash", PackageVersion: "4.17.21"},
+				}},
+			}},
+			"lodash@4.17.21",
+		},
+		{
+			"dependency without version",
+			[]coordinate{{
+				Representations: []representation{{
+					Dependency: dependencyRepresentation{PackageName: "lodash"},
+				}},
+			}},
+			"lodash",
+		},
+		{
+			"source file takes precedence over dependency",
+			[]coordinate{{
+				Representations: []representation{{
+					Dependency:     dependencyRepresentation{PackageName: "lodash", PackageVersion: "4.17.21"},
+					SourceLocation: sourceLocationRepresentation{File: "src/index.py"},
+				}},
+			}},
+			"src/index.py",
+		},
+		{
+			"empty coordinates",
+			[]coordinate{},
+			"",
+		},
+		{
+			"no representations",
+			[]coordinate{{}},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := locationKey(tt.coords)
+			if got != tt.want {
+				t.Fatalf("locationKey() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

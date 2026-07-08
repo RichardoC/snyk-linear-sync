@@ -373,7 +373,7 @@ func (c *Client) findingFromIssue(
 ) model.Finding {
 	source := sourceLocation(issue.Attributes.Coordinates)
 	return model.Finding{
-		Fingerprint:        model.Fingerprint(projectID, issue.ID),
+		Fingerprint:        model.Fingerprint(projectID, issue.ID, locationKey(issue.Attributes.Coordinates)),
 		SnykIssueID:        issue.ID,
 		SnykIssueKey:       issueKey,
 		IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
@@ -1174,6 +1174,36 @@ func sourceLocation(coords []coordinate) sourceLocationRepresentation {
 		}
 	}
 	return sourceLocationRepresentation{}
+}
+
+// locationKey derives a stable per-instance key from the coordinate
+// representations Snyk reports, so that two occurrences of the same
+// problem-type-in-project get distinct fingerprints (and thus distinct
+// Linear tickets) when they live in different code or dependencies.
+//
+// For code (SAST) issues it returns the source file path. For dependency
+// issues it returns package@version. An empty string means no coordinates
+// were available, in which case Fingerprint falls back to the coarse
+// 2-segment key for backward compatibility.
+//
+// Line numbers and commit SHAs are deliberately excluded: they churn on
+// every refactor and would orphan tickets. The file path / package identity
+// is the stable "occurrence site."
+func locationKey(coords []coordinate) string {
+	for _, coord := range coords {
+		for _, rep := range coord.Representations {
+			if rep.SourceLocation.File != "" {
+				return rep.SourceLocation.File
+			}
+			if rep.Dependency.PackageName != "" {
+				if rep.Dependency.PackageVersion != "" {
+					return rep.Dependency.PackageName + "@" + rep.Dependency.PackageVersion
+				}
+				return rep.Dependency.PackageName
+			}
+		}
+	}
+	return ""
 }
 
 // isActiveProjectStatus returns true for projects that are being monitored.

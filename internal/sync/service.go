@@ -130,6 +130,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	)
 
 	existingByFingerprint := map[string]model.ExistingIssue{}
+	// existingByCoarseFingerprint indexes non-terminal tickets by their coarse
+	// (location-stripped) fingerprint. It is used only for migration: when a
+	// finding carries a new fine-grained fingerprint that no Linear ticket has
+	// yet, but a non-terminal ticket with the matching coarse fingerprint
+	// exists, we update that ticket rather than creating a duplicate. Terminal
+	// tickets are deliberately excluded so that a closed coarse-fingerprint
+	// ticket is never reused (reopen guard). Only tickets whose stored
+	// fingerprint IS already coarse (no location segment) are candidates — a
+	// fine-grained ticket is matched by exact lookup and must never be a
+	// coarse-fallback candidate, or two findings sharing a coarse prefix
+	// would both bind to it (ticket stealing + perpetual churn).
+	existingByCoarseFingerprint := map[string]model.ExistingIssue{}
 	var duplicatesToCancel []model.ExistingIssue
 	for _, issue := range existingIssues {
 		if issue.Fingerprint != "" {
@@ -148,15 +160,72 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				continue
 			}
 			existingByFingerprint[issue.Fingerprint] = issue
+			if isNonTerminalLinearState(issue.StateName, s.cfg.Linear.States) {
+				coarse := model.CoarseFingerprint(issue.Fingerprint)
+				if coarse == issue.Fingerprint {
+					if _, exists := existingByCoarseFingerprint[coarse]; !exists {
+						existingByCoarseFingerprint[coarse] = issue
+					}
+				}
+			}
 		}
 	}
 
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
+	// matchedExisting records the Linear ticket each finding resolved to,
+	// whether by exact fingerprint or coarse-fingerprint migration fallback.
+	// The job loop uses this instead of existingByFingerprint so that
+	// migration-matched findings update their coarse ticket rather than
+	// creating a duplicate.
+	matchedExisting := make(map[string]model.ExistingIssue, len(findings))
 	snykHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
 
-		if existing, ok := existingByFingerprint[finding.Fingerprint]; ok {
+		existing, matched := existingByFingerprint[finding.Fingerprint]
+		if !matched {
+			// Migration fallback: the finding carries a fine-grained
+			// fingerprint no Linear ticket has yet (new code occurrence),
+			// but an in-flight ticket with the matching coarse fingerprint
+			// may exist. Reuse it so we update rather than duplicate. Only
+			// non-terminal tickets are candidates — a closed ticket must
+			// never be reused (reopen guard).
+			coarse := model.CoarseFingerprint(finding.Fingerprint)
+			if coarse != finding.Fingerprint {
+				if candidate, ok := existingByCoarseFingerprint[coarse]; ok {
+					existing = candidate
+					matched = true
+					// Deplete the coarse index so only the first fine-grained finding
+					// reuses this ticket. Subsequent findings with the same coarse
+					// prefix (e.g. the same issue type in a different file) create
+					// fresh tickets instead of all binding to the same Linear issue,
+					// which would race and lose fingerprints.
+					delete(existingByCoarseFingerprint, coarse)
+				}
+			}
+		}
+
+		if matched {
+			// Reopen guard: never reuse a terminal (Done/Cancelled) ticket
+			// when Snyk reports the finding as open/awaiting-fix. Snyk
+			// reusing a problem-type issueID across different code is not a
+			// directive to reopen a closed Linear ticket; a fresh ticket
+			// should be created instead. Treating this as "no match" falls
+			// through to the create path. The terminal ticket is also removed
+			// from existingByFingerprint so the job-dispatch loop does not
+			// send an update that would reopen it.
+			if isTerminalLinearState(existing.StateName, s.cfg.Linear.States) && isNonTerminalModelState(desired.State) {
+				s.logger.Info("not reusing closed ticket for reopened finding; creating new ticket",
+					slog.String("fingerprint", finding.Fingerprint),
+					slog.String("existing", existing.Identifier),
+					slog.String("existing_state", existing.StateName),
+				)
+				delete(existingByFingerprint, finding.Fingerprint)
+				matched = false
+			}
+		}
+
+		if matched {
 			// Respect manual Backlog override: if a user moved an open ticket from
 			// Todo to Backlog, don't move it back on subsequent syncs.
 			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
@@ -190,10 +259,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
+		if matched {
+			matchedExisting[finding.Fingerprint] = existing
+		}
 	}
 
-	currentLinearHashes := make(map[string]string, len(existingByFingerprint))
-	for fingerprint, issue := range existingByFingerprint {
+	currentLinearHashes := make(map[string]string, len(matchedExisting))
+	for fingerprint, issue := range matchedExisting {
 		currentLinearHashes[fingerprint] = existingIssueHash(issue)
 	}
 
@@ -224,7 +296,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		updateBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for fingerprint, desired := range desiredByFingerprint {
 			seen[fingerprint] = struct{}{}
-			existing, ok := existingByFingerprint[fingerprint]
+			// Also mark the coarse fingerprint as seen so the resolve loop
+			// doesn't try to close a terminal ticket whose coarse fingerprint
+			// was superseded by a fine-grained finding (reopen-guard create).
+			if coarse := model.CoarseFingerprint(fingerprint); coarse != fingerprint {
+				seen[coarse] = struct{}{}
+			}
+			existing, ok := matchedExisting[fingerprint]
 			if !ok {
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
@@ -242,9 +320,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if cacheEnabled && cacheSnapshot.SnykHashes[fingerprint] == snykHashes[fingerprint] && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] && !pendingTerminalTransition(existing, desired) {
 				continue
 			}
-			if needsUpdate(existing, desired) {
+			if needsUpdate(existing, desired, s.cfg.Linear.States) {
 				update := model.IssueUpdate{Existing: existing, Desired: desired}
-				update.Diff = ComputeDiff(existing, desired)
+				update.Diff = ComputeDiff(existing, desired, s.cfg.Linear.States)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
 					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
@@ -278,9 +356,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				ManagedLabels: existing.ManagedLabels,
 				Priority:      existing.Priority,
 			}
-			if needsUpdate(existing, resolved) {
+			if needsUpdate(existing, resolved, s.cfg.Linear.States) {
 				resolvedUpdate := model.IssueUpdate{Existing: existing, Desired: resolved}
-				resolvedUpdate.Diff = ComputeDiff(existing, resolved)
+				resolvedUpdate.Diff = ComputeDiff(existing, resolved, s.cfg.Linear.States)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
 					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
@@ -306,9 +384,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				ManagedLabels: duplicate.ManagedLabels,
 				Priority:      duplicate.Priority,
 			}
-			if needsUpdate(duplicate, desired) {
+			if needsUpdate(duplicate, desired, s.cfg.Linear.States) {
 				cancelUpdate := model.IssueUpdate{Existing: duplicate, Desired: desired}
-				cancelUpdate.Diff = ComputeDiff(duplicate, desired)
+				cancelUpdate.Diff = ComputeDiff(duplicate, desired, s.cfg.Linear.States)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
 					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
@@ -926,15 +1004,16 @@ func pendingTerminalTransition(existing model.ExistingIssue, desired model.Desir
 	return model.NormalizeWorkflowStateName(existing.StateName) != model.NormalizeWorkflowStateName(model.StateName(desired.State))
 }
 
-func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue) bool {
-	return ComputeDiff(existing, desired).HasChanges()
+func needsUpdate(existing model.ExistingIssue, desired model.DesiredIssue, states config.StateConfig) bool {
+	return ComputeDiff(existing, desired, states).HasChanges()
 }
 
 // ComputeDiff returns a diff describing which managed fields changed between
 // the existing and desired Linear issue. The caller is responsible for only
 // displaying a change when the corresponding field is non-empty (e.g. a
 // resolved issue may carry the existing issue's title and description).
-func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *model.IssueDiff {
+// states is used for the terminal→non-terminal reopen guard.
+func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, states config.StateConfig) *model.IssueDiff {
 	d := &model.IssueDiff{}
 
 	if existing.Title != desired.Title {
@@ -959,9 +1038,20 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue) *mode
 		existingNorm := model.NormalizeWorkflowStateName(existing.StateName)
 		desiredNorm := model.NormalizeWorkflowStateName(model.StateName(desired.State))
 		if existingNorm != desiredNorm {
-			d.StateChanged = true
-			d.StateFrom = existing.StateName
-			d.StateTo = desiredNorm
+			// Defense in depth: never report a terminal→non-terminal state
+			// change as an update. The match-layer reopen guard should
+			// prevent us from ever reaching here with a terminal existing
+			// issue and a non-terminal desired state, but if a caller
+			// bypasses that guard (or a future refactor introduces one),
+			// suppress the state change rather than reopening a closed
+			// ticket. The description/labels/title can still update.
+			if isTerminalLinearState(existing.StateName, states) && isNonTerminalModelState(desired.State) {
+				// Deliberately do not set d.StateChanged.
+			} else {
+				d.StateChanged = true
+				d.StateFrom = existing.StateName
+				d.StateTo = desiredNorm
+			}
 		}
 	}
 
@@ -1186,14 +1276,22 @@ func isNonTerminalModelState(state model.IssueState) bool {
 // freely move issues between non-terminal states as part of triage; the sync
 // should not override those manual decisions.
 func isNonTerminalLinearState(stateName string, states config.StateConfig) bool {
+	return !isTerminalLinearState(stateName, states)
+}
+
+// isTerminalLinearState reports whether the existing Linear issue state is a
+// terminal state (configured Done or Cancelled). A ticket in a terminal state
+// must never be reopened by the sync — if Snyk re-reports an issue that maps
+// to a closed ticket, a fresh ticket should be created instead.
+func isTerminalLinearState(stateName string, states config.StateConfig) bool {
 	normalized := model.NormalizeWorkflowStateName(stateName)
 	if normalized == model.NormalizeWorkflowStateName(states.Done) {
-		return false
+		return true
 	}
 	if normalized == model.NormalizeWorkflowStateName(states.Cancelled) {
-		return false
+		return true
 	}
-	return true
+	return false
 }
 
 func upsertManagedMetadata(description, fingerprint string, managedLabels []string) string {
