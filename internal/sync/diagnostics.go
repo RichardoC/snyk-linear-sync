@@ -41,7 +41,7 @@ func DiagnoseDueDate(cfg config.Config, finding model.Finding, existing model.Ex
 		desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(cfg.Linear.Due, finding)
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, cfg.Linear.States)
 
 	scenarios := make([]DueDateScenario, 0, 2)
 	if creationDueDate, creationBase, creationReason := issueDueDateFromCreatedAt(cfg.Linear.Due, finding); creationDueDate != "" {
@@ -68,7 +68,7 @@ func DiagnoseDueDate(cfg config.Config, finding model.Finding, existing model.Ex
 		Existing:                  existing,
 		Desired:                   desired,
 		Diff:                      diff,
-		WouldUpdate:               needsUpdate(existing, desired),
+		WouldUpdate:               needsUpdate(existing, desired, cfg.Linear.States),
 		WasAwaitingFix:            awaitingFix,
 		FixAvailabilityScenario:   dueDateScenario("fix availability (today + severity SLA)", fixAvailabilityDueDate, fixAvailabilityBase, fixAvailabilityReason),
 		Scenarios:                 scenarios,

@@ -60,6 +60,33 @@ func TestMapStatusDisregardIfFixableAwaitingFix(t *testing.T) {
 	}
 }
 
+func TestMapStatusWontFixIsNotFixed(t *testing.T) {
+	// "wont_fix" contains the substring "fix" but does NOT mean the issue
+	// was fixed. It must not map to FindingFixed (Done). When ignored=false
+	// and status is not resolved, it should fall through to FindingOpen.
+	issue := issueAttributes{
+		Ignored:    false,
+		Status:     "open",
+		Resolution: resolution{Type: "wont_fix"},
+	}
+	got := mapStatus(issue, time.Time{}, false)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus(wont_fix) = %q, want %q (must not be treated as fixed)", got, model.FindingOpen)
+	}
+}
+
+func TestMapStatusFixedResolutionIsFixed(t *testing.T) {
+	issue := issueAttributes{
+		Ignored:    false,
+		Status:     "open",
+		Resolution: resolution{Type: "fixed"},
+	}
+	got := mapStatus(issue, time.Time{}, false)
+	if got != model.FindingFixed {
+		t.Fatalf("mapStatus(fixed) = %q, want %q", got, model.FindingFixed)
+	}
+}
+
 func TestMapStatusDisregardIfFixableTakesPrecedenceOverExpiry(t *testing.T) {
 	past := time.Now().Add(-24 * time.Hour)
 	issue := issueAttributes{
@@ -547,5 +574,69 @@ func TestMergeIgnoresKeepsCachedKeyWhenMissingFromAPI(t *testing.T) {
 	}
 	if entries[0].Expires != "2026-06-17T23:00:00Z" {
 		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	}
+}
+
+func TestLocationKey(t *testing.T) {
+	tests := []struct {
+		name   string
+		coords []coordinate
+		want   string
+	}{
+		{
+			"source file",
+			[]coordinate{{
+				Representations: []representation{{
+					SourceLocation: sourceLocationRepresentation{File: "e2e/prerequisite_gate.py"},
+				}},
+			}},
+			"e2e/prerequisite_gate.py",
+		},
+		{
+			"dependency with version",
+			[]coordinate{{
+				Representations: []representation{{
+					Dependency: dependencyRepresentation{PackageName: "lodash", PackageVersion: "4.17.21"},
+				}},
+			}},
+			"lodash@4.17.21",
+		},
+		{
+			"dependency without version",
+			[]coordinate{{
+				Representations: []representation{{
+					Dependency: dependencyRepresentation{PackageName: "lodash"},
+				}},
+			}},
+			"lodash",
+		},
+		{
+			"source file takes precedence over dependency",
+			[]coordinate{{
+				Representations: []representation{{
+					Dependency:     dependencyRepresentation{PackageName: "lodash", PackageVersion: "4.17.21"},
+					SourceLocation: sourceLocationRepresentation{File: "src/index.py"},
+				}},
+			}},
+			"src/index.py",
+		},
+		{
+			"empty coordinates",
+			[]coordinate{},
+			"",
+		},
+		{
+			"no representations",
+			[]coordinate{{}},
+			"",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := locationKey(tt.coords)
+			if got != tt.want {
+				t.Fatalf("locationKey() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

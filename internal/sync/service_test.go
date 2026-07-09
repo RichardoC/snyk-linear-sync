@@ -540,7 +540,7 @@ func TestNeedsUpdateUsesCaseInsensitiveLabels(t *testing.T) {
 		Priority:    2,
 	}
 
-	if needsUpdate(existing, desired) {
+	if needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = true, want false")
 	}
 }
@@ -966,7 +966,7 @@ func TestNeedsUpdateDetectsManagedLabelChange(t *testing.T) {
 		Priority:      2,
 	}
 
-	if !needsUpdate(existing, desired) {
+	if !needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = false, want true")
 	}
 }
@@ -1075,7 +1075,7 @@ func TestNeedsUpdateClearsDueDateWhenDesiredIsEmpty(t *testing.T) {
 		Priority:    2,
 	}
 
-	if !needsUpdate(existing, desired) {
+	if !needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = false, want true (must clear stale due date for awaiting-fix)")
 	}
 }
@@ -1096,7 +1096,7 @@ func TestNeedsUpdateSkipsDueDateWhenBothEmpty(t *testing.T) {
 		Priority:    2,
 	}
 
-	if needsUpdate(existing, desired) {
+	if needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = true, want false (both due dates empty)")
 	}
 }
@@ -1117,7 +1117,7 @@ func TestNeedsUpdateIncludesDueDate(t *testing.T) {
 		Priority:    2,
 	}
 
-	if !needsUpdate(existing, desired) {
+	if !needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = false, want true")
 	}
 }
@@ -1138,7 +1138,7 @@ func TestNeedsUpdateDetectsLinkOnlyDescriptionChange(t *testing.T) {
 		Priority:    2,
 	}
 
-	if !needsUpdate(existing, desired) {
+	if !needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = false, want true")
 	}
 }
@@ -1408,6 +1408,12 @@ func TestRunCancelsDuplicateAndStillSyncsCanonical(t *testing.T) {
 func minimalCfg() config.Config {
 	return config.Config{
 		Linear: config.LinearConfig{
+			States: config.StateConfig{
+				Todo:      "Todo",
+				Backlog:   "Backlog",
+				Done:      "Done",
+				Cancelled: "Cancelled",
+			},
 			Due: config.DueDateConfig{
 				CriticalDays: 15,
 				HighDays:     30,
@@ -2123,7 +2129,7 @@ func TestNeedsUpdateAlwaysCorrectsDueDate(t *testing.T) {
 		Priority:    2,
 	}
 
-	if !needsUpdate(existing, desired) {
+	if !needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = false, want true (Snyk-derived due date must correct manual override)")
 	}
 }
@@ -2146,7 +2152,7 @@ func TestNeedsUpdateStillDetectsDueDateChangeWhenBothNonEmpty(t *testing.T) {
 		Priority:    2,
 	}
 
-	if !needsUpdate(existing, desired) {
+	if !needsUpdate(existing, desired, config.StateConfig{}) {
 		t.Fatal("needsUpdate() = false, want true (due dates differ)")
 	}
 }
@@ -2417,7 +2423,7 @@ func TestComputeDiffDetectsAllChanges(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation", "snyk-code"},
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, config.StateConfig{})
 
 	if !diff.TitleChanged {
 		t.Fatal("expected TitleChanged")
@@ -2475,7 +2481,7 @@ func TestComputeDiffDetectsNoChanges(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation"},
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, config.StateConfig{})
 
 	if diff.TitleChanged || diff.DescriptionChanged || diff.DueDateChanged ||
 		diff.StateChanged || diff.PriorityChanged || diff.LabelsNeedUpdate ||
@@ -2506,7 +2512,7 @@ func TestComputeDiffDetectsLabelRemoval(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation"},
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, config.StateConfig{})
 
 	if len(diff.LabelsRemoved) != 1 || diff.LabelsRemoved[0] != "snyk-code" {
 		t.Fatalf("labels removed = %v, want [snyk-code]", diff.LabelsRemoved)
@@ -2533,7 +2539,7 @@ func TestComputeDiffNoStateChangeWhenPreserveState(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation"},
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, config.StateConfig{})
 
 	if diff.StateChanged {
 		t.Fatal("expected no state change when PreserveState=true")
@@ -2562,7 +2568,7 @@ func TestComputeDiffDetectsLabelNotOnIssue(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation", "snyk-code"},
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, config.StateConfig{})
 
 	if !diff.LabelsNeedUpdate {
 		t.Fatal("expected LabelsNeedUpdate when managed label is not on issue")
@@ -2602,7 +2608,7 @@ func TestComputeDiffNoFalseLabelRemovalWhenLabelAlreadyGone(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation"},
 	}
 
-	diff := ComputeDiff(existing, desired)
+	diff := ComputeDiff(existing, desired, config.StateConfig{})
 
 	if len(diff.LabelsRemoved) != 0 {
 		t.Fatalf("LabelsRemoved = %v, want empty (snyk-code is not on the issue)", diff.LabelsRemoved)
@@ -2848,13 +2854,16 @@ func TestRunPreservesTodoWhenFindingIsAwaitingFix(t *testing.T) {
 	}
 }
 
-// TestRunDoesNotPreserveTerminalStates verifies that the non-terminal state
-// override does NOT apply when the existing state is a terminal state like
-// Done or Cancelled. If a user manually marks an open finding as Done, the
-// sync should still move it back to the configured open state.
+// TestRunDoesNotPreserveTerminalStates verifies that a terminal (Done) ticket
+// is never reopened when Snyk reports the finding as open. Instead of updating
+// the closed ticket back to an open state, the sync creates a new ticket. This
+// is the reopen guard: Snyk reusing a problem-type issueID is not a directive
+// to reopen a closed Linear ticket.
 func TestRunDoesNotPreserveTerminalStates(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Todo = "Triage"
+	cfg.Linear.States.Done = "Done"
+	cfg.Linear.States.Cancelled = "Cancelled"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	finding := model.Finding{
@@ -2882,7 +2891,7 @@ func TestRunDoesNotPreserveTerminalStates(t *testing.T) {
 				Identifier:  "SEC-1",
 				Title:       "stale title",
 				Description: "old description",
-				StateName:   "Done", // terminal state — should NOT be preserved
+				StateName:   "Done", // terminal state — must not be reopened
 				Fingerprint: finding.Fingerprint,
 			},
 		},
@@ -2894,8 +2903,12 @@ func TestRunDoesNotPreserveTerminalStates(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	if result.PlannedUpdates == 0 {
-		t.Fatal("PlannedUpdates = 0, want > 0 (Done state should NOT be preserved for open finding)")
+	// A new ticket should be created, not an update to the closed one.
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1 (should create new ticket, not reopen Done)", result.PlannedCreates)
+	}
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (must not reopen terminal ticket)", result.PlannedUpdates)
 	}
 }
 
@@ -3127,5 +3140,344 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 		if label == "triage-dependency" {
 			t.Fatalf("updated managed labels should not contain triage-dependency after fix is available: %v", updated.ManagedLabels)
 		}
+	}
+}
+
+// TestRunDoesNotReopenTerminalTicketForCoarseFingerprint reproduces the
+// SNYK-6582 bug: a Done ticket with the old coarse fingerprint
+// snyk:project:issue is matched when Snyk re-reports the same issue ID as
+// open. The reopen guard must prevent reusing the closed ticket and instead
+// create a fresh one.
+func TestRunDoesNotReopenTerminalTicketForCoarseFingerprint(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Done = "Done"
+	cfg.Linear.States.Cancelled = "Cancelled"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Path traversal",
+		Severity:    "low",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SNYK-6582",
+				Title:       "Snyk: [low] Path traversal",
+				Description: "old description",
+				StateName:   "Done",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// A new ticket should be created, not an update to the closed one.
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1 (should create new ticket for reopened finding)", result.PlannedCreates)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (must not reopen terminal ticket)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0 (must not send update for Done ticket)", len(linear.updated))
+	}
+
+	// The created ticket should carry the same fingerprint as the finding.
+	if linear.created[0].Fingerprint != finding.Fingerprint {
+		t.Fatalf("created fingerprint = %q, want %q", linear.created[0].Fingerprint, finding.Fingerprint)
+	}
+}
+
+// TestRunDoesNotReopenTerminalTicketForFineGrainedFingerprint tests the case
+// where Snyk starts reporting a fine-grained fingerprint (with location key)
+// for an issue whose old coarse-fingerprint ticket is Done. The closed ticket
+// must not be matched via the coarse fallback, and a new ticket must be created.
+func TestRunDoesNotReopenTerminalTicketForFineGrainedFingerprint(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Done = "Done"
+	cfg.Linear.States.Cancelled = "Cancelled"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1:e2e/prerequisite_gate.py",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Path traversal",
+		Severity:    "low",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SNYK-6582",
+				Title:       "Snyk: [low] Path traversal",
+				Description: "old description",
+				StateName:   "Done",
+				Fingerprint: "snyk:project-a:issue-1", // old coarse fingerprint
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1 (should create new ticket for new code occurrence)", result.PlannedCreates)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (must not match terminal ticket via coarse fallback)", result.PlannedUpdates)
+	}
+	// The old Done ticket may be resolved (no-op update keeping it Done),
+	// but it must not be reopened. Verify no update changed its state to
+	// non-terminal.
+	for _, u := range linear.updated {
+		if u.State == model.StateTodo || u.State == model.StateBacklog {
+			t.Fatalf("terminal ticket was reopened: state=%s", u.State)
+		}
+	}
+}
+
+// TestRunMigratesCoarseFingerprintForNonTerminalTicket tests the migration
+// path: a non-terminal ticket with the old coarse fingerprint is updated
+// (not duplicated) when Snyk starts reporting a fine-grained fingerprint.
+func TestRunMigratesCoarseFingerprintForNonTerminalTicket(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Todo = "Todo"
+	cfg.Linear.States.Done = "Done"
+	cfg.Linear.States.Cancelled = "Cancelled"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1:e2e/prerequisite_gate.py",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "Path traversal",
+		Severity:    "low",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [low] Path traversal",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1", // old coarse fingerprint
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Should update the existing non-terminal ticket, not create a duplicate.
+	if result.PlannedCreates != 0 {
+		t.Fatalf("PlannedCreates = %d, want 0 (should migrate, not duplicate)", result.PlannedCreates)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (should update existing ticket with new fingerprint)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0", len(linear.created))
+	}
+}
+
+// TestRunMigratesCoarseFingerprintForMultipleFindings verifies that when
+// Snyk reports multiple fine-grained findings sharing a coarse prefix and a
+// single non-terminal coarse ticket exists, only the first finding migrates
+// (updates the existing ticket). The rest create fresh tickets. This prevents
+// a race where multiple findings all bind to the same Linear issue.
+func TestRunMigratesCoarseFingerprintForMultipleFindings(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	findings := []model.Finding{
+		{
+			Fingerprint: "snyk:project-a:issue-1:src/fileA.py",
+			SnykIssueID: "issue-1",
+			ProjectID:   "project-a",
+			ProjectName: "Project A",
+			IssueTitle:  "Path traversal",
+			Severity:    "low",
+			Status:      model.FindingOpen,
+			CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		},
+		{
+			Fingerprint: "snyk:project-a:issue-1:src/fileB.py",
+			SnykIssueID: "issue-1",
+			ProjectID:   "project-a",
+			ProjectName: "Project A",
+			IssueTitle:  "Path traversal",
+			Severity:    "low",
+			Status:      model.FindingOpen,
+			CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		},
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   findings,
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [low] Path traversal",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1", // old coarse fingerprint
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// One finding migrates (updates the existing ticket), the other creates
+	// a fresh ticket. Both must not update the same Linear issue.
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (only first finding migrates)", result.PlannedUpdates)
+	}
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1 (second finding creates new ticket)", result.PlannedCreates)
+	}
+
+	// Verify no two updates target the same existing issue.
+	// (fakeLinear.updated is []DesiredIssue; duplicates would mean the same
+	// coarse ticket was matched twice, which the deplete-on-match prevents.)
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want exactly 1 (no duplicate updates)", len(linear.updated))
+	}
+}
+
+// TestRunDoesNotStealFineGrainedTicketViaCoarseFallback verifies that a
+// fine-grained ticket (3-segment fingerprint) is never used as a coarse-
+// fallback match for a DIFFERENT finding sharing the same coarse prefix.
+// Without this guard, the fileA finding would steal the fileB ticket via
+// the coarse index, causing perpetual fingerprint churn.
+func TestRunDoesNotStealFineGrainedTicketViaCoarseFallback(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	findings := []model.Finding{
+		{
+			Fingerprint: "snyk:project-a:issue-1:src/fileA.py",
+			SnykIssueID: "issue-1",
+			ProjectID:   "project-a",
+			ProjectName: "Project A",
+			IssueTitle:  "Path traversal",
+			Severity:    "low",
+			Status:      model.FindingOpen,
+			CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		},
+		{
+			Fingerprint: "snyk:project-a:issue-1:src/fileB.py",
+			SnykIssueID: "issue-1",
+			ProjectID:   "project-a",
+			ProjectName: "Project A",
+			IssueTitle:  "Path traversal",
+			Severity:    "low",
+			Status:      model.FindingOpen,
+			CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		},
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   findings,
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	// Linear already has a fine-grained ticket for fileB (e.g. from a prior
+	// migration or creation). fileA has no ticket yet.
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [low] Path traversal",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1:src/fileB.py",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// fileB finding updates its exact-match ticket. fileA finding must NOT
+	// steal the fileB ticket via coarse fallback — it should create a new one.
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (only fileB updates its ticket)", result.PlannedUpdates)
+	}
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1 (fileA creates new ticket, not steal fileB's)", result.PlannedCreates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1 (no ticket stealing)", len(linear.updated))
 	}
 }

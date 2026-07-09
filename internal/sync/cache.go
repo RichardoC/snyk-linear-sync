@@ -52,48 +52,6 @@ func existingIssueHash(existing model.ExistingIssue) string {
 	)
 }
 
-func nextLinearHashes(desiredByFingerprint map[string]model.DesiredIssue, existingByFingerprint map[string]model.ExistingIssue, conflicted map[string]struct{}) map[string]string {
-	out := make(map[string]string, len(existingByFingerprint)+len(desiredByFingerprint))
-
-	for fingerprint, desired := range desiredByFingerprint {
-		if _, blocked := conflicted[fingerprint]; blocked {
-			continue
-		}
-		existing, ok := existingByFingerprint[fingerprint]
-		if ok && !needsUpdate(existing, desired) {
-			out[fingerprint] = existingIssueHash(existing)
-			continue
-		}
-		out[fingerprint] = desiredIssueHash(desired)
-	}
-
-	for fingerprint, existing := range existingByFingerprint {
-		if _, blocked := conflicted[fingerprint]; blocked {
-			continue
-		}
-		if _, ok := desiredByFingerprint[fingerprint]; ok {
-			continue
-		}
-
-		resolved := model.DesiredIssue{
-			Fingerprint:   existing.Fingerprint,
-			Title:         existing.Title,
-			Description:   existing.Description,
-			DueDate:       existing.DueDate,
-			State:         model.StateDone,
-			ManagedLabels: existing.ManagedLabels,
-			Priority:      existing.Priority,
-		}
-		if needsUpdate(existing, resolved) {
-			out[fingerprint] = desiredIssueHash(resolved)
-			continue
-		}
-		out[fingerprint] = existingIssueHash(existing)
-	}
-
-	return out
-}
-
 func digestParts(parts ...string) string {
 	h := sha256.New()
 	for _, part := range parts {

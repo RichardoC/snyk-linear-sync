@@ -122,7 +122,7 @@ func TestFindingFromIssueDecodesRealIssueShape(t *testing.T) {
 		t.Fatalf("parse created_at: %v", err)
 	}
 
-	finding := c.findingFromIssue(issue, "project-a", project, "myorg", "SNYK-JS-DEBUG-12552895", createdAt, ignoreMetadata{})
+	finding := c.findingFromIssue(issue, "project-a", project, "myorg", "SNYK-JS-DEBUG-12552895", "SNYK-JS-DEBUG-12552895", createdAt, ignoreMetadata{})
 
 	// CVSS: Snyk score (9.3) must win over NVD (7.5) per selectCVSS (Snyk > Red Hat > NVD).
 	if finding.CVSS != 9.3 {
@@ -234,7 +234,7 @@ func TestFindingFromIssueCodeFindingRemediationProse(t *testing.T) {
 	}
 	c := &Client{restBase: mustParseURL(t, "https://api.snyk.io/rest/")}
 	createdAt, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
-	finding := c.findingFromIssue(issue, "project-code", projectRef{ID: "project-code", Name: "owner/repo"}, "myorg", "SNYK-CODE-1", createdAt, ignoreMetadata{})
+	finding := c.findingFromIssue(issue, "project-code", projectRef{ID: "project-code", Name: "owner/repo"}, "myorg", "SNYK-CODE-1", "SNYK-CODE-1", createdAt, ignoreMetadata{})
 
 	if finding.CVSS != 0 {
 		t.Fatalf("CVSS = %v, want 0 when no severities reported (code finding)", finding.CVSS)

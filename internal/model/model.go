@@ -190,8 +190,45 @@ func StateName(state IssueState) string {
 	}
 }
 
-func Fingerprint(projectID, issueID string) string {
-	return fmt.Sprintf("snyk:%s:%s", projectID, issueID)
+// Fingerprint builds the dedup key the sync uses to match a Snyk finding to
+// a Linear ticket. The base key is snyk:<projectID>:<issueID>, where issueID
+// is Snyk's problem-type-in-project identifier (e.g. a vulnerability key),
+// NOT a per-occurrence UUID. Snyk reuses the same issueID across scans and
+// across code changes, so the base key alone is too coarse: when a problem
+// of the same type reappears on different code, the fingerprint collides
+// with an already-closed ticket and the sync reopens it.
+//
+// locationKey disambiguates finding instances using data Snyk already
+// reports — the source file path for code (SAST) issues, or package@version
+// for dependency issues. When present, a third segment is appended so each
+// genuine occurrence gets its own ticket. When absent (e.g. Snyk didn't
+// report coordinates), the coarse 2-segment key is returned for backward
+// compatibility with existing Linear tickets.
+//
+// Line numbers and commit SHAs are deliberately excluded: they churn on
+// every refactor and would orphan tickets. The file path / package identity
+// is the stable "occurrence site."
+func Fingerprint(projectID, issueID, locationKey string) string {
+	if locationKey == "" {
+		return fmt.Sprintf("snyk:%s:%s", projectID, issueID)
+	}
+	return fmt.Sprintf("snyk:%s:%s:%s", projectID, issueID, locationKey)
+}
+
+// CoarseFingerprint returns the 2-segment snyk:<projectID>:<issueID> prefix
+// of a fingerprint, stripping any location segment. It is used during
+// migration to match new fine-grained findings against existing Linear
+// tickets that still carry the old coarse fingerprint.
+func CoarseFingerprint(fingerprint string) string {
+	const prefix = "snyk:"
+	rest := strings.TrimPrefix(fingerprint, prefix)
+	// Cut twice: projectID:issueID[:location]
+	first, rest, ok := strings.Cut(rest, ":")
+	if !ok {
+		return fingerprint
+	}
+	issueID, _, _ := strings.Cut(rest, ":")
+	return fmt.Sprintf("%s%s:%s", prefix, first, issueID)
 }
 
 // NormalizeManagedLabelNames deduplicates, normalizes, and sorts a set of
