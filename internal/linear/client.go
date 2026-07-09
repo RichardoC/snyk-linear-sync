@@ -123,7 +123,7 @@ query issueByIdentifier($filter: IssueFilter!) {
         id
         name
       }
-      labels {
+      labels(first: 250) {
         nodes {
           id
           name
@@ -503,7 +503,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
         id
         name
       }
-      labels {
+      labels(first: 250) {
         nodes {
           id
           name

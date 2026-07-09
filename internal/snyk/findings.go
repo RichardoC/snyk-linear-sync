@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -319,6 +320,15 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 
 			project := projectDetails[projectID]
 			issueKey := coalesce(issue.Attributes.Key, firstProblemID(issue.Attributes.Problems), issue.ID)
+			// The Snyk UI URL fragment needs a SNYK-* key or issue UUID, not a
+			// CVE ID. When issue.Attributes.Key is empty, firstProblemID may
+			// return a CVE identifier (e.g. "CVE-2025-7783") which doesn't
+			// resolve in the Snyk UI. Prefer issue.ID (always a UUID) for the
+			// URL in that case.
+			urlKey := issue.Attributes.Key
+			if strings.TrimSpace(urlKey) == "" {
+				urlKey = issue.ID
+			}
 			createdAt, err := parseIssueCreatedAt(issue.Attributes.CreatedAt)
 			if err != nil {
 				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
@@ -330,8 +340,20 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			if !ok && issue.ID != "" && issueKey != issue.ID {
 				ignoreMeta, ok = ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issue.ID}]
 			}
+			// If the issue is ignored but we found no v1 ignore metadata, the
+			// key format didn't match either fallback. Log a warning so
+			// operators can detect key-format mismatches; without metadata we
+			// can't distinguish a temporary snooze from a permanent ignore, so
+			// the issue would be treated as permanently ignored (Cancelled).
+			if issue.Attributes.Ignored && !ok {
+				c.logger.Warn("ignored issue has no v1 ignore metadata; treating as permanent ignore",
+					slog.String("issue_id", issue.ID),
+					slog.String("issue_key", issueKey),
+					slog.String("project_id", projectID),
+				)
+			}
 
-			finding := c.findingFromIssue(issue, projectID, project, orgSlug, issueKey, createdAt, ignoreMeta)
+			finding := c.findingFromIssue(issue, projectID, project, orgSlug, issueKey, urlKey, createdAt, ignoreMeta)
 
 			findings = append(findings, finding)
 		}
@@ -367,7 +389,7 @@ func (c *Client) findingFromIssue(
 	issue issueResource,
 	projectID string,
 	project projectRef,
-	orgSlug, issueKey string,
+	orgSlug, issueKey, urlKey string,
 	createdAt time.Time,
 	ignoreMeta ignoreMetadata,
 ) model.Finding {
@@ -391,7 +413,7 @@ func (c *Client) findingFromIssue(
 		PackageName:        packageName(issue.Attributes.Coordinates),
 		VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
 		FixedVersion:       fixedVersion(issue.Attributes.Coordinates),
-		IssueURL:           c.issueUIURL(orgSlug, projectID, issueKey),
+		IssueURL:           c.issueUIURL(orgSlug, projectID, urlKey),
 		IssueAPIURL:        c.issueAPIURL(issue.ID),
 		Status:             mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
 		IntroducedThrough:  introducedThrough(issue.Attributes.Coordinates),
@@ -893,7 +915,7 @@ func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixa
 	switch {
 	case strings.Contains(resolutionType, "snooz") || strings.Contains(resolutionDetails, "snooz"):
 		return model.FindingSnoozed
-	case status == "resolved" || status == "fixed" || coordinateResolved(issue.Coordinates) || strings.Contains(resolutionType, "fix"):
+	case status == "resolved" || status == "fixed" || coordinateResolved(issue.Coordinates) || resolutionType == "fixed":
 		return model.FindingFixed
 	default:
 		return model.FindingOpen

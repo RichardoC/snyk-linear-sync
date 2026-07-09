@@ -60,6 +60,33 @@ func TestMapStatusDisregardIfFixableAwaitingFix(t *testing.T) {
 	}
 }
 
+func TestMapStatusWontFixIsNotFixed(t *testing.T) {
+	// "wont_fix" contains the substring "fix" but does NOT mean the issue
+	// was fixed. It must not map to FindingFixed (Done). When ignored=false
+	// and status is not resolved, it should fall through to FindingOpen.
+	issue := issueAttributes{
+		Ignored: false,
+		Status:  "open",
+		Resolution: resolution{Type: "wont_fix"},
+	}
+	got := mapStatus(issue, time.Time{}, false)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus(wont_fix) = %q, want %q (must not be treated as fixed)", got, model.FindingOpen)
+	}
+}
+
+func TestMapStatusFixedResolutionIsFixed(t *testing.T) {
+	issue := issueAttributes{
+		Ignored:    false,
+		Status:     "open",
+		Resolution: resolution{Type: "fixed"},
+	}
+	got := mapStatus(issue, time.Time{}, false)
+	if got != model.FindingFixed {
+		t.Fatalf("mapStatus(fixed) = %q, want %q", got, model.FindingFixed)
+	}
+}
+
 func TestMapStatusDisregardIfFixableTakesPrecedenceOverExpiry(t *testing.T) {
 	past := time.Now().Add(-24 * time.Hour)
 	issue := issueAttributes{
