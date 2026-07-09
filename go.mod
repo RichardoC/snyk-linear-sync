@@ -9,7 +9,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/pavel-snyk/snyk-sdk-go/v2 v2.0.0-20260301004312-50b140348e2a
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sync v0.21.0
+	golang.org/x/sync v0.22.0
 	modernc.org/sqlite v1.53.0
 )
 
