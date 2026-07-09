@@ -65,8 +65,8 @@ func TestMapStatusWontFixIsNotFixed(t *testing.T) {
 	// was fixed. It must not map to FindingFixed (Done). When ignored=false
 	// and status is not resolved, it should fall through to FindingOpen.
 	issue := issueAttributes{
-		Ignored: false,
-		Status:  "open",
+		Ignored:    false,
+		Status:     "open",
 		Resolution: resolution{Type: "wont_fix"},
 	}
 	got := mapStatus(issue, time.Time{}, false)
