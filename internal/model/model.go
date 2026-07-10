@@ -23,6 +23,7 @@ type Finding struct {
 	SnykIssueKey       string
 	IssueType          string
 	CreatedAt          time.Time
+	UpdatedAt          time.Time
 	ProjectID          string
 	ProjectName        string
 	ProjectOrigin      string

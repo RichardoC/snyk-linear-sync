@@ -333,6 +333,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			if err != nil {
 				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
 			}
+			updatedAt := parseIssueTimestamp(issue.Attributes.UpdatedAt)
 
 			ignoreMeta, ok := ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issueKey}]
 			// The v1 API uses either SNYK-* keys or issue UUIDs as top-level keys
@@ -353,7 +354,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				)
 			}
 
-			finding := c.findingFromIssue(issue, projectID, project, orgSlug, issueKey, urlKey, createdAt, ignoreMeta)
+			finding := c.findingFromIssue(issue, projectID, project, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
 
 			findings = append(findings, finding)
 		}
@@ -390,7 +391,7 @@ func (c *Client) findingFromIssue(
 	projectID string,
 	project projectRef,
 	orgSlug, issueKey, urlKey string,
-	createdAt time.Time,
+	createdAt, updatedAt time.Time,
 	ignoreMeta ignoreMetadata,
 ) model.Finding {
 	source := sourceLocation(issue.Attributes.Coordinates)
@@ -400,6 +401,7 @@ func (c *Client) findingFromIssue(
 		SnykIssueKey:       issueKey,
 		IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
 		CreatedAt:          createdAt,
+		UpdatedAt:          updatedAt,
 		ProjectID:          projectID,
 		ProjectName:        project.Name,
 		ProjectOrigin:      project.Origin,
@@ -891,6 +893,21 @@ func parseIssueCreatedAt(raw string) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return createdAt, nil
+}
+
+// parseIssueTimestamp parses a Snyk RFC3339 timestamp, returning the zero
+// time if the string is empty. Used for optional fields like updated_at
+// where a missing value is acceptable.
+func parseIssueTimestamp(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixable bool) model.FindingStatus {
