@@ -53,6 +53,11 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
       - name: Verify formatting
         run: |
           unformatted=$(go list -f '{{.Dir}}' ./... | xargs -r gofmt -l)
