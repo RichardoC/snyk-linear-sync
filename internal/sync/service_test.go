@@ -622,6 +622,117 @@ func TestDesiredIssueDueDateLeavesPastSLAAsIs(t *testing.T) {
 	}
 }
 
+// TestDesiredIssueDueDateUsesUpdatedOnReusedIssueID verifies that when Snyk
+// reuses an issue ID for a new code occurrence (updated_at >> created_at),
+// the SLA clock restarts from updated_at rather than using the stale
+// created_at. Without this, a freshly-detected occurrence gets a months-old
+// due date and is immediately past due despite the code being only days old.
+func TestDesiredIssueDueDateUsesUpdatedOnReusedIssueID(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	// Snyk created the issue ID in January, but the current occurrence was
+	// detected in July (updated_at). The 90-day gap exceeds the 45-day
+	// medium SLA, so the SLA clock should restart from updated_at.
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1:src/file.py",
+		SnykIssueID: "issue-1",
+		ProjectName: "Project A",
+		Severity:    "medium",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.January, 22, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, time.July, 9, 17, 32, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	// July 9 + 45 days = August 23
+	want := "2026-08-23"
+	if desired.DueDate != want {
+		t.Fatalf("desired due date = %q, want %q (SLA from updated_at, not created_at)", desired.DueDate, want)
+	}
+	if !strings.Contains(desired.DueDateReason, "updated_at") {
+		t.Fatalf("due date reason = %q, want it to mention updated_at", desired.DueDateReason)
+	}
+}
+
+// TestDesiredIssueDueDateDoesNotUseUpdatedAtForRecentIssue verifies that
+// when updated_at is close to created_at (within the SLA window), the SLA
+// clock uses created_at as before. This avoids false positives from routine
+// re-scans that bump updated_at by a day or two.
+func TestDesiredIssueDueDateDoesNotUseUpdatedAtForRecentIssue(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	// created_at and updated_at are only 10 days apart — within the 90-day
+	// low SLA window, so the SLA clock should use created_at.
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1:src/file.py",
+		SnykIssueID: "issue-1",
+		ProjectName: "Project A",
+		Severity:    "low",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, time.July, 11, 0, 0, 0, 0, time.UTC),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	// July 1 + 90 days = September 29 (using created_at, NOT updated_at)
+	want := "2026-09-29"
+	if desired.DueDate != want {
+		t.Fatalf("desired due date = %q, want %q (SLA from created_at, not updated_at)", desired.DueDate, want)
+	}
+	if !strings.Contains(desired.DueDateReason, "issue creation") {
+		t.Fatalf("due date reason = %q, want it to mention issue creation", desired.DueDateReason)
+	}
+}
+
+// TestDesiredIssueDueDateIgnoredAtZeroUpdatedAt verifies that the updated_at
+// fallback does not fire when updated_at is zero (missing from API response).
+func TestDesiredIssueDueDateIgnoredAtZeroUpdatedAt(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectName: "Project A",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		// UpdatedAt is zero — should fall back to created_at behavior
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	// Jan 1 + 30 days = Jan 31 (uses created_at, no updated_at fallback)
+	if desired.DueDate != "2026-01-31" {
+		t.Fatalf("desired due date = %q, want 2026-01-31 (created_at fallback when updated_at is zero)", desired.DueDate)
+	}
+}
+
 func TestDesiredIssueDueDateLeavesPastExpiredSnoozeAsIs(t *testing.T) {
 	cfg := config.Config{
 		Linear: config.LinearConfig{

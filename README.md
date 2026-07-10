@@ -83,21 +83,33 @@ go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
 
 ## Validation
 
-Run these before every commit. `go fix ./...` may automatically rewrite code
-(for example, modernising loop syntax), so run it first, review the resulting
-`git diff`, and include any changes in the same commit. Repeat until
-`git diff --exit-code` is clean.
+Run these before every commit, in order. Each step catches a different class
+of issue and some depend on earlier steps being clean.
 
 ```bash
+# 1. Reconcile module dependencies first — go fmt/build/vet/test can all
+#    fail with a stale go.mod even when the code is correct.
+go mod tidy
+git diff --exit-code go.mod go.sum
+
+# 2. Apply go fix (may rewrite code, e.g. modernising loop syntax). Review
+#    the diff and include any changes in the same commit. Repeat until clean.
 go fix ./...
 git diff --exit-code
-go test ./...
-go vet ./...
+
+# 3. Format — must come after go fix so you don't re-diff what fix touched.
+#    go fmt ./... loads the full module graph and exits non-zero if go.mod
+#    needs tidying, which is why step 1 comes first.
 go fmt ./...
+
+# 4. Compile, vet, and test.
+go build ./...
+go vet ./...
+go test ./...
 ```
 
-CI enforces this: the `go fix` check runs `go fix ./...` and then
-`git diff --exit-code`, so any unfixed code will fail the build.
+CI enforces all of these: `gofmt -l`, `go fix` + `git diff --exit-code`,
+`go vet`, and `go test` (including `-race`).
 
 ## Current Behavior
 

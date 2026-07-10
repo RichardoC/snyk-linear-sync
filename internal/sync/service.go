@@ -909,6 +909,27 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 		createdAtUTC := finding.CreatedAt.UTC()
 		baseDate = time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
 		basis = "issue creation"
+
+		// Snyk reuses issue IDs when the same vulnerability class reappears on
+		// different code in the same project. The created_at reflects the
+		// ORIGINAL occurrence, not the current one. If updated_at is
+		// significantly newer than created_at (more than the SLA window),
+		// the issue was likely reused for a new occurrence and the SLA
+		// clock should restart from updated_at — otherwise a freshly-
+		// detected occurrence gets a months-old due date and is immediately
+		// past due despite the code being only days old.
+		//
+		// The SLA-window threshold avoids false positives from routine
+		// re-scans that bump updated_at by a day or two, and avoids daily
+		// churn: once updated_at stabilizes, the due date is stable too.
+		if !finding.UpdatedAt.IsZero() {
+			slaDays := severitySLADays(dueCfg, finding.Severity)
+			updatedAtUTC := finding.UpdatedAt.UTC()
+			if slaDays > 0 && updatedAtUTC.Sub(createdAtUTC) > time.Duration(slaDays)*24*time.Hour {
+				baseDate = time.Date(updatedAtUTC.Year(), updatedAtUTC.Month(), updatedAtUTC.Day(), 0, 0, 0, 0, time.UTC)
+				basis = "issue re-detection (updated_at)"
+			}
+		}
 	default:
 		return "", "", ""
 	}
@@ -916,21 +937,31 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 	return dueDateFromBase(baseDate, basis, dueCfg, finding)
 }
 
+// severitySLADays returns the SLA day count for a given severity, or 0 if
+// the severity is unknown. Used by issueDueDate to detect issue-ID reuse:
+// if updated_at exceeds created_at by more than the SLA window, the issue
+// was likely reused for a new occurrence and the SLA clock should restart.
+func severitySLADays(dueCfg config.DueDateConfig, severity string) int {
+	switch issuePriority(severity) {
+	case 1:
+		return dueCfg.CriticalDays
+	case 2:
+		return dueCfg.HighDays
+	case 3:
+		return dueCfg.MediumDays
+	case 4:
+		return dueCfg.LowDays
+	default:
+		return 0
+	}
+}
+
 // dueDateFromBase calculates the due date from a given base date, severity,
 // and SLA offsets. It returns the same value for both the effective due date
 // and the cache base so that past-SLA dates remain stable.
 func dueDateFromBase(baseDate time.Time, basis string, dueCfg config.DueDateConfig, finding model.Finding) (effective, base, reason string) {
-	var days int
-	switch issuePriority(finding.Severity) {
-	case 1:
-		days = dueCfg.CriticalDays
-	case 2:
-		days = dueCfg.HighDays
-	case 3:
-		days = dueCfg.MediumDays
-	case 4:
-		days = dueCfg.LowDays
-	default:
+	days := severitySLADays(dueCfg, finding.Severity)
+	if days == 0 {
 		return "", "", ""
 	}
 

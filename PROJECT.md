@@ -276,12 +276,16 @@ The post-write refresh matters because Linear may rewrite markdown bodies after 
 
 ## Operator Guidance
 
-After any code change, run:
+After any code change, run the full verification suite (see README for the
+rationale behind the ordering):
 
 ```bash
-go fix ./...
-go test ./...
+go mod tidy && git diff --exit-code go.mod go.sum
+go fix ./... && git diff --exit-code
+go fmt ./...
+go build ./...
 go vet ./...
+go test ./...
 ```
 
 Use a normal run for day-to-day sync:
