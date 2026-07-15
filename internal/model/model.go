@@ -127,6 +127,15 @@ type DesiredIssue struct {
 	StateReason   string
 	DueDateReason string
 	LabelReasons  map[string]string // normalized label name → reason
+	// DueDateUsedUpdatedAtFallback records whether DueDate/DueDateBase were
+	// computed using the updated_at re-detection fallback (Snyk reusing an
+	// issue ID for a new code occurrence) rather than the issue's original
+	// created_at or ignore expiry. The sync's match loop uses this to keep
+	// the due date sticky against an already-matched Linear ticket's due
+	// date, since Snyk bumps updated_at on routine re-scans — not just
+	// genuine re-detections — which would otherwise churn the due date
+	// every run once the fallback triggers.
+	DueDateUsedUpdatedAtFallback bool
 }
 
 // IssueDiff captures which managed fields changed between the existing and
