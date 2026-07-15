@@ -160,7 +160,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				continue
 			}
 			existingByFingerprint[issue.Fingerprint] = issue
-			if isNonTerminalLinearState(issue.StateName, s.cfg.Linear.States) {
+			if isNonTerminalLinearState(issue, s.cfg.Linear.States) {
 				coarse := model.CoarseFingerprint(issue.Fingerprint)
 				if coarse == issue.Fingerprint {
 					if _, exists := existingByCoarseFingerprint[coarse]; !exists {
@@ -214,7 +214,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// through to the create path. The terminal ticket is also removed
 			// from existingByFingerprint so the job-dispatch loop does not
 			// send an update that would reopen it.
-			if isTerminalLinearState(existing.StateName, s.cfg.Linear.States) && isNonTerminalModelState(desired.State) {
+			if isTerminalLinearState(existing, s.cfg.Linear.States) && isNonTerminalModelState(desired.State) {
 				s.logger.Info("not reusing closed ticket for reopened finding; creating new ticket",
 					slog.String("fingerprint", finding.Fingerprint),
 					slog.String("existing", existing.Identifier),
@@ -240,7 +240,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// state already matches the configured state, avoiding false-positive
 			// state-change detection due to model state names ("todo") differing
 			// from configured Linear state names ("Triage").
-			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing.StateName, s.cfg.Linear.States) {
+			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing, s.cfg.Linear.States) {
 				desired.PreserveState = true
 			}
 
@@ -343,6 +343,12 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		resolveBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for fingerprint, existing := range existingByFingerprint {
 			if _, ok := seen[fingerprint]; ok {
+				continue
+			}
+			// Skip archived tickets — they're already terminal and Linear
+			// doesn't allow updating archived issues. Trying to resolve
+			// them would produce API errors.
+			if existing.ArchivedAt != nil {
 				continue
 			}
 			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
@@ -1076,7 +1082,7 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, state
 			// bypasses that guard (or a future refactor introduces one),
 			// suppress the state change rather than reopening a closed
 			// ticket. The description/labels/title can still update.
-			if isTerminalLinearState(existing.StateName, states) && isNonTerminalModelState(desired.State) {
+			if isTerminalLinearState(existing, states) && isNonTerminalModelState(desired.State) {
 				// Deliberately do not set d.StateChanged.
 			} else {
 				d.StateChanged = true
@@ -1302,20 +1308,24 @@ func isNonTerminalModelState(state model.IssueState) bool {
 	return state == model.StateTodo || state == model.StateBacklog
 }
 
-// isNonTerminalLinearState reports whether the existing Linear issue state is
-// non-terminal (i.e. not the configured Done or Cancelled state). Users can
-// freely move issues between non-terminal states as part of triage; the sync
-// should not override those manual decisions.
-func isNonTerminalLinearState(stateName string, states config.StateConfig) bool {
-	return !isTerminalLinearState(stateName, states)
+// isNonTerminalLinearState reports whether the existing Linear issue is NOT
+// in a terminal state (not Done/Cancelled and not archived). Users can freely
+// move issues between non-terminal states as part of triage; the sync should
+// not override those manual decisions.
+func isNonTerminalLinearState(existing model.ExistingIssue, states config.StateConfig) bool {
+	return !isTerminalLinearState(existing, states)
 }
 
-// isTerminalLinearState reports whether the existing Linear issue state is a
-// terminal state (configured Done or Cancelled). A ticket in a terminal state
-// must never be reopened by the sync — if Snyk re-reports an issue that maps
-// to a closed ticket, a fresh ticket should be created instead.
-func isTerminalLinearState(stateName string, states config.StateConfig) bool {
-	normalized := model.NormalizeWorkflowStateName(stateName)
+// isTerminalLinearState reports whether the existing Linear issue is in a
+// terminal state — either a configured Done/Cancelled workflow state, or
+// archived (auto-archived tickets are always terminal). A terminal ticket
+// must never be reopened by the sync; if Snyk re-reports an issue that maps
+// to a closed or archived ticket, a fresh ticket should be created instead.
+func isTerminalLinearState(existing model.ExistingIssue, states config.StateConfig) bool {
+	if existing.ArchivedAt != nil {
+		return true
+	}
+	normalized := model.NormalizeWorkflowStateName(existing.StateName)
 	if normalized == model.NormalizeWorkflowStateName(states.Done) {
 		return true
 	}
