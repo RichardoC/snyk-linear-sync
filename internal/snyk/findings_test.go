@@ -37,15 +37,19 @@ func TestMapStatusPermanentIgnoreCancelled(t *testing.T) {
 	}
 }
 
-func TestMapStatusExpiredIgnoreCancelled(t *testing.T) {
+func TestMapStatusExpiredIgnoreKeepsOpen(t *testing.T) {
+	// When a snooze expires but Snyk still reports ignored=true, the sync
+	// should treat the finding as open (not ignored) to prevent flapping.
+	// Mapping to FindingIgnored (Cancelled) would trigger the reopen guard
+	// when the snooze is re-applied, creating duplicate tickets.
 	past := time.Now().Add(-24 * time.Hour)
 	issue := issueAttributes{
 		Ignored: true,
 		Status:  "open",
 	}
 	got := mapStatus(issue, past, false)
-	if got != model.FindingIgnored {
-		t.Fatalf("mapStatus() = %q, want %q for expired temporary ignore", got, model.FindingIgnored)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus() = %q, want %q for expired temporary ignore (snooze expired but still ignored)", got, model.FindingOpen)
 	}
 }
 
@@ -149,13 +153,13 @@ func TestMaxExpiryIgnoreMeta(t *testing.T) {
 			},
 		},
 		{
-			name: "latest has no expiry still uses max expiry",
+			name: "latest permanent ignore overrides earlier snooze expiry",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 				{Created: "2026-04-01T12:00:00Z", Expires: ""},
 			},
 			want: ignoreMetadata{
-				ExpiresAt: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC),
+				ExpiresAt: time.Time{}, // permanent ignore — no expiry
 				CreatedAt: time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
 			},
 		},
@@ -167,6 +171,18 @@ func TestMaxExpiryIgnoreMeta(t *testing.T) {
 			want: ignoreMetadata{
 				DisregardIfFixable: true,
 				CreatedAt:          time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC),
+			},
+		},
+		{
+			name: "multiple snoozes all expired picks max expiry",
+			entries: []v1IgnoreEntry{
+				{Created: "2026-04-10T17:14:57Z", Expires: "2026-04-29T00:00:00Z"},
+				{Created: "2026-05-29T09:35:35Z", Expires: "2026-06-11T00:00:00Z"},
+				{Created: "2026-07-02T15:01:44Z", Expires: "2026-07-15T23:00:00Z"},
+			},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.July, 15, 23, 0, 0, 0, time.UTC),
+				CreatedAt: time.Date(2026, time.July, 2, 15, 1, 44, 0, time.UTC),
 			},
 		},
 		{

@@ -669,6 +669,11 @@ func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 	var meta ignoreMetadata
 	var latestCreated time.Time
 	var maxExpiry time.Time
+	// latestHasExpiry tracks whether the most recently created ignore entry
+	// has an expiry date. If the latest entry is a permanent ignore (no
+	// expiry), earlier snooze expiries must NOT be used — the user's latest
+	// intent is to ignore permanently.
+	latestHasExpiry := false
 
 	for _, entry := range entries {
 		createdAt, errCreated := parseTime(entry.Created)
@@ -677,6 +682,7 @@ func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 				latestCreated = createdAt
 				meta.CreatedAt = createdAt
 				meta.DisregardIfFixable = entry.DisregardIfFixable
+				latestHasExpiry = entry.Expires != ""
 			}
 		}
 
@@ -691,6 +697,13 @@ func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 			maxExpiry = expiresAt
 			meta.ExpiresAt = expiresAt
 		}
+	}
+
+	// If the latest ignore entry is permanent (no expiry), discard any
+	// earlier snooze expiry — the user's most recent action overrides the
+	// previous temporary ignores.
+	if !latestHasExpiry {
+		meta.ExpiresAt = time.Time{}
 	}
 
 	return meta
@@ -919,9 +932,19 @@ func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixa
 		if disregardIfFixable {
 			return model.FindingAwaitingFix
 		}
-		if !ignoreExpiresAt.IsZero() && time.Now().Before(ignoreExpiresAt) {
+		if !ignoreExpiresAt.IsZero() {
+			if time.Now().Before(ignoreExpiresAt) {
+				// Snooze still active — treat as open so the ticket stays in Todo.
+				return model.FindingOpen
+			}
+			// Snooze has expired but Snyk still reports ignored=true. Snyk
+			// will eventually flip ignored=false or the user will re-snooze.
+			// Treat as open (not FindingIgnored) to keep the ticket in Todo;
+			// mapping to FindingIgnored (Cancelled) would trigger the reopen
+			// guard when the snooze is re-applied, creating duplicate tickets.
 			return model.FindingOpen
 		}
+		// No expiry metadata — permanent ignore.
 		return model.FindingIgnored
 	}
 
