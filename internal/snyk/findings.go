@@ -443,6 +443,12 @@ func (c *Client) findingFromIssue(
 
 func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1ProjectIgnores, error) {
 	var cached v1ProjectIgnores
+	// previousUpdatedAt records each cached issue key's existing updated_at
+	// so that, later, keys the live API doesn't confirm this run can keep
+	// their original updated_at when written back (see v1IgnoresToCache)
+	// instead of being refreshed to "now" every run, which would mean
+	// ignoreEntryTTL eviction never fires.
+	previousUpdatedAt := make(map[string]time.Time)
 	if c.cache != nil {
 		cachedMeta, err := c.cache.LoadIgnores(ctx, projectID)
 		if err != nil {
@@ -452,6 +458,9 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 			)
 		} else if len(cachedMeta) > 0 {
 			cached = cacheIgnoresToV1(cachedMeta)
+			for issueKey, meta := range cachedMeta {
+				previousUpdatedAt[issueKey] = meta.UpdatedAt
+			}
 		}
 	}
 
@@ -476,7 +485,14 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 	merged := mergeIgnores(apiIgnores, cached)
 
 	if c.cache != nil {
-		if err := c.cache.SaveIgnores(ctx, projectID, v1IgnoresToCache(merged)); err != nil {
+		// apiConfirmed is the set of issue keys the live API actually
+		// reported this run. Everything else in merged survived solely via
+		// the cached side and must keep its previous updated_at on write-back.
+		apiConfirmed := make(map[string]struct{}, len(apiIgnores))
+		for issueKey := range apiIgnores {
+			apiConfirmed[issueKey] = struct{}{}
+		}
+		if err := c.cache.SaveIgnores(ctx, projectID, v1IgnoresToCache(merged, apiConfirmed, previousUpdatedAt)); err != nil {
 			c.logger.Warn("failed to cache v1 ignores",
 				"project_id", projectID,
 				"error", err,
@@ -529,6 +545,12 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 
 	var apiIgnores v1ProjectIgnores
 	var lastErr error
+	// lastErrNotFound tracks whether the most recent failure was a 404, so
+	// that if every attempt exhausts on a 404 we can fall back to the
+	// existing non-fatal "ignores unavailable" behavior instead of failing
+	// the whole run, while still giving a transient 404 a chance to recover
+	// on retry like any other failure.
+	lastErrNotFound := false
 
 	for attempt := range maxAttempts {
 		if attempt > 0 {
@@ -547,6 +569,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
+			lastErrNotFound = false
 			c.logger.Warn("v1 ignores request failed, retrying",
 				"project_id", projectID,
 				"attempt", attempt+1,
@@ -560,18 +583,26 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 		resp.Body.Close()
 
 		if resp.StatusCode == http.StatusNotFound {
-			c.logger.Warn("v1 ignores endpoint returned 404, treating project ignores as unavailable",
+			// A 404 can be transient (e.g. eventual consistency just after a
+			// project is created, or a flaky backend route), so retry it
+			// like any other failure instead of accepting it immediately.
+			// Previously this returned right away, so a single transient 404
+			// erased ignore metadata for the whole run.
+			lastErr = fmt.Errorf("snyk v1 ignores API %s %s returned 404",
+				resp.Request.Method, resp.Request.URL)
+			lastErrNotFound = true
+			c.logger.Warn("v1 ignores endpoint returned 404, retrying",
 				"project_id", projectID,
+				"attempt", attempt+1,
+				"max_attempts", maxAttempts,
 			)
-			if len(apiIgnores) > 0 {
-				return apiIgnores, nil
-			}
-			return v1ProjectIgnores{}, nil
+			continue
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			lastErr = fmt.Errorf("snyk v1 ignores API %s %s failed with %d: %s",
 				resp.Request.Method, resp.Request.URL, resp.StatusCode, strings.TrimSpace(string(body)))
+			lastErrNotFound = false
 			c.logger.Warn("v1 ignores request failed, retrying",
 				"project_id", projectID,
 				"attempt", attempt+1,
@@ -584,6 +615,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 		var attemptIgnores v1ProjectIgnores
 		if err := json.Unmarshal(body, &attemptIgnores); err != nil {
 			lastErr = fmt.Errorf("decode v1 ignores: %w", err)
+			lastErrNotFound = false
 			c.logger.Warn("v1 ignores decode failed, retrying",
 				"project_id", projectID,
 				"attempt", attempt+1,
@@ -595,21 +627,52 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 
 		apiIgnores = mergeIgnores(apiIgnores, attemptIgnores)
 		lastErr = nil
+		lastErrNotFound = false
 	}
 
 	if lastErr != nil {
+		if lastErrNotFound {
+			// Every attempt (or at least the last one) 404ed. Keep the
+			// existing non-fatal behavior: don't fail the run, just return
+			// whatever we accumulated (possibly empty) so the caller can
+			// fall back to/merge with the cache, and warn so operators can
+			// see that ignore metadata was unavailable from the API.
+			c.logger.Warn("v1 ignores endpoint returned 404 after all retries; ignore metadata unavailable from the API this run",
+				"project_id", projectID,
+				"attempts", maxAttempts,
+			)
+			if apiIgnores == nil {
+				apiIgnores = v1ProjectIgnores{}
+			}
+			return apiIgnores, nil
+		}
 		return nil, fmt.Errorf("v1 ignores API failed after %d attempts: %w", maxAttempts, lastErr)
 	}
 
 	return apiIgnores, nil
 }
 
-// mergeIgnores combines live API ignores with cached ignores. For each issue
-// key, it synthesizes a single merged entry with:
-//   - the maximum expiry seen from either source (high-water mark), so the
-//     due date never moves earlier because of a stale API response;
-//   - the most recently created timestamp and disregard-if-fixable flag from
-//     the source that has the most recent created timestamp.
+// mergeIgnores combines live API ignores with cached ignores for the same
+// project. For each issue key, the result is the deduplicated UNION of the
+// raw entries from both sides — NOT two independently-summarized metas
+// combined afterwards. Summarizing each side separately and then taking
+// max(ExpiresAt) and the latest CreatedAt as two independent decisions
+// conflates fields from different entries: if the API's latest entry is now
+// a permanent ignore (summarized ExpiresAt = zero) but the cache still holds
+// an earlier snooze's expiry, an independent max() resurrects that stale
+// expiry — and, worse, that conflated result used to get written straight
+// back to the cache, so the poison would self-perpetuate across runs.
+//
+// Instead, maxExpiryIgnoreMeta — which already implements "the latest
+// created entry wins, including a permanent ignore overriding an earlier
+// snooze" — is left to run once over the whole unioned entry set (callers do
+// this, e.g. v1IgnoresToCache and the ignoreMetaByProjectIssue lookup in
+// LoadSnapshot), so it always sees every entry from both sources together.
+//
+// This same function is also used to fold successive retry attempts against
+// the live API together inside fetchProjectIgnoresWithRetry (both arguments
+// are then "API" data, not one API and one cache) — the union approach works
+// identically there.
 //
 // Cached entries are kept for keys that disappear from the API response so a
 // partial response does not wipe stable data.
@@ -624,41 +687,57 @@ func mergeIgnores(api, cached v1ProjectIgnores) v1ProjectIgnores {
 
 	merged := make(v1ProjectIgnores, len(allKeys))
 	for key := range allKeys {
-		apiMeta := maxExpiryIgnoreMeta(api[key])
-		cachedMeta := maxExpiryIgnoreMeta(cached[key])
-
-		var disregard bool
-		var createdAt time.Time
-		if apiMeta.CreatedAt.After(cachedMeta.CreatedAt) {
-			disregard = apiMeta.DisregardIfFixable
-			createdAt = apiMeta.CreatedAt
-		} else {
-			disregard = cachedMeta.DisregardIfFixable
-			createdAt = cachedMeta.CreatedAt
-		}
-
-		maxExpiry := apiMeta.ExpiresAt
-		if cachedMeta.ExpiresAt.After(maxExpiry) {
-			maxExpiry = cachedMeta.ExpiresAt
-		}
-
-		if maxExpiry.IsZero() && !disregard {
+		union := unionIgnoreEntries(api[key], cached[key])
+		if len(union) == 0 {
 			continue
 		}
-
-		entry := v1IgnoreEntry{
-			DisregardIfFixable: disregard,
-		}
-		if !maxExpiry.IsZero() {
-			entry.Expires = maxExpiry.UTC().Format(time.RFC3339)
-		}
-		if !createdAt.IsZero() {
-			entry.Created = createdAt.UTC().Format(time.RFC3339)
-		}
-		merged[key] = []v1IgnoreEntry{entry}
+		merged[key] = union
 	}
 
 	return merged
+}
+
+// unionIgnoreEntries merges the first-argument and second-argument raw ignore
+// entries for a single issue key into a deduplicated union, preserving every
+// distinct entry so maxExpiryIgnoreMeta can later decide what they mean
+// together. Entries are deduplicated by their full contents (Created,
+// Expires, DisregardIfFixable).
+//
+// The first argument's entries are placed first in the returned slice. This
+// matters when two entries share the exact same Created timestamp but
+// disagree on other fields (e.g. a previously-poisoned cache entry
+// {Created: X, Expires: stale} alongside a clean API entry {Created: X, no
+// expiry}): maxExpiryIgnoreMeta only updates its "latest entry" once it sees
+// a strictly later Created, so among same-Created entries the one that
+// appears first wins the "latest" determination. Since fetchProjectIgnores
+// calls mergeIgnores(api, cached), the live API's entry for that moment wins
+// over the synthetic cached one, so a poisoned cache entry cannot keep
+// resurrecting itself. (We do not additionally drop the conflicting
+// lower-priority entry outright — fetchProjectIgnoresWithRetry also uses this
+// function to fold successive retry attempts, both genuinely "API" data with
+// no priority between them, and dropping on tie there would discard a
+// corrected expiry seen only on a later attempt instead of taking the
+// maximum, as intended.)
+func unionIgnoreEntries(first, second []v1IgnoreEntry) []v1IgnoreEntry {
+	out := make([]v1IgnoreEntry, 0, len(first)+len(second))
+	seen := make(map[v1IgnoreEntry]struct{}, len(first)+len(second))
+
+	for _, entry := range first {
+		if _, dup := seen[entry]; dup {
+			continue
+		}
+		seen[entry] = struct{}{}
+		out = append(out, entry)
+	}
+	for _, entry := range second {
+		if _, dup := seen[entry]; dup {
+			continue
+		}
+		seen[entry] = struct{}{}
+		out = append(out, entry)
+	}
+
+	return out
 }
 
 // maxExpiryIgnoreMeta returns the maximum ignore expiry and the metadata of
@@ -669,15 +748,33 @@ func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 	var meta ignoreMetadata
 	var latestCreated time.Time
 	var maxExpiry time.Time
+	// latestHasExpiry tracks whether the most recently created ignore entry
+	// has an expiry date. If the latest entry is a permanent ignore (no
+	// expiry), earlier snooze expiries must NOT be used — the user's latest
+	// intent is to ignore permanently.
+	latestHasExpiry := false
+	// anyCreatedParsed / allCreatedParsed track whether we can actually trust
+	// "latest" above. If any entry's Created is missing/unparseable, we can't
+	// reliably tell which entry is the latest one, so the permanent-override
+	// zeroing below must be skipped — otherwise an entry with a missing
+	// Created but a legitimate future Expires could be silently outranked and
+	// have its expiry zeroed, turning an active snooze into a permanent
+	// ignore (and wrongly cancelling the ticket).
+	anyCreatedParsed := false
+	allCreatedParsed := true
 
 	for _, entry := range entries {
 		createdAt, errCreated := parseTime(entry.Created)
 		if errCreated == nil {
+			anyCreatedParsed = true
 			if latestCreated.IsZero() || createdAt.After(latestCreated) {
 				latestCreated = createdAt
 				meta.CreatedAt = createdAt
 				meta.DisregardIfFixable = entry.DisregardIfFixable
+				latestHasExpiry = entry.Expires != ""
 			}
+		} else {
+			allCreatedParsed = false
 		}
 
 		if entry.Expires == "" {
@@ -693,25 +790,57 @@ func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 		}
 	}
 
+	// If the latest ignore entry is permanent (no expiry), discard any
+	// earlier snooze expiry — the user's most recent action overrides the
+	// previous temporary ignores. Only do this when every entry's Created
+	// timestamp parsed, so "latest" is actually reliable.
+	if allCreatedParsed && anyCreatedParsed && !latestHasExpiry {
+		meta.ExpiresAt = time.Time{}
+	}
+
 	return meta
 }
 
-// v1IgnoresToCache converts v1 ignore entries into a cache-friendly map keyed
-// by issue key. Only entries with an expiry or a disregard-if-fixable flag are
-// kept, because those are the only fields the sync uses.
-func v1IgnoresToCache(ignores v1ProjectIgnores) map[string]cache.IgnoreMeta {
+// v1IgnoresToCache converts merged v1 ignore entries into a cache-friendly
+// map keyed by issue key, ready for Store.SaveIgnores. Each key's entries are
+// summarized with maxExpiryIgnoreMeta here — over the full unioned entry set
+// mergeIgnores produced — so the value written to the cache is always the
+// POST-override summary (e.g. ExpiresAt correctly zeroed when the latest
+// entry is a permanent ignore), never a conflated max-expiry. That is what
+// stops a permanent ignore's zero expiry from being resurrected by a stale
+// cached snooze in a future merge.
+//
+// Only entries with an expiry or a disregard-if-fixable flag are kept — a
+// summary of ExpiresAt zero and DisregardIfFixable false (a plain permanent
+// ignore) is intentionally not cached, because an absent cache entry plus
+// issue.Ignored=true already maps to a permanent ignore, so there is nothing
+// worth persisting and nothing that could poison a future merge.
+//
+// apiConfirmedKeys is the set of issue keys the live API actually reported
+// this run. A key that is NOT in apiConfirmedKeys survived into ignores
+// solely via the cached side (the API didn't mention it this run), so its
+// cache.IgnoreMeta keeps the original updated_at from previousUpdatedAt
+// instead of being refreshed — otherwise every run would stamp "now" on
+// every entry and ignoreEntryTTL eviction would never fire. Confirmed keys
+// get UpdatedAt left at its zero value, so Store.SaveIgnores stamps them with
+// "now".
+func v1IgnoresToCache(ignores v1ProjectIgnores, apiConfirmedKeys map[string]struct{}, previousUpdatedAt map[string]time.Time) map[string]cache.IgnoreMeta {
 	out := make(map[string]cache.IgnoreMeta, len(ignores))
 	for issueKey, entries := range ignores {
 		meta := maxExpiryIgnoreMeta(entries)
 		if meta.ExpiresAt.IsZero() && !meta.DisregardIfFixable {
 			continue
 		}
-		out[issueKey] = cache.IgnoreMeta{
+		entry := cache.IgnoreMeta{
 			IssueKey:           issueKey,
 			ExpiresAt:          meta.ExpiresAt,
 			DisregardIfFixable: meta.DisregardIfFixable,
 			CreatedAt:          meta.CreatedAt,
 		}
+		if _, confirmed := apiConfirmedKeys[issueKey]; !confirmed {
+			entry.UpdatedAt = previousUpdatedAt[issueKey]
+		}
+		out[issueKey] = entry
 	}
 	return out
 }
@@ -919,9 +1048,20 @@ func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixa
 		if disregardIfFixable {
 			return model.FindingAwaitingFix
 		}
-		if !ignoreExpiresAt.IsZero() && time.Now().Before(ignoreExpiresAt) {
+		if !ignoreExpiresAt.IsZero() {
+			// Both an active snooze and an expired-but-still-ignored snooze
+			// map to FindingOpen (Todo), for two different reasons:
+			//   - active snooze: the user intentionally silenced this for
+			//     now, so the ticket should stay open rather than cancelled.
+			//   - expired snooze: Snyk still reports ignored=true even
+			//     though the expiry has passed. Snyk will eventually flip
+			//     ignored=false or the user will re-snooze. Mapping to
+			//     FindingIgnored (Cancelled) here would trigger the reopen
+			//     guard when the snooze lapses or is re-applied, creating
+			//     duplicate tickets.
 			return model.FindingOpen
 		}
+		// No expiry metadata — permanent ignore.
 		return model.FindingIgnored
 	}
 
@@ -1068,7 +1208,7 @@ func anyFixable(coords []coordinate, ok func(coordinate) bool) bool {
 // selectCVSS picks a single CVSS score to display from the severities Snyk
 // reports for an issue. Snyk may emit several entries from different sources
 // (e.g. "Snyk", "NVD", "Red Hat") and CVSS versions (3.1, 4.0). We prefer a
-// NVD score, then Red Hat, then Snyk, then any other source; within a source
+// Snyk score, then Red Hat, then NVD, then any other source; within a source
 // we take the highest score so a more severe, well-sourced score wins. 0 is
 // returned (and the renderer omits the line) when Snyk reports no scores —
 // which is legitimate for non-vulnerability issue types.
@@ -1228,21 +1368,39 @@ func sourceLocation(coords []coordinate) sourceLocationRepresentation {
 // Line numbers and commit SHAs are deliberately excluded: they churn on
 // every refactor and would orphan tickets. The file path / package identity
 // is the stable "occurrence site."
+//
+// When an issue carries multiple coordinates/representations, Snyk does not
+// guarantee their ordering is stable across API calls. Picking "whichever
+// comes first" therefore made the fingerprint flip between runs, orphaning
+// the old Linear ticket and creating a duplicate. To keep the key
+// deterministic we instead collect every candidate location string (still
+// preferring a representation's source file over its dependency, as before)
+// and pick the lexicographically smallest one. This is a one-time fingerprint
+// shift for existing multi-coordinate tickets that happened to be created
+// under "first wins" with a non-minimal candidate — acceptable, since the
+// vast majority of issues have a single coordinate and are unaffected.
 func locationKey(coords []coordinate) string {
+	var candidates []string
 	for _, coord := range coords {
 		for _, rep := range coord.Representations {
 			if rep.SourceLocation.File != "" {
-				return rep.SourceLocation.File
+				candidates = append(candidates, rep.SourceLocation.File)
+				continue
 			}
 			if rep.Dependency.PackageName != "" {
 				if rep.Dependency.PackageVersion != "" {
-					return rep.Dependency.PackageName + "@" + rep.Dependency.PackageVersion
+					candidates = append(candidates, rep.Dependency.PackageName+"@"+rep.Dependency.PackageVersion)
+				} else {
+					candidates = append(candidates, rep.Dependency.PackageName)
 				}
-				return rep.Dependency.PackageName
 			}
 		}
 	}
-	return ""
+	if len(candidates) == 0 {
+		return ""
+	}
+	slices.Sort(candidates)
+	return candidates[0]
 }
 
 // isActiveProjectStatus returns true for projects that are being monitored.

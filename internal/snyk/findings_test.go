@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/RichardoC/snyk-linear-sync/internal/cache"
 	"github.com/RichardoC/snyk-linear-sync/internal/model"
 )
 
@@ -37,15 +39,19 @@ func TestMapStatusPermanentIgnoreCancelled(t *testing.T) {
 	}
 }
 
-func TestMapStatusExpiredIgnoreCancelled(t *testing.T) {
+func TestMapStatusExpiredIgnoreKeepsOpen(t *testing.T) {
+	// When a snooze expires but Snyk still reports ignored=true, the sync
+	// should treat the finding as open (not ignored) to prevent flapping.
+	// Mapping to FindingIgnored (Cancelled) would trigger the reopen guard
+	// when the snooze is re-applied, creating duplicate tickets.
 	past := time.Now().Add(-24 * time.Hour)
 	issue := issueAttributes{
 		Ignored: true,
 		Status:  "open",
 	}
 	got := mapStatus(issue, past, false)
-	if got != model.FindingIgnored {
-		t.Fatalf("mapStatus() = %q, want %q for expired temporary ignore", got, model.FindingIgnored)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus() = %q, want %q for expired temporary ignore (snooze expired but still ignored)", got, model.FindingOpen)
 	}
 }
 
@@ -149,13 +155,13 @@ func TestMaxExpiryIgnoreMeta(t *testing.T) {
 			},
 		},
 		{
-			name: "latest has no expiry still uses max expiry",
+			name: "latest permanent ignore overrides earlier snooze expiry",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z"},
 				{Created: "2026-04-01T12:00:00Z", Expires: ""},
 			},
 			want: ignoreMetadata{
-				ExpiresAt: time.Date(2026, time.April, 18, 12, 0, 0, 0, time.UTC),
+				ExpiresAt: time.Time{}, // permanent ignore — no expiry
 				CreatedAt: time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
 			},
 		},
@@ -170,6 +176,18 @@ func TestMaxExpiryIgnoreMeta(t *testing.T) {
 			},
 		},
 		{
+			name: "multiple snoozes all expired picks max expiry",
+			entries: []v1IgnoreEntry{
+				{Created: "2026-04-10T17:14:57Z", Expires: "2026-04-29T00:00:00Z"},
+				{Created: "2026-05-29T09:35:35Z", Expires: "2026-06-11T00:00:00Z"},
+				{Created: "2026-07-02T15:01:44Z", Expires: "2026-07-15T23:00:00Z"},
+			},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.July, 15, 23, 0, 0, 0, time.UTC),
+				CreatedAt: time.Date(2026, time.July, 2, 15, 1, 44, 0, time.UTC),
+			},
+		},
+		{
 			name: "disregardIfFixable from latest created entry",
 			entries: []v1IgnoreEntry{
 				{Created: "2026-03-18T12:00:00Z", Expires: "2026-04-18T12:00:00Z", DisregardIfFixable: true},
@@ -179,6 +197,36 @@ func TestMaxExpiryIgnoreMeta(t *testing.T) {
 				ExpiresAt:          time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC),
 				CreatedAt:          time.Date(2026, time.April, 1, 12, 0, 0, 0, time.UTC),
 				DisregardIfFixable: false,
+			},
+		},
+		{
+			// Fix 4: a single entry with a legitimate future expiry but an
+			// empty/unparseable Created must NOT have its expiry zeroed. With
+			// only one entry we can't determine "latest" reliably (Created
+			// didn't parse), so the permanent-override must be skipped
+			// entirely rather than defaulting to "no expiry seen yet".
+			name: "unparseable created with future expiry keeps expiry",
+			entries: []v1IgnoreEntry{
+				{Created: "", Expires: "2026-08-18T12:00:00Z"},
+			},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC),
+			},
+		},
+		{
+			// Fix 4: one entry parses fine and looks like a permanent ignore,
+			// but another entry has an unparseable Created and a real expiry.
+			// We can't reliably tell which entry is actually latest, so the
+			// ambiguous case must NOT zero the expiry — that would silently
+			// convert an active snooze into a permanent ignore.
+			name: "ambiguous latest entry due to unparseable created keeps expiry",
+			entries: []v1IgnoreEntry{
+				{Created: "2026-03-18T12:00:00Z", Expires: ""},
+				{Created: "", Expires: "2026-08-18T12:00:00Z"},
+			},
+			want: ignoreMetadata{
+				ExpiresAt: time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC),
+				CreatedAt: time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC),
 			},
 		},
 	}
@@ -464,14 +512,18 @@ func TestMergeIgnoresPicksLatestExpiry(t *testing.T) {
 	if !ok {
 		t.Fatal("merged missing SNYK-1")
 	}
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
+	// mergeIgnores now returns the union of raw entries rather than a single
+	// synthetic entry, so the two distinct (Created, Expires) pairs are both
+	// preserved; maxExpiryIgnoreMeta is what summarizes them.
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
 	}
-	if entries[0].Expires != "2026-06-17T23:00:00Z" {
-		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	meta := maxExpiryIgnoreMeta(entries)
+	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", meta.ExpiresAt.Format(time.RFC3339))
 	}
-	if entries[0].Created != "2026-06-01T00:00:00Z" {
-		t.Fatalf("created = %q, want 2026-06-01T00:00:00Z (latest created from API)", entries[0].Created)
+	if meta.CreatedAt.Format(time.RFC3339) != "2026-06-01T00:00:00Z" {
+		t.Fatalf("created = %q, want 2026-06-01T00:00:00Z (latest created from API)", meta.CreatedAt.Format(time.RFC3339))
 	}
 }
 
@@ -523,11 +575,235 @@ func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
 	if !ok {
 		t.Fatal("ignores missing SNYK-1")
 	}
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
+	// mergeIgnores now returns the deduplicated union of raw entries seen
+	// across attempts rather than a single synthetic entry, so both distinct
+	// expiries observed across the flaky attempts survive; maxExpiryIgnoreMeta
+	// is what picks the maximum.
+	meta := maxExpiryIgnoreMeta(entries)
+	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", meta.ExpiresAt.Format(time.RFC3339))
 	}
-	if entries[0].Expires != "2026-06-17T23:00:00Z" {
-		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+}
+
+// TestFetchProjectIgnoresRetriesOn404 verifies Fix 3: a 404 from the v1
+// ignores endpoint is retried like any other failure instead of being
+// accepted immediately. The server 404s on the first attempt and returns
+// real data on the remaining attempts (fetchProjectIgnoresWithRetry always
+// runs all maxAttempts to find the max expiry, it doesn't stop at the first
+// success), so the retry must recover the data rather than returning empty.
+func TestFetchProjectIgnoresRetriesOn404(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		body := map[string][]v1IgnoreEntry{
+			"SNYK-1": {{Created: "2026-06-01T00:00:00Z", Expires: "2026-06-17T23:00:00Z"}},
+		}
+		if err := json.NewEncoder(w).Encode(body); err != nil {
+			t.Fatalf("encode mock response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("fetchProjectIgnores() error = %v", err)
+	}
+	if requestCount != 3 {
+		t.Fatalf("requestCount = %d, want 3 (404 on attempt 1 must be retried, not accepted immediately)", requestCount)
+	}
+
+	meta := maxExpiryIgnoreMeta(ignores["SNYK-1"])
+	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z (data from the retries after the 404 must survive)", meta.ExpiresAt.Format(time.RFC3339))
+	}
+}
+
+// TestFetchProjectIgnoresLater404KeepsEarlierAttemptsData verifies the
+// existing non-fatal behavior is preserved: if an earlier attempt returned
+// real data and a later attempt 404s, the earlier data must not be erased.
+func TestFetchProjectIgnoresLater404KeepsEarlierAttemptsData(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			body := map[string][]v1IgnoreEntry{
+				"SNYK-1": {{Created: "2026-06-01T00:00:00Z", Expires: "2026-06-17T23:00:00Z"}},
+			}
+			if err := json.NewEncoder(w).Encode(body); err != nil {
+				t.Fatalf("encode mock response: %v", err)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("fetchProjectIgnores() error = %v", err)
+	}
+	if requestCount != 3 {
+		t.Fatalf("requestCount = %d, want 3", requestCount)
+	}
+
+	meta := maxExpiryIgnoreMeta(ignores["SNYK-1"])
+	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z (a later 404 must not erase an earlier attempt's data)", meta.ExpiresAt.Format(time.RFC3339))
+	}
+}
+
+// TestFetchProjectIgnoresPersistent404IsNonFatal verifies that if every
+// attempt 404s, fetchProjectIgnores still succeeds non-fatally with an empty
+// result (relying on the cache merge / caller fallback), matching the
+// pre-existing behavior — it just now gets there after retrying instead of
+// accepting the first 404.
+func TestFetchProjectIgnoresPersistent404IsNonFatal(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("fetchProjectIgnores() error = %v, want nil (persistent 404 is non-fatal)", err)
+	}
+	if requestCount != 3 {
+		t.Fatalf("requestCount = %d, want 3 (404 must be retried like any other failure)", requestCount)
+	}
+	if len(ignores) != 0 {
+		t.Fatalf("ignores = %+v, want empty", ignores)
+	}
+}
+
+// TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys is the
+// findings.go-level integration test for Fix 2: an issue key that is present
+// in the cache but NOT reported by the API this run must keep its original
+// cached updated_at (so it eventually ages out past ignoreEntryTTL), while a
+// key the API does confirm this run gets its updated_at refreshed.
+func TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys(t *testing.T) {
+	dir := t.TempDir()
+	store, err := cache.Open(filepath.Join(dir, "cache.db"))
+	if err != nil {
+		t.Fatalf("cache.Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	projectID := "test-project"
+
+	staleUpdatedAt := time.Now().UTC().Add(-3 * 24 * time.Hour).Truncate(time.Second)
+	seeded := map[string]cache.IgnoreMeta{
+		"SNYK-STALE": {
+			IssueKey:  "SNYK-STALE",
+			ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			CreatedAt: time.Now().UTC().Add(-48 * time.Hour),
+			UpdatedAt: staleUpdatedAt,
+		},
+		"SNYK-CONFIRMED": {
+			IssueKey:  "SNYK-CONFIRMED",
+			ExpiresAt: time.Now().UTC().Add(24 * time.Hour),
+			CreatedAt: time.Now().UTC().Add(-48 * time.Hour),
+			UpdatedAt: staleUpdatedAt,
+		},
+	}
+	if err := store.SaveIgnores(ctx, projectID, seeded); err != nil {
+		t.Fatalf("seed SaveIgnores() error = %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Only SNYK-CONFIRMED is reported by the API this run; SNYK-STALE is
+		// not mentioned at all, so it must be carried over from the cache.
+		body := map[string][]v1IgnoreEntry{
+			"SNYK-CONFIRMED": {
+				{Created: time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339), Expires: time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339)},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(body); err != nil {
+			t.Fatalf("encode mock response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cache:      store,
+	}
+
+	if _, err := c.fetchProjectIgnores(ctx, projectID); err != nil {
+		t.Fatalf("fetchProjectIgnores() error = %v", err)
+	}
+
+	loaded, err := store.LoadIgnores(ctx, projectID)
+	if err != nil {
+		t.Fatalf("LoadIgnores() error = %v", err)
+	}
+
+	stale, ok := loaded["SNYK-STALE"]
+	if !ok {
+		t.Fatal("SNYK-STALE missing after round trip")
+	}
+	if !stale.UpdatedAt.Equal(staleUpdatedAt) {
+		t.Fatalf("SNYK-STALE UpdatedAt = %v, want unchanged %v (not confirmed by API this run, so TTL clock must keep ticking)", stale.UpdatedAt, staleUpdatedAt)
+	}
+
+	confirmed, ok := loaded["SNYK-CONFIRMED"]
+	if !ok {
+		t.Fatal("SNYK-CONFIRMED missing after round trip")
+	}
+	if !confirmed.UpdatedAt.After(staleUpdatedAt) {
+		t.Fatalf("SNYK-CONFIRMED UpdatedAt = %v, want refreshed after %v (confirmed by API this run)", confirmed.UpdatedAt, staleUpdatedAt)
 	}
 }
 
@@ -544,16 +820,17 @@ func TestMergeIgnoresUsesLatestCreatedFromAPI(t *testing.T) {
 	if !ok {
 		t.Fatal("merged missing SNYK-1")
 	}
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
 	}
-	if entries[0].Expires != "2026-06-17T23:00:00Z" {
-		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	meta := maxExpiryIgnoreMeta(entries)
+	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
+		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", meta.ExpiresAt.Format(time.RFC3339))
 	}
-	if entries[0].Created != "2026-06-15T00:00:00Z" {
-		t.Fatalf("created = %q, want 2026-06-15T00:00:00Z (latest created from API)", entries[0].Created)
+	if meta.CreatedAt.Format(time.RFC3339) != "2026-06-15T00:00:00Z" {
+		t.Fatalf("created = %q, want 2026-06-15T00:00:00Z (latest created from API)", meta.CreatedAt.Format(time.RFC3339))
 	}
-	if !entries[0].DisregardIfFixable {
+	if !meta.DisregardIfFixable {
 		t.Fatalf("DisregardIfFixable = false, want true (from latest created API entry)")
 	}
 }
@@ -574,6 +851,94 @@ func TestMergeIgnoresKeepsCachedKeyWhenMissingFromAPI(t *testing.T) {
 	}
 	if entries[0].Expires != "2026-06-17T23:00:00Z" {
 		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z", entries[0].Expires)
+	}
+}
+
+// TestMergeIgnoresUnionResurrectsStaleExpiry reproduces the core bug: the API
+// now correctly reports the latest action as a permanent ignore (an entry
+// with no Expires, created after the old snooze), but the cache still holds
+// the earlier snooze's expiry. Summarizing each side independently and then
+// taking max(ExpiresAt) would resurrect the stale expiry; unioning the raw
+// entries and letting maxExpiryIgnoreMeta run once over the whole set must
+// not.
+func TestMergeIgnoresUnionResurrectsStaleExpiry(t *testing.T) {
+	api := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{
+			{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"},
+			{Created: "2026-07-01T00:00:00Z", Expires: ""}, // latest action: permanent ignore
+		},
+	}
+	cached := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{
+			{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"},
+		},
+	}
+
+	merged := mergeIgnores(api, cached)
+	meta := maxExpiryIgnoreMeta(merged["SNYK-1"])
+	if !meta.ExpiresAt.IsZero() {
+		t.Fatalf("ExpiresAt = %v, want zero (latest action is a permanent ignore)", meta.ExpiresAt)
+	}
+}
+
+// TestMergeIgnoresRetryUnionResurrectsStaleExpiry reproduces the same bug via
+// the retry path inside fetchProjectIgnoresWithRetry: attempt 1 sees only the
+// old snooze, attempt 2 sees the snooze plus the newer permanent ignore. The
+// accumulated apiIgnores must end up with a zero expiry.
+func TestMergeIgnoresRetryUnionResurrectsStaleExpiry(t *testing.T) {
+	attempt1 := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{
+			{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"},
+		},
+	}
+	attempt2 := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{
+			{Created: "2026-05-29T00:00:00Z", Expires: "2026-06-17T23:00:00Z"},
+			{Created: "2026-07-01T00:00:00Z", Expires: ""},
+		},
+	}
+
+	var apiIgnores v1ProjectIgnores
+	apiIgnores = mergeIgnores(apiIgnores, attempt1)
+	apiIgnores = mergeIgnores(apiIgnores, attempt2)
+
+	meta := maxExpiryIgnoreMeta(apiIgnores["SNYK-1"])
+	if !meta.ExpiresAt.IsZero() {
+		t.Fatalf("ExpiresAt = %v, want zero (latest attempt reported a permanent ignore)", meta.ExpiresAt)
+	}
+}
+
+// TestMergeIgnoresPreferAPIOnCreatedTie reproduces a previously-poisoned
+// cache: the cache holds an entry {Created: X, Expires: stale} (itself the
+// product of an earlier conflated merge), while the live API now cleanly
+// reports {Created: X, no expiry} for that same moment. On an exact Created
+// tie with conflicting Expires, the API entry (first argument to
+// mergeIgnores) must win the "latest entry" determination so the merged
+// result is a clean permanent ignore and the poisoned cached entry cannot
+// keep resurrecting itself.
+func TestMergeIgnoresPreferAPIOnCreatedTie(t *testing.T) {
+	api := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{
+			{Created: "2026-07-01T00:00:00Z", Expires: ""},
+		},
+	}
+	cached := v1ProjectIgnores{
+		"SNYK-1": []v1IgnoreEntry{
+			{Created: "2026-07-01T00:00:00Z", Expires: "2026-08-01T00:00:00Z"},
+		},
+	}
+
+	merged := mergeIgnores(api, cached)
+	meta := maxExpiryIgnoreMeta(merged["SNYK-1"])
+	if !meta.ExpiresAt.IsZero() {
+		t.Fatalf("ExpiresAt = %v, want zero (API's permanent ignore wins the Created tie)", meta.ExpiresAt)
+	}
+
+	// The same cache-write-back path (v1IgnoresToCache) must also see the
+	// clean, zeroed result rather than the stale conflated expiry.
+	cacheOut := v1IgnoresToCache(merged, map[string]struct{}{"SNYK-1": {}}, nil)
+	if got, ok := cacheOut["SNYK-1"]; ok && !got.ExpiresAt.IsZero() {
+		t.Fatalf("cached ExpiresAt = %v, want zero or absent", got.ExpiresAt)
 	}
 }
 
@@ -630,6 +995,36 @@ func TestLocationKey(t *testing.T) {
 			[]coordinate{{}},
 			"",
 		},
+		{
+			// Fix 5: multiple coordinates, file order A, C.
+			"multiple coordinates order A",
+			[]coordinate{
+				{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "z/file.py"}}}},
+				{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "a/file.py"}}}},
+			},
+			"a/file.py",
+		},
+		{
+			// Fix 5: same two coordinates, order flipped — must produce the
+			// identical key as "multiple coordinates order A" above, since
+			// Snyk does not guarantee coordinate ordering is stable across
+			// API calls.
+			"multiple coordinates order B (reversed)",
+			[]coordinate{
+				{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "a/file.py"}}}},
+				{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "z/file.py"}}}},
+			},
+			"a/file.py",
+		},
+		{
+			// Fix 5: same nondeterminism risk for dependency coordinates.
+			"multiple dependency coordinates, order-independent",
+			[]coordinate{
+				{Representations: []representation{{Dependency: dependencyRepresentation{PackageName: "zeta", PackageVersion: "1.0.0"}}}},
+				{Representations: []representation{{Dependency: dependencyRepresentation{PackageName: "alpha", PackageVersion: "2.0.0"}}}},
+			},
+			"alpha@2.0.0",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -638,5 +1033,29 @@ func TestLocationKey(t *testing.T) {
 				t.Fatalf("locationKey() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestLocationKeyDeterministicAcrossCoordinateOrder is a focused regression
+// test for Fix 5: given the same set of coordinates in any order, locationKey
+// must always return the same key. Snyk's issue coordinates/representations
+// ordering is not guaranteed stable across API calls; picking "whichever
+// comes first" made the fingerprint flip between runs, orphaning the old
+// Linear ticket and creating a duplicate.
+func TestLocationKeyDeterministicAcrossCoordinateOrder(t *testing.T) {
+	forward := []coordinate{
+		{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "src/b.py"}}}},
+		{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "src/a.py"}}}},
+		{Representations: []representation{{SourceLocation: sourceLocationRepresentation{File: "src/c.py"}}}},
+	}
+	reversed := []coordinate{forward[2], forward[1], forward[0]}
+
+	gotForward := locationKey(forward)
+	gotReversed := locationKey(reversed)
+	if gotForward != gotReversed {
+		t.Fatalf("locationKey() not order-independent: forward = %q, reversed = %q", gotForward, gotReversed)
+	}
+	if gotForward != "src/a.py" {
+		t.Fatalf("locationKey() = %q, want lexicographically smallest %q", gotForward, "src/a.py")
 	}
 }

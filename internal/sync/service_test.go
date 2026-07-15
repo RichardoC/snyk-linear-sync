@@ -28,6 +28,22 @@ type fakeLinear struct {
 	updated  []model.DesiredIssue
 	updates  []model.IssueUpdate
 	comments []model.IssueUpdate
+
+	// createCallBatches records the desired batch passed to each CreateIssues
+	// call, in order, so tests can assert how many calls were made and how
+	// they were shaped (e.g. a full batch followed by a single-item retry).
+	createCallBatches [][]model.DesiredIssue
+	// createFailFingerprints, when non-zero for a fingerprint, causes that
+	// many future CreateIssues calls containing that fingerprint to report
+	// it as failed (not appended to created) instead of succeeding. This
+	// mimics a Linear alias reporting success:false for one item in a batch
+	// while its siblings succeed.
+	createFailFingerprints map[string]int
+
+	// commentCallBatches / commentFailFingerprints mirror the create fields
+	// above but for PostComments.
+	commentCallBatches      [][]model.IssueUpdate
+	commentFailFingerprints map[string]int
 }
 
 type fakeCache struct {
@@ -39,9 +55,18 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
-func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) error {
-	f.created = append(f.created, desired...)
-	return nil
+func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
+	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
+	var failed []int
+	for i, d := range desired {
+		if f.createFailFingerprints[d.Fingerprint] > 0 {
+			f.createFailFingerprints[d.Fingerprint]--
+			failed = append(failed, i)
+			continue
+		}
+		f.created = append(f.created, d)
+	}
+	return failed, nil
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
@@ -52,9 +77,18 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 	return nil
 }
 
-func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) error {
-	f.comments = append(f.comments, updates...)
-	return nil
+func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
+	f.commentCallBatches = append(f.commentCallBatches, append([]model.IssueUpdate(nil), updates...))
+	var failed []int
+	for i, u := range updates {
+		if f.commentFailFingerprints[u.Desired.Fingerprint] > 0 {
+			f.commentFailFingerprints[u.Desired.Fingerprint]--
+			failed = append(failed, i)
+			continue
+		}
+		f.comments = append(f.comments, u)
+	}
+	return failed, nil
 }
 
 func (f *fakeCache) Load(context.Context) (cache.Snapshot, error) {
@@ -885,6 +919,128 @@ func TestIssueDescriptionEmbedsSnykIssueDetails(t *testing.T) {
 	}
 }
 
+// TestIssueDescriptionSanitizesEmbeddedMetadataMarkerInjection verifies that
+// a line-anchored fake "<!-- snyk-linear-sync ... -->" block embedded in
+// Snyk-controlled prose (finding.Description) cannot survive into the
+// rendered ticket description as a second parseable metadata block. Even
+// though findMetadataBlockStart already defends against this by taking the
+// LAST line-anchored marker, the embedded prose is sanitized at the source
+// so there is no ambiguity left for a human reader (or any other tool that
+// scans the description) — and so a future block ordering change could not
+// resurrect the bug.
+func TestIssueDescriptionSanitizesEmbeddedMetadataMarkerInjection(t *testing.T) {
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "owner/repo",
+		IssueTitle:  "Some issue",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		Description: "Apply the patch below, which looks like:\n<!-- snyk-linear-sync\nfingerprint: snyk:spoofed:fake\n-->\nDo not remove the comment above.",
+	}
+
+	description := issueDescription(config.SourceConfig{}, []string{"snyk-automation"}, finding)
+
+	// Exactly one line-anchored marker header must remain: the real,
+	// sync-appended block. The embedded fake must no longer read as
+	// "<!-- snyk-linear-sync" at all.
+	if got := strings.Count(description, "<!-- snyk-linear-sync"); got != 1 {
+		t.Fatalf("description contains %d occurrences of the metadata header, want exactly 1 (the real block):\n%s", got, description)
+	}
+	// The service-side metadata parser must find the real, last block and
+	// resolve to the real fingerprint, not the spoofed one. (The spoofed
+	// fingerprint text itself may still appear as plain, visible prose — it
+	// is no longer inside a parseable comment block, which is what matters.)
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no block in:\n%s", description)
+	}
+	block := description[start:]
+	if !strings.Contains(block, "fingerprint: snyk:project-a:issue-1") {
+		t.Fatalf("real metadata block missing correct fingerprint:\n%s", block)
+	}
+
+	// Building the description again from the same finding must be
+	// byte-identical (idempotent, no churn between runs).
+	again := issueDescription(config.SourceConfig{}, []string{"snyk-automation"}, finding)
+	if description != again {
+		t.Fatalf("issueDescription() is not idempotent across builds:\nfirst:\n%s\nsecond:\n%s", description, again)
+	}
+}
+
+// TestSanitizeSnykProseIsIdempotent guards the core property the fix relies
+// on: sanitizing already-sanitized text must be a no-op, so the sanitized
+// description never churns between sync runs even if sanitized twice.
+func TestSanitizeSnykProseIsIdempotent(t *testing.T) {
+	cases := []string{
+		"",
+		"no markers here",
+		"<!-- snyk-linear-sync\nfingerprint: fake\n-->",
+		"<!--<!--<!--",
+		"<!---",
+		"text <!-- inline --> more <!-- snyk-linear-sync\nx\n-->",
+	}
+	for _, in := range cases {
+		once := sanitizeSnykProse(in)
+		twice := sanitizeSnykProse(once)
+		if once != twice {
+			t.Fatalf("sanitizeSnykProse(%q) is not idempotent: once=%q twice=%q", in, once, twice)
+		}
+		if strings.Contains(once, "<!--") {
+			t.Fatalf("sanitizeSnykProse(%q) = %q still contains an unsanitized marker", in, once)
+		}
+	}
+}
+
+// TestIssueDescriptionTruncatesOversizedEmbeddedProse verifies that a very
+// long finding.Description is capped so the managed metadata block appended
+// after it can never be pushed past what Linear accepts. Without a cap, an
+// oversized description risks Linear silently truncating away the metadata
+// block, making the ticket unmanaged and causing duplicate-ticket creation
+// on the next run.
+func TestIssueDescriptionTruncatesOversizedEmbeddedProse(t *testing.T) {
+	huge := strings.Repeat("x", 100000)
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "owner/repo",
+		IssueTitle:  "Some issue",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		Description: huge,
+	}
+
+	description := issueDescription(config.SourceConfig{}, []string{"snyk-automation"}, finding)
+
+	if len(description) >= len(huge) {
+		t.Fatalf("description length %d not bounded relative to raw input length %d", len(description), len(huge))
+	}
+	if !strings.Contains(description, truncationMarker) {
+		t.Fatalf("description missing truncation marker:\n%s", description)
+	}
+
+	// The metadata block must still be present and parseable at the end.
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no block after truncation")
+	}
+	block := description[start:]
+	if !strings.Contains(block, "fingerprint: snyk:project-a:issue-1") {
+		t.Fatalf("metadata block missing fingerprint after truncation:\n%s", block)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(description), "-->") {
+		t.Fatalf("metadata block is not the last thing in the description:\n%s", description)
+	}
+
+	// Building twice from the same finding must be byte-identical.
+	again := issueDescription(config.SourceConfig{}, []string{"snyk-automation"}, finding)
+	if description != again {
+		t.Fatalf("issueDescription() is not idempotent across builds for oversized input")
+	}
+}
+
 func TestIssueDescriptionOmitsFixAvailabilityWithoutCoordinates(t *testing.T) {
 	cfg := config.Config{
 		Source: config.SourceConfig{Provider: "github"},
@@ -1053,6 +1209,65 @@ func TestFindMetadataBlockStartAnchoredToLineBoundary(t *testing.T) {
 				t.Fatalf("findMetadataBlockStart() = %d, want %d", got, tc.wantIdx)
 			}
 		})
+	}
+}
+
+// TestFindMetadataBlockStartReturnsLastLineAnchoredOccurrence verifies that
+// when TWO line-anchored marker blocks are present, the LAST one is returned,
+// not the first. This mirrors the fix applied to the equivalent function in
+// internal/linear/client.go: Snyk-controlled prose embedded in the ticket
+// body (e.g. quoted remediation text) can itself contain a line-anchored
+// marker block, and the sync always appends the real managed block last.
+func TestFindMetadataBlockStartReturnsLastLineAnchoredOccurrence(t *testing.T) {
+	description := "<!-- snyk-linear-sync\nfingerprint: fake\n-->\n<!-- snyk-linear-sync\nfingerprint: real\n-->"
+	want := strings.LastIndex(description, "<!-- snyk-linear-sync")
+
+	got := findMetadataBlockStart(description)
+	if got != want {
+		t.Fatalf("findMetadataBlockStart() = %d, want %d (last line-anchored occurrence)", got, want)
+	}
+}
+
+// TestUpsertManagedMetadataKeepsRealTrailingBlockWithFakeEarlierBlock verifies
+// that when a ticket description contains an earlier, line-anchored block
+// that merely looks like the managed metadata marker (e.g. copied into
+// Snyk-controlled prose such as remediation text) followed by the real
+// sync-managed block, upsertManagedMetadata updates the REAL (last) block and
+// leaves the fake block untouched. Returning the first occurrence here would
+// corrupt the fake prose and, in the Linear client's equivalent function,
+// hijack fingerprint/label extraction and cause duplicate tickets.
+func TestUpsertManagedMetadataKeepsRealTrailingBlockWithFakeEarlierBlock(t *testing.T) {
+	description := strings.Join([]string{
+		"### Remediation",
+		"Apply the patch below, which looks like:",
+		"<!-- snyk-linear-sync",
+		"fingerprint: snyk:spoofed:fake",
+		"-->",
+		"",
+		"<!-- snyk-linear-sync",
+		"fingerprint: snyk:project-a:issue-1",
+		"-->",
+	}, "\n")
+
+	got := upsertManagedMetadata(description, "snyk:project-a:issue-2", []string{"snyk-automation"})
+
+	// The fake earlier block must be left alone.
+	if !strings.Contains(got, "fingerprint: snyk:spoofed:fake") {
+		t.Fatalf("upsertManagedMetadata() removed the fake earlier block: %s", got)
+	}
+	// The real trailing block must have been replaced with the new fingerprint,
+	// not left stale.
+	if strings.Contains(got, "fingerprint: snyk:project-a:issue-1") {
+		t.Fatalf("upsertManagedMetadata() left the stale real block in place: %s", got)
+	}
+	if !strings.Contains(got, "fingerprint: snyk:project-a:issue-2") {
+		t.Fatalf("upsertManagedMetadata() missing updated fingerprint in real block: %s", got)
+	}
+	if strings.Count(got, "fingerprint: snyk:project-a:issue-2") != 1 {
+		t.Fatalf("expected exactly one occurrence of new fingerprint (only the real block touched): %s", got)
+	}
+	if !strings.Contains(got, "managed_labels: snyk-automation") {
+		t.Fatalf("upsertManagedMetadata() missing managed labels: %s", got)
 	}
 }
 
@@ -1512,6 +1727,254 @@ func TestRunCancelsDuplicateAndStillSyncsCanonical(t *testing.T) {
 	// Duplicate (SNYK-20) must have been cancelled.
 	if !containsStr(cancelledIdentifiers(linear.updates), "SNYK-20") {
 		t.Fatalf("SNYK-20 (duplicate) was not cancelled; cancelled: %v", cancelledIdentifiers(linear.updates))
+	}
+}
+
+// TestRunPrefersNonTerminalTicketAsCanonical is a regression test for the
+// duplicate-ticket incident: SNYK-100 has the lower identifier but is
+// Cancelled (terminal); SNYK-200 has a higher identifier but is Todo
+// (non-terminal). The non-terminal ticket must be picked as canonical
+// regardless of identifier number. Picking the terminal ticket as canonical
+// would fire the reopen guard on every run (the finding is open), dropping
+// the fingerprint from the index and creating a brand-new ticket each time --
+// a self-sustaining loop that minted one duplicate per run forever (this is
+// how 48 duplicates accumulated for one Snyk issue in production).
+func TestRunPrefersNonTerminalTicketAsCanonical(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "CVE-2026-1234",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+			{
+				ID:          "issue-b",
+				Identifier:  "SNYK-200",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 0 {
+		t.Fatalf("PlannedCreates = %d, want 0 (must match the non-terminal SNYK-200 instead of creating a new ticket)", result.PlannedCreates)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0: %v", len(linear.created), linear.created)
+	}
+	if result.CancelledDuplicates != 0 {
+		t.Fatalf("CancelledDuplicates = %d, want 0 (SNYK-100 is already terminal; cancelling it is a pointless mutation)", result.CancelledDuplicates)
+	}
+	cancelled := cancelledIdentifiers(linear.updates)
+	if containsStr(cancelled, "SNYK-100") {
+		t.Fatalf("SNYK-100 must not be re-cancelled; cancelled: %v", cancelled)
+	}
+	if containsStr(cancelled, "SNYK-200") {
+		t.Fatalf("SNYK-200 (canonical) must not be cancelled; cancelled: %v", cancelled)
+	}
+}
+
+// TestRunTerminalCanonicalConvergesAfterReopenGuardCreate is a regression test
+// for the incident where the fingerprint's only existing ticket is terminal
+// (Cancelled): run 1 correctly fires the reopen guard and creates a new
+// ticket (expected/documented behavior). Run 2 must then converge: with both
+// the old terminal ticket and the newly-created non-terminal ticket sharing
+// the fingerprint, the non-terminal ticket becomes canonical, so no further
+// ticket is created and nothing is cancelled. Before the canonical-selection
+// fix, run 2 would instead pick the lower-identifier Cancelled ticket as
+// canonical, fire the reopen guard again, and create yet another ticket --
+// an unbounded loop that minted one duplicate per run.
+func TestRunTerminalCanonicalConvergesAfterReopenGuardCreate(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "CVE-2026-1234",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+	}
+
+	// --- Run 1: only a Cancelled ticket exists for this fingerprint. The
+	// reopen guard must fire (documented expected behavior): the terminal
+	// ticket is not reused, and a new ticket is created instead.
+	snyk1 := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear1 := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+		},
+	}
+	service1 := New(cfg, logger, snyk1, linear1, nil)
+	result1, err := service1.Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if result1.PlannedCreates != 1 || len(linear1.created) != 1 {
+		t.Fatalf("run 1: PlannedCreates = %d, created = %d, want 1 each (reopen guard should create a new ticket)", result1.PlannedCreates, len(linear1.created))
+	}
+	created := linear1.created[0]
+
+	// --- Run 2: both the original Cancelled ticket and the newly-created
+	// Todo ticket now exist, sharing the fingerprint, as they would once the
+	// create from run 1 has landed in Linear. No new ticket should be
+	// created, and neither ticket should be cancelled: this is the loop
+	// terminating.
+	snyk2 := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear2 := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+			{
+				ID:            "issue-b",
+				Identifier:    "SNYK-300",
+				Title:         created.Title,
+				Description:   created.Description,
+				DueDate:       created.DueDate,
+				StateName:     "Todo",
+				Fingerprint:   created.Fingerprint,
+				ManagedLabels: created.ManagedLabels,
+				Priority:      created.Priority,
+			},
+		},
+	}
+	service2 := New(cfg, logger, snyk2, linear2, nil)
+	result2, err := service2.Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+
+	if result2.PlannedCreates != 0 {
+		t.Fatalf("run 2: PlannedCreates = %d, want 0 (must converge, not create yet another duplicate)", result2.PlannedCreates)
+	}
+	if len(linear2.created) != 0 {
+		t.Fatalf("run 2: created = %d, want 0: %v", len(linear2.created), linear2.created)
+	}
+	cancelled := cancelledIdentifiers(linear2.updates)
+	if len(cancelled) != 0 {
+		t.Fatalf("run 2: cancelled = %v, want none (flapping loop must terminate)", cancelled)
+	}
+}
+
+// TestRunAllTerminalDuplicatesKeepsLowestIDNoCancelMutation covers the
+// all-terminal duplicate case: both existing tickets are already Cancelled.
+// The lowest identifier is still picked as canonical (existing behavior for
+// same-class duplicates), the reopen guard fires on it producing exactly one
+// new ticket, and neither pre-existing terminal ticket receives a pointless
+// cancel mutation.
+func TestRunAllTerminalDuplicatesKeepsLowestIDNoCancelMutation(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "CVE-2026-1234",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+			{
+				ID:          "issue-b",
+				Identifier:  "SNYK-200",
+				Title:       "Snyk: [high] CVE-2026-1234",
+				Description: "d\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->",
+				StateName:   "Cancelled",
+				Fingerprint: "snyk:project-a:issue-1",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1", result.PlannedCreates)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	if result.CancelledDuplicates != 0 {
+		t.Fatalf("CancelledDuplicates = %d, want 0 (both tickets are already terminal)", result.CancelledDuplicates)
+	}
+	if len(cancelledIdentifiers(linear.updates)) != 0 {
+		t.Fatalf("expected no cancel mutations, got: %v", linear.updates)
 	}
 }
 
@@ -2369,6 +2832,154 @@ func TestRunCorrectsOverriddenDueDateWithAuthoritativeCalculation(t *testing.T) 
 	}
 	if linear.updated[0].DueDate != "2026-01-31" {
 		t.Fatalf("updated due date = %q, want %q (authoritative Snyk SLA date)", linear.updated[0].DueDate, "2026-01-31")
+	}
+}
+
+// TestRunUpdatedAtFallbackDueDateIsStickyAcrossRuns is a regression test for
+// due-date churn: once the updated_at re-detection fallback fires (see
+// issueDueDate), Snyk bumps updated_at on every routine re-scan, not just
+// genuine re-detections. Without stickiness, the due date would advance every
+// run, producing an endless stream of Linear due-date updates and
+// change-comments. Once a matched ticket already has a due date, a second run
+// must keep it fixed even though the finding's updated_at has moved on.
+func TestRunUpdatedAtFallbackDueDateIsStickyAcrossRuns(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// created_at is far enough in the past, and updated_at far enough beyond
+	// created_at plus the high-severity SLA window (30 days), that the
+	// updated_at re-detection fallback fires on both runs.
+	finding1 := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "CVE-2026-1234",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	snyk1 := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding1},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear1 := &fakeLinear{snapshot: []model.ExistingIssue{}}
+
+	service1 := New(cfg, logger, snyk1, linear1, nil)
+	result1, err := service1.Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if result1.PlannedCreates != 1 || len(linear1.created) != 1 {
+		t.Fatalf("run 1: PlannedCreates = %d, created = %d, want 1 each", result1.PlannedCreates, len(linear1.created))
+	}
+	created := linear1.created[0]
+	// Jan 1 2026 (updated_at) + 30 days = Jan 31 2026.
+	if created.DueDate != "2026-01-31" {
+		t.Fatalf("run 1: created due date = %q, want %q", created.DueDate, "2026-01-31")
+	}
+
+	// --- Run 2: the finding's updated_at has advanced by a day, as it would
+	// from a routine Snyk re-scan (not a genuine re-detection). The existing
+	// ticket already has the due date set from run 1.
+	finding2 := finding1
+	finding2.UpdatedAt = finding1.UpdatedAt.AddDate(0, 0, 1)
+
+	snyk2 := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding2},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear2 := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "issue-a",
+				Identifier:    "SNYK-500",
+				Title:         created.Title,
+				Description:   created.Description,
+				DueDate:       created.DueDate,
+				StateName:     "Todo",
+				Fingerprint:   created.Fingerprint,
+				ManagedLabels: created.ManagedLabels,
+				Priority:      created.Priority,
+			},
+		},
+	}
+	service2 := New(cfg, logger, snyk2, linear2, nil)
+	result2, err := service2.Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+
+	if result2.PlannedUpdates != 0 {
+		t.Fatalf("run 2: PlannedUpdates = %d, want 0 (due date must not churn once set)", result2.PlannedUpdates)
+	}
+	if len(linear2.updated) != 0 {
+		t.Fatalf("run 2: updated = %v, want none", linear2.updated)
+	}
+}
+
+// TestRunUpdatedAtFallbackStillSetsDueDateWhenNeverSet verifies that a
+// matched ticket which never had a due date still gets one computed from the
+// updated_at fallback -- the stickiness added to prevent due-date churn must
+// not suppress setting a due date for the first time.
+func TestRunUpdatedAtFallbackStillSetsDueDateWhenNeverSet(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "CVE-2026-1234",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		CreatedAt:   time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+	desired := desiredIssue(cfg, finding)
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "issue-a",
+				Identifier:  "SNYK-500",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     "", // never set
+				StateName:   "Todo",
+				Fingerprint: finding.Fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (due date must be set for the first time)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	if linear.updated[0].DueDate != "2026-01-31" {
+		t.Fatalf("updated due date = %q, want %q", linear.updated[0].DueDate, "2026-01-31")
 	}
 }
 
@@ -3727,5 +4338,164 @@ func TestIsTerminalLinearStateArchived(t *testing.T) {
 	open := model.ExistingIssue{StateName: "Todo"}
 	if isTerminalLinearState(open, states) {
 		t.Fatal("non-archived Todo ticket should not be terminal")
+	}
+}
+
+// TestRunBatchCreatePartialFailureRetriesOnlyFailedIssue verifies that when
+// CreateIssues reports a partial failure (one alias failed, siblings
+// succeeded), only the failed issue is retried individually. Retrying the
+// whole batch — the old behavior — recreated the already-created siblings,
+// producing duplicate tickets.
+func TestRunBatchCreatePartialFailureRetriesOnlyFailedIssue(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		// The first CreateIssues call containing issue-2 reports it as
+		// failed (success: false alias) while issue-1 succeeds.
+		createFailFingerprints: map[string]int{"snyk:project-a:issue-2": 1},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	counts := map[string]int{}
+	for _, d := range linear.created {
+		counts[d.Fingerprint]++
+	}
+	if counts["snyk:project-a:issue-1"] != 1 {
+		t.Fatalf("issue-1 created %d times, want exactly 1 (batch-sibling must not be recreated on partial failure)", counts["snyk:project-a:issue-1"])
+	}
+	if counts["snyk:project-a:issue-2"] != 1 {
+		t.Fatalf("issue-2 created %d times, want exactly 1 (failed item retried individually)", counts["snyk:project-a:issue-2"])
+	}
+
+	if len(linear.createCallBatches) != 2 {
+		t.Fatalf("CreateIssues calls = %d, want 2 (initial batch + single-item retry)", len(linear.createCallBatches))
+	}
+	retry := linear.createCallBatches[1]
+	if len(retry) != 1 || retry[0].Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("retry batch = %+v, want only the failed issue-2", retry)
+	}
+
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0 (the individual retry succeeded)", result.FailedOps)
+	}
+}
+
+// TestRunBatchCommentPartialFailureRetriesOnlyFailedComment is the
+// PostComments equivalent: a partial comment failure must only re-post the
+// failed comment. Re-posting comments that already landed leaves duplicate
+// change-summary comments (and duplicate notifications) on the issue.
+func TestRunBatchCommentPartialFailureRetriesOnlyFailedComment(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.CommentsEnabled = true
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Updated title one",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Updated title two",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title one",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    3,
+			},
+			{
+				ID:          "existing-2",
+				Identifier:  "SEC-2",
+				Title:       "stale title two",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-2",
+				Priority:    3,
+			},
+		},
+		commentFailFingerprints: map[string]int{"snyk:project-a:issue-2": 1},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	if _, err := service.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	counts := map[string]int{}
+	for _, u := range linear.comments {
+		counts[u.Desired.Fingerprint]++
+	}
+	if counts["snyk:project-a:issue-1"] != 1 {
+		t.Fatalf("issue-1 commented %d times, want exactly 1 (batch-sibling comment must not be re-posted)", counts["snyk:project-a:issue-1"])
+	}
+	if counts["snyk:project-a:issue-2"] != 1 {
+		t.Fatalf("issue-2 commented %d times, want exactly 1 (failed comment retried individually)", counts["snyk:project-a:issue-2"])
+	}
+
+	if len(linear.commentCallBatches) != 2 {
+		t.Fatalf("PostComments calls = %d, want 2 (initial batch + single-item retry)", len(linear.commentCallBatches))
+	}
+	retry := linear.commentCallBatches[1]
+	if len(retry) != 1 || retry[0].Desired.Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("comment retry batch = %+v, want only the failed issue-2 update", retry)
 	}
 }

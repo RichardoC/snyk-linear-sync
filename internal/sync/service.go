@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
@@ -26,9 +27,17 @@ type SnykClient interface {
 
 type LinearClient interface {
 	LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error)
-	CreateIssues(ctx context.Context, desired []model.DesiredIssue) error
+	// CreateIssues returns the indices (into desired) of items whose alias
+	// failed, so the caller retries only those instead of the whole batch.
+	// A non-nil error means no per-alias data is available (e.g. a
+	// transport failure) and every item must be retried individually.
+	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error)
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
-	PostComments(ctx context.Context, updates []model.IssueUpdate) error
+	// PostComments returns the indices (into updates) whose comment failed
+	// to post, so the caller retries only those instead of the whole batch.
+	// A non-nil error means no per-alias data is available and every update
+	// must be retried individually.
+	PostComments(ctx context.Context, updates []model.IssueUpdate) ([]int, error)
 }
 
 type CacheStore interface {
@@ -146,11 +155,8 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	for _, issue := range existingIssues {
 		if issue.Fingerprint != "" {
 			if prior, exists := existingByFingerprint[issue.Fingerprint]; exists {
-				canonical, duplicate := prior, issue
-				if identifierNum(issue.Identifier) < identifierNum(prior.Identifier) {
-					canonical, duplicate = issue, prior
-				}
-				s.logger.Warn("duplicate fingerprint found on Linear issues, will cancel higher-identifier copy",
+				canonical, duplicate := preferCanonicalDuplicate(prior, issue, s.cfg.Linear.States)
+				s.logger.Warn("duplicate fingerprint found on Linear issues, will cancel other copy",
 					slog.String("fingerprint", issue.Fingerprint),
 					slog.String("canonical", canonical.Identifier),
 					slog.String("duplicate", duplicate.Identifier),
@@ -242,6 +248,22 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// from configured Linear state names ("Triage").
 			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing, s.cfg.Linear.States) {
 				desired.PreserveState = true
+			}
+
+			// Sticky due date for the updated_at re-detection fallback: Snyk
+			// bumps updated_at on routine re-scans, not just genuine
+			// re-detections, which would otherwise advance the computed due
+			// date every single run once the fallback triggers — endless
+			// Linear due-date updates and change-comments. Once the ticket
+			// already has a due date, keep it fixed instead of re-deriving it
+			// from a moving updated_at. A ticket that never had a due date
+			// set still gets one (the condition below is false), and the
+			// fix-availability recalculation further below still takes
+			// priority when it applies.
+			if desired.DueDateUsedUpdatedAtFallback && existing.DueDate != "" {
+				desired.DueDate = existing.DueDate
+				desired.DueDateBase = existing.DueDate
+				desired.DueDateReason = "kept existing due date to avoid churn from Snyk updated_at re-detection"
 			}
 
 			// When a fix becomes available for a previously-blocked issue,
@@ -380,6 +402,15 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		cancelBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for _, duplicate := range duplicatesToCancel {
+			// Skip tickets that are already terminal (a configured Done/
+			// Cancelled workflow state, or archived). Cancelling an
+			// already-cancelled or already-done ticket is a pointless
+			// mutation, and archived tickets cannot be mutated via the
+			// Linear API at all — attempting it would just produce an API
+			// error.
+			if isTerminalLinearState(duplicate, s.cfg.Linear.States) {
+				continue
+			}
 			desired := model.DesiredIssue{
 				Fingerprint:   duplicate.Fingerprint,
 				Title:         duplicate.Title,
@@ -472,13 +503,34 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 		if s.cfg.DryRun {
 			return nil
 		}
-		if err := s.linear.CreateIssues(ctx, job.desiredBatch); err != nil {
+		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
+		if err != nil {
+			// No per-alias data at all (e.g. a transport failure): fall back
+			// to retrying every item individually, same as before.
 			s.logger.Warn("batch create failed, retrying issues individually",
 				slog.Int("batch_size", len(job.desiredBatch)),
 				slog.Any("error", err),
 			)
 			for _, desired := range job.desiredBatch {
-				if err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+					atomic.AddInt64(&result.FailedOps, 1)
+					s.logger.Error("failed to create issue",
+						slog.String("fingerprint", desired.Fingerprint),
+						slog.Any("error", err),
+					)
+				}
+			}
+		} else if len(failedIdx) > 0 {
+			// Partial failure: the batch call told us exactly which items
+			// failed. Only retry those — the rest were already created and
+			// retrying them too would produce duplicate tickets.
+			s.logger.Warn("batch create had partial failures, retrying only the failed issues",
+				slog.Int("failed_count", len(failedIdx)),
+				slog.Int("batch_size", len(job.desiredBatch)),
+			)
+			for _, idx := range failedIdx {
+				desired := job.desiredBatch[idx]
+				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
@@ -510,13 +562,34 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				}
 			}
 		} else if s.cfg.Linear.CommentsEnabled {
-			if err := s.linear.PostComments(ctx, job.updateBatch); err != nil {
+			failedIdx, err := s.linear.PostComments(ctx, job.updateBatch)
+			if err != nil {
+				// No per-alias data at all (e.g. a transport failure): fall
+				// back to retrying every update individually, same as before.
 				s.logger.Warn("batch comment post failed, retrying individually",
 					slog.Int("batch_size", len(job.updateBatch)),
 					slog.Any("error", err),
 				)
 				for _, update := range job.updateBatch {
-					if err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+						s.logger.Warn("failed to post change comment",
+							slog.String("issue", update.Existing.Identifier),
+							slog.String("fingerprint", update.Desired.Fingerprint),
+							slog.Any("error", err),
+						)
+					}
+				}
+			} else if len(failedIdx) > 0 {
+				// Partial failure: only retry the comments that actually
+				// failed — the rest already posted, and retrying them too
+				// would leave duplicate notification comments on the issue.
+				s.logger.Warn("batch comment post had partial failures, retrying only the failed comments",
+					slog.Int("failed_count", len(failedIdx)),
+					slog.Int("batch_size", len(job.updateBatch)),
+				)
+				for _, idx := range failedIdx {
+					update := job.updateBatch[idx]
+					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
 						s.logger.Warn("failed to post change comment",
 							slog.String("issue", update.Existing.Identifier),
 							slog.String("fingerprint", update.Desired.Fingerprint),
@@ -595,7 +668,7 @@ func (s *Service) logExecutionProgress(kind string, completed int64) {
 }
 
 func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
-	dueDate, dueDateBase, dueDateReason := issueDueDate(cfg.Linear.Due, finding)
+	dueDate, dueDateBase, dueDateReason, usedUpdatedAtFallback := issueDueDate(cfg.Linear.Due, finding)
 	// No meaningful SLA while blocked on an upstream fix. When a fix becomes
 	// available Snyk flips ignored=false; the next run maps it back to
 	// FindingOpen (Todo) and recalculates the due date.
@@ -603,19 +676,21 @@ func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 		dueDate = ""
 		dueDateBase = ""
 		dueDateReason = "awaiting upstream fix, SLA paused"
+		usedUpdatedAtFallback = false
 	}
 	return model.DesiredIssue{
-		Fingerprint:   finding.Fingerprint,
-		Title:         issueTitle(finding),
-		Description:   issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding),
-		DueDate:       dueDate,
-		DueDateBase:   dueDateBase,
-		State:         issueState(finding.Status),
-		StateReason:   stateReason(finding.Status),
-		DueDateReason: dueDateReason,
-		ManagedLabels: managedLabels(cfg.Linear.Labels, finding),
-		LabelReasons:  buildLabelReasons(cfg.Linear.Labels, finding),
-		Priority:      issuePriority(finding.Severity),
+		Fingerprint:                  finding.Fingerprint,
+		Title:                        issueTitle(finding),
+		Description:                  issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding),
+		DueDate:                      dueDate,
+		DueDateBase:                  dueDateBase,
+		State:                        issueState(finding.Status),
+		StateReason:                  stateReason(finding.Status),
+		DueDateReason:                dueDateReason,
+		DueDateUsedUpdatedAtFallback: usedUpdatedAtFallback,
+		ManagedLabels:                managedLabels(cfg.Linear.Labels, finding),
+		LabelReasons:                 buildLabelReasons(cfg.Linear.Labels, finding),
+		Priority:                     issuePriority(finding.Severity),
 	}
 }
 
@@ -737,14 +812,72 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 	}
 
 	if finding.Description != "" {
-		lines = append(lines, "", "### Description", finding.Description)
+		lines = append(lines, "", "### Description", embedSnykProse(finding.Description))
 	}
 	if finding.Remediation != "" {
-		lines = append(lines, "", "### Remediation", finding.Remediation)
+		lines = append(lines, "", "### Remediation", embedSnykProse(finding.Remediation))
 	}
 
 	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabels))
 	return strings.Join(lines, "\n")
+}
+
+// maxEmbeddedProseRunes bounds how much of Snyk's free-text Description and
+// Remediation fields is embedded verbatim in the ticket description. Linear
+// enforces its own description length limit; since the managed metadata
+// block (containing the fingerprint used for deduplication) is always
+// appended LAST, unbounded Snyk prose would risk pushing that block past
+// Linear's limit and silently truncating it away. That would make the
+// ticket unmanaged (extractFingerprint finds nothing) and cause the next run
+// to create a duplicate. The cap is conservative relative to Linear's limit
+// so the metadata block always survives.
+const maxEmbeddedProseRunes = 10000
+
+// truncationMarker is appended when embedded Snyk prose is truncated, so
+// readers understand why the text is cut off.
+const truncationMarker = "\n\n_[truncated by snyk-linear-sync]_"
+
+// embedSnykProse prepares Snyk-controlled free text (finding.Description or
+// finding.Remediation) for embedding in a ticket description. It:
+//
+//  1. Sanitizes any HTML-comment opening ("<!--") so embedded text cannot
+//     look like a second "<!-- snyk-linear-sync ... -->" metadata block.
+//     extractFingerprint/extractManagedLabels already defend against this by
+//     always taking the LAST line-anchored marker (see
+//     findMetadataBlockStart), but neutralizing the marker at the source
+//     removes the ambiguity for human readers and any other tooling that
+//     might scan the description.
+//  2. Caps the length so the text can never grow large enough to push the
+//     metadata block (appended after it) out of what Linear accepts.
+//
+// Both steps are pure functions of the input finding text, so calling
+// embedSnykProse twice with the same Snyk data always produces byte-identical
+// output — required for the sync's compare/hash pipeline
+// (normalizeDescriptionForCompare, desiredIssueHash) to stay stable and not
+// churn tickets between runs when nothing has actually changed.
+func embedSnykProse(text string) string {
+	return truncateProse(sanitizeSnykProse(text), maxEmbeddedProseRunes)
+}
+
+// sanitizeSnykProse neutralizes HTML-comment openings in Snyk-controlled
+// free text by replacing "<!--" with "<!- -". The replacement never
+// reintroduces the substring "<!--" (the inserted space always separates the
+// two dashes), so the transformation is idempotent:
+// sanitizeSnykProse(sanitizeSnykProse(x)) == sanitizeSnykProse(x).
+func sanitizeSnykProse(text string) string {
+	return strings.ReplaceAll(text, "<!--", "<!- -")
+}
+
+// truncateProse truncates s to at most maxRunes runes, never splitting a
+// multibyte rune, appending truncationMarker when truncation occurs. It is a
+// pure function of s and maxRunes, so the same input always yields the same
+// output.
+func truncateProse(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes]) + truncationMarker
 }
 
 func issueTitleSubject(finding model.Finding) string {
@@ -903,7 +1036,15 @@ func issuePriority(severity string) int {
 	}
 }
 
-func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective, base, reason string) {
+// issueDueDate calculates the due date for a finding. usedUpdatedAtFallback
+// reports whether the updated_at re-detection fallback (below) supplied the
+// base date, as opposed to the issue's original created_at or ignore expiry.
+// The match loop uses this to keep the due date sticky against an existing
+// Linear ticket's due date once set (see the sticky-override comment in
+// Service.Run), since Snyk bumps updated_at on routine re-scans — not just
+// genuine re-detections — which would otherwise advance the due date every
+// run once the fallback triggers.
+func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective, base, reason string, usedUpdatedAtFallback bool) {
 	var baseDate time.Time
 	var basis string
 	switch {
@@ -934,13 +1075,15 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 			if slaDays > 0 && updatedAtUTC.Sub(createdAtUTC) > time.Duration(slaDays)*24*time.Hour {
 				baseDate = time.Date(updatedAtUTC.Year(), updatedAtUTC.Month(), updatedAtUTC.Day(), 0, 0, 0, 0, time.UTC)
 				basis = "issue re-detection (updated_at)"
+				usedUpdatedAtFallback = true
 			}
 		}
 	default:
-		return "", "", ""
+		return "", "", "", false
 	}
 
-	return dueDateFromBase(baseDate, basis, dueCfg, finding)
+	effective, base, reason = dueDateFromBase(baseDate, basis, dueCfg, finding)
+	return effective, base, reason, usedUpdatedAtFallback
 }
 
 // severitySLADays returns the SLA day count for a given severity, or 0 if
@@ -1361,22 +1504,34 @@ func upsertManagedMetadata(description, fingerprint string, managedLabels []stri
 // prevents false matches where the marker string appears mid-sentence in
 // user-written text (e.g. "See <!-- snyk-linear-sync notes -->"), which
 // could corrupt the description if treated as a metadata block.
+//
+// It returns the LAST line-anchored occurrence, not the first. Ticket
+// descriptions can embed free-form Snyk-controlled prose (e.g. issue
+// description/remediation text) ABOVE the real metadata block, since the
+// sync always appends the managed metadata block last. If that prose
+// happens to contain a line-anchored marker (e.g. quoted/copied from
+// elsewhere), returning the first occurrence would hijack this function with
+// a bogus block and corrupt the description, and could also break ticket
+// matching via extractFingerprint/extractManagedLabels in the Linear client.
+// The real, sync-managed block is always the last one in the description.
+// Keep this in sync with the equivalent function in internal/linear/client.go.
 func findMetadataBlockStart(description string) int {
 	header := metadataHeaderStart()
+	last := -1
 	for i := 0; i <= len(description)-len(header); {
 		idx := strings.Index(description[i:], header)
 		if idx < 0 {
-			return -1
+			break
 		}
 		absIdx := i + idx
 		// The marker must be at the start of a line: either position 0
 		// or preceded by a newline.
 		if absIdx == 0 || description[absIdx-1] == '\n' {
-			return absIdx
+			last = absIdx
 		}
 		i = absIdx + 1
 	}
-	return -1
+	return last
 }
 
 func metadataHeaderStart() string {
@@ -1455,6 +1610,31 @@ func buildLabelReasons(labelCfg config.LabelConfig, finding model.Finding) map[s
 	}
 
 	return reasons
+}
+
+// preferCanonicalDuplicate decides which of two Linear tickets sharing the
+// same fingerprint should be treated as canonical. A non-terminal ticket is
+// always preferred over a terminal one (archived, or a configured Done/
+// Cancelled workflow state), regardless of identifier number: keeping a
+// terminal ticket as canonical would make the reopen guard (see the match
+// loop above) fire on every run, dropping the fingerprint from the index and
+// creating a brand-new ticket each time — a self-sustaining loop that mints
+// one duplicate per run forever. Among two tickets of the same class (both
+// terminal or both non-terminal), the lower Linear identifier is kept, since
+// it is the older ticket.
+func preferCanonicalDuplicate(a, b model.ExistingIssue, states config.StateConfig) (canonical, duplicate model.ExistingIssue) {
+	aTerminal := isTerminalLinearState(a, states)
+	bTerminal := isTerminalLinearState(b, states)
+	if aTerminal != bTerminal {
+		if aTerminal {
+			return b, a
+		}
+		return a, b
+	}
+	if identifierNum(b.Identifier) < identifierNum(a.Identifier) {
+		return b, a
+	}
+	return a, b
 }
 
 // identifierNum extracts the numeric suffix from a Linear identifier (e.g. "SNYK-42" → 42).

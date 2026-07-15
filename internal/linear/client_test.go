@@ -173,6 +173,111 @@ func TestUpdateIssuesClearsManagedLabelsWhenNoneDesired(t *testing.T) {
 	}
 }
 
+// TestLoadSnapshotArchiveFilterMatchesNotArchivedIssues guards against a
+// regression where the "not archived" OR clauses in loadIssues' filter used
+// AutoArchivedAt.Null: false instead of true. Per Linear's
+// NullableDateComparator, "null: false" matches non-null values (i.e.
+// archived issues) while "null: true" matches null values (i.e. NOT
+// archived issues). With the inverted boolean, the first two OR clauses
+// matched only archived tickets -- the opposite of their intent -- so the
+// snapshot silently dropped every non-archived managed ticket outside the
+// lookback window's Gte clauses, and the sync created duplicate tickets for
+// issues that already had an open Linear ticket.
+func TestLoadSnapshotArchiveFilterMatchesNotArchivedIssues(t *testing.T) {
+	var capturedFilter map[string]any
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:              "11111111-1111-1111-1111-111111111111",
+			ArchiveLookbackDays: 21,
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+
+				switch {
+				case strings.Contains(payload.Query, "query teamStates"):
+					return jsonResponse(t, `{"data":{"team":{"states":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`), nil
+				case strings.Contains(payload.Query, "query existingIssues"):
+					filter, ok := payload.Variables["filter"].(map[string]any)
+					if !ok {
+						t.Fatalf("filter variable missing or wrong type: %#v", payload.Variables["filter"])
+					}
+					capturedFilter = filter
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`), nil
+				default:
+					t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+					return nil, nil
+				}
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName: map[string]string{},
+		statesByType: map[string]string{},
+	}
+
+	if _, err := client.LoadSnapshot(t.Context()); err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if capturedFilter == nil {
+		t.Fatal("no filter captured for the existingIssues query")
+	}
+
+	orClauses, ok := capturedFilter["or"].([]any)
+	if !ok {
+		t.Fatalf("filter.or missing or wrong type: %#v", capturedFilter["or"])
+	}
+	if len(orClauses) != 4 {
+		t.Fatalf("filter.or len = %d, want 4", len(orClauses))
+	}
+
+	var nullTrueCount, gteCount int
+	for _, raw := range orClauses {
+		clause, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("OR clause has wrong type: %#v", raw)
+		}
+		autoArchivedAt, ok := clause["autoArchivedAt"].(map[string]any)
+		if !ok {
+			t.Fatalf("OR clause missing autoArchivedAt: %#v", clause)
+		}
+		if nullVal, has := autoArchivedAt["null"]; has {
+			if nullVal != true {
+				t.Fatalf("autoArchivedAt.null = %#v, want true (matches NOT-archived issues); "+
+					"null:false would match only archived issues, hiding open managed tickets", nullVal)
+			}
+			nullTrueCount++
+			continue
+		}
+		if gte, has := autoArchivedAt["gte"]; has {
+			gteStr, ok := gte.(string)
+			if !ok || gteStr == "" {
+				t.Fatalf("autoArchivedAt.gte = %#v, want a non-empty cutoff timestamp", gte)
+			}
+			gteCount++
+			continue
+		}
+		t.Fatalf("OR clause autoArchivedAt has neither null nor gte: %#v", autoArchivedAt)
+	}
+
+	if nullTrueCount != 2 {
+		t.Fatalf("clauses with autoArchivedAt.null=true = %d, want 2", nullTrueCount)
+	}
+	if gteCount != 2 {
+		t.Fatalf("clauses with autoArchivedAt.gte = %d, want 2", gteCount)
+	}
+}
+
 func TestExtractFingerprintPrefersMetadataBlock(t *testing.T) {
 	description := "## Example\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,snyk-code\n-->"
 
@@ -227,6 +332,85 @@ func TestExtractManagedLabelsIgnoresLinesOutsideMetadataBlock(t *testing.T) {
 
 	if got := extractManagedLabels(description); !slices.Equal(got, []string{"snyk-automation", "snyk-code"}) {
 		t.Fatalf("extractManagedLabels() = %#v, want the metadata-block labels", got)
+	}
+}
+
+// TestFindMetadataBlockStartReturnsLastOccurrence guards against a
+// regression where findMetadataBlockStart returned the FIRST line-anchored
+// "<!-- snyk-linear-sync" marker instead of the LAST. Ticket descriptions
+// can embed free-form Snyk-controlled prose (issue description/remediation
+// text) above the real metadata block, since the sync always appends its
+// managed block last. If that prose happens to contain its own line-anchored
+// marker (e.g. quoted from elsewhere), the first-occurrence behavior would
+// hijack fingerprint/label extraction and break ticket matching, causing
+// duplicate ticket creation.
+func TestFindMetadataBlockStartReturnsLastOccurrence(t *testing.T) {
+	cases := []struct {
+		name        string
+		description string
+		wantIdx     int
+	}{
+		{
+			name:        "single block unchanged",
+			description: "Some text\n<!-- snyk-linear-sync\nfingerprint: test\n-->",
+			wantIdx:     10, // after "Some text\n"
+		},
+		{
+			name:        "fake block before real block: last wins",
+			description: "<!-- snyk-linear-sync\nfingerprint: fake\n-->\nSome text\n<!-- snyk-linear-sync\nfingerprint: real\n-->",
+			wantIdx:     54, // index of the second marker
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findMetadataBlockStart(tc.description)
+			if got != tc.wantIdx {
+				t.Fatalf("findMetadataBlockStart() = %d, want %d", got, tc.wantIdx)
+			}
+		})
+	}
+}
+
+// TestExtractMetadataUsesLastBlockWhenFakeBlockPrecedesReal verifies that
+// when a fake, line-anchored "<!-- snyk-linear-sync ... -->" block appears
+// before the real one (e.g. embedded in Snyk-controlled prose above the
+// sync-managed block), extractFingerprint and extractManagedLabels return
+// the values from the LAST (real) block, not the first (fake) one.
+func TestExtractMetadataUsesLastBlockWhenFakeBlockPrecedesReal(t *testing.T) {
+	description := "<!-- snyk-linear-sync\n" +
+		"fingerprint: fake-from-embedded-prose\n" +
+		"managed_labels: fake-label\n" +
+		"-->\n\n" +
+		"## Remediation\n\nSome Snyk-controlled prose describing the finding.\n\n" +
+		"<!-- snyk-linear-sync\n" +
+		"fingerprint: snyk:project-a:issue-1\n" +
+		"managed_labels: snyk-automation,snyk-code\n" +
+		"-->"
+
+	if got := extractFingerprint(description); got != "snyk:project-a:issue-1" {
+		t.Fatalf("extractFingerprint() = %q, want the last (real) block's fingerprint", got)
+	}
+	if got := extractManagedLabels(description); !slices.Equal(got, []string{"snyk-automation", "snyk-code"}) {
+		t.Fatalf("extractManagedLabels() = %#v, want the last (real) block's labels", got)
+	}
+}
+
+// TestExtractMetadataUsesLastBlockWhenFakeBlockInsideFencedCode verifies
+// that a fake metadata block embedded inside a fenced code block (still
+// line-anchored, since fences don't change line-boundary semantics) does
+// not win over the real, sync-appended block that follows it.
+func TestExtractMetadataUsesLastBlockWhenFakeBlockInsideFencedCode(t *testing.T) {
+	description := "```\n" +
+		"<!-- snyk-linear-sync\n" +
+		"fingerprint: fake-in-code-block\n" +
+		"-->\n" +
+		"```\n\n" +
+		"<!-- snyk-linear-sync\n" +
+		"fingerprint: snyk:project-a:issue-2\n" +
+		"-->"
+
+	if got := extractFingerprint(description); got != "snyk:project-a:issue-2" {
+		t.Fatalf("extractFingerprint() = %q, want the last (real) block's fingerprint", got)
 	}
 }
 
@@ -443,7 +627,7 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 		statesByType: map[string]string{"unstarted": "state-1"},
 	}
 
-	err := client.CreateIssues(t.Context(), []model.DesiredIssue{{
+	failed, err := client.CreateIssues(t.Context(), []model.DesiredIssue{{
 		Fingerprint: "snyk:project-1:issue-1",
 		Title:       "Snyk: example",
 		Description: "body",
@@ -452,6 +636,9 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 	}})
 	if err != nil {
 		t.Fatalf("CreateIssues() error = %v", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("CreateIssues() failed indices = %v, want none", failed)
 	}
 
 	if len(requests) != 2 {
@@ -790,5 +977,153 @@ func TestBuildChangeCommentReturnsEmptyWhenDiffIsNil(t *testing.T) {
 
 	if comment != "" {
 		t.Fatalf("expected empty comment when diff is nil, got: %s", comment)
+	}
+}
+
+// TestCreateIssuesPartialAliasFailureReturnsOnlyFailedIndices verifies that
+// when one aliased issueCreate in a batched mutation reports success: false
+// while its siblings succeed, CreateIssues reports only the failed index
+// instead of an error for the whole batch. Treating a partial failure as a
+// whole-batch failure made the caller recreate the already-created siblings,
+// producing duplicate tickets.
+func TestCreateIssuesPartialAliasFailureReturnsOnlyFailedIndices(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return jsonResponse(t, `{"data":{
+					"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"ENG-1"}},
+					"issueCreate1":{"success":false,"issue":{"id":"","identifier":""}}
+				}}`), nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-1"},
+		statesByType: map[string]string{"unstarted": "state-1"},
+	}
+
+	failed, err := client.CreateIssues(t.Context(), []model.DesiredIssue{
+		{
+			Fingerprint: "snyk:project-1:issue-1",
+			Title:       "Snyk: first",
+			Description: "body",
+			State:       model.StateTodo,
+			Priority:    3,
+		},
+		{
+			Fingerprint: "snyk:project-1:issue-2",
+			Title:       "Snyk: second",
+			Description: "body",
+			State:       model.StateTodo,
+			Priority:    3,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil (partial failure is not a batch error)", err)
+	}
+	if len(failed) != 1 || failed[0] != 1 {
+		t.Fatalf("CreateIssues() failed indices = %v, want [1]", failed)
+	}
+}
+
+// TestCreateIssuesUnsubscribeFailureDoesNotFailCreates verifies that a
+// failure in the best-effort post-create actor-unsubscribe step is not
+// reported as a create failure. The issues were already created; returning
+// an error here made the caller recreate them, producing duplicate tickets.
+func TestCreateIssuesUnsubscribeFailureDoesNotFailCreates(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID:           "team-1",
+			UnsubscribeActor: true,
+			States:           config.StateConfig{Todo: "Todo"},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				payload := string(body)
+				switch {
+				case strings.Contains(payload, "issueCreateBatch"):
+					return jsonResponse(t, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"ENG-1"}}}}`), nil
+				case strings.Contains(payload, "issueUnsubscribeBatch"):
+					return jsonResponse(t, `{"errors":[{"message":"unsubscribe exploded"}]}`), nil
+				default:
+					t.Fatalf("unexpected GraphQL query: %s", payload)
+					return nil, nil
+				}
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-1"},
+		statesByType: map[string]string{"unstarted": "state-1"},
+	}
+
+	failed, err := client.CreateIssues(t.Context(), []model.DesiredIssue{{
+		Fingerprint: "snyk:project-1:issue-1",
+		Title:       "Snyk: example",
+		Description: "body",
+		State:       model.StateTodo,
+		Priority:    3,
+	}})
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil (unsubscribe is best-effort)", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("CreateIssues() failed indices = %v, want none", failed)
+	}
+}
+
+// TestPostCommentsPartialAliasFailureReturnsOnlyFailedIndices verifies the
+// PostComments equivalent of the CreateIssues partial-failure contract: only
+// the update whose commentCreate alias failed is reported, mapped back to
+// its index in the updates slice (accounting for updates that produced no
+// comment at all), so the caller does not re-post comments that already
+// landed — re-posting spams duplicate notifications to subscribers.
+func TestPostCommentsPartialAliasFailureReturnsOnlyFailedIndices(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{TeamID: "team-1"},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return jsonResponse(t, `{"data":{
+					"commentCreate0":{"success":true,"comment":{"id":"comment-1"}},
+					"commentCreate1":{"success":false,"comment":{"id":""}}
+				}}`), nil
+			}),
+		}),
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	updates := []model.IssueUpdate{
+		{
+			// No diff: produces no comment and must never appear in the
+			// failed list, and must not shift the index mapping.
+			Existing: model.ExistingIssue{ID: "existing-0", Identifier: "ENG-10"},
+			Desired:  model.DesiredIssue{Fingerprint: "snyk:project-1:issue-10"},
+		},
+		{
+			Existing: model.ExistingIssue{ID: "existing-1", Identifier: "ENG-11"},
+			Desired:  model.DesiredIssue{Fingerprint: "snyk:project-1:issue-11"},
+			Diff:     &model.IssueDiff{TitleChanged: true},
+		},
+		{
+			Existing: model.ExistingIssue{ID: "existing-2", Identifier: "ENG-12"},
+			Desired:  model.DesiredIssue{Fingerprint: "snyk:project-1:issue-12"},
+			Diff:     &model.IssueDiff{TitleChanged: true},
+		},
+	}
+
+	failed, err := client.PostComments(t.Context(), updates)
+	if err != nil {
+		t.Fatalf("PostComments() error = %v, want nil (partial failure is not a batch error)", err)
+	}
+	if len(failed) != 1 || failed[0] != 2 {
+		t.Fatalf("PostComments() failed indices = %v, want [2] (the second comment maps to updates[2])", failed)
 	}
 }

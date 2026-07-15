@@ -238,25 +238,39 @@ func (c *Client) StateID(state model.IssueState) (string, error) {
 	return id, nil
 }
 
-func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) error {
+// CreateIssues creates the given issues in Linear as a single batched
+// GraphQL mutation using aliased issueCreate calls.
+//
+// It returns the indices (into desired) of items whose alias reported
+// success: false. A GraphQL alias failing does not mean its sibling aliases
+// in the same request failed too — Linear already created those issues, and
+// the caller must not recreate them (doing so would produce duplicate
+// tickets). The caller should retry only the returned indices individually.
+//
+// A non-nil error means the request itself could not be completed (e.g. a
+// transport/HTTP failure) and no per-alias results are available at all. In
+// that case the caller cannot tell which, if any, items succeeded and must
+// fall back to retrying every item in desired individually — that is
+// unavoidable without idempotency keys on the mutation.
+func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
 	if len(desired) == 0 {
-		return nil
+		return nil, nil
 	}
 	if err := c.resolveTeam(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.ensureStatesLoaded(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := c.ensureManagedLabelsResolved(ctx, managedLabelsFromDesiredIssues(desired)); err != nil {
-		return err
+		return nil, err
 	}
 
 	op := gqlclient.NewOperation(createIssuesMutation(len(desired)))
 	for i, issue := range desired {
 		stateID, err := c.StateID(issue.State)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		title := issue.Title
@@ -283,19 +297,30 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 		} `json:"issue"`
 	}{}
 	if err := c.execute(ctx, op, &resp); err != nil {
-		return fmt.Errorf("create Linear issues: %w", err)
+		return nil, fmt.Errorf("create Linear issues: %w", err)
 	}
 
-	for alias, result := range resp {
-		if !result.Success {
-			return fmt.Errorf("create Linear issues failed without GraphQL error for %s", alias)
+	var failed []int
+	for i := range desired {
+		alias := fmt.Sprintf("issueCreate%d", i)
+		if result, ok := resp[alias]; !ok || !result.Success {
+			failed = append(failed, i)
 		}
 	}
+
 	if err := c.issueUnsubscribeCreatedIssues(ctx, resp); err != nil {
-		return err
+		// The issues above were already created successfully; unsubscribing
+		// the actor is best-effort cleanup (it only stops the sync's own
+		// actor from being subscribed to notifications on tickets it
+		// manages). A failure here must NOT be reported as a create
+		// failure — the caller would otherwise recreate issues that already
+		// exist, producing duplicates.
+		c.log.Warn("failed to unsubscribe actor from newly created Linear issues; issues were created successfully",
+			slog.Any("error", err),
+		)
 	}
 
-	return nil
+	return failed, nil
 }
 
 func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error {
@@ -362,23 +387,35 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 // explaining which managed fields were modified and why. Comments are posted
 // after a successful update/resolve/cancel mutation so the Linear history
 // shows exactly what the sync changed.
-func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) error {
+//
+// It returns the indices (into updates) whose comment failed to post, so the
+// caller can retry only those individually — the same rationale as
+// CreateIssues: a sibling alias failing does not mean this comment failed
+// too, and retrying a comment that already posted would leave a duplicate
+// notification comment on the issue. Updates that had nothing to comment on
+// (buildChangeComment returned "") are never included in the failed list.
+//
+// A non-nil error means the request itself could not be completed (e.g. a
+// transport/HTTP failure) with no per-alias results available; the caller
+// must then retry every update individually, as before.
+func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) ([]int, error) {
 	if len(updates) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	type commentJob struct {
-		issueID string
-		comment string
+		issueID     string
+		comment     string
+		updateIndex int
 	}
 	var jobs []commentJob
-	for _, update := range updates {
+	for i, update := range updates {
 		if comment := buildChangeComment(update); comment != "" {
-			jobs = append(jobs, commentJob{issueID: update.Existing.ID, comment: comment})
+			jobs = append(jobs, commentJob{issueID: update.Existing.ID, comment: comment, updateIndex: i})
 		}
 	}
 	if len(jobs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	op := gqlclient.NewOperation(commentCreateMutation(len(jobs)))
@@ -398,16 +435,18 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 		} `json:"comment"`
 	}{}
 	if err := c.execute(ctx, op, &resp); err != nil {
-		return fmt.Errorf("post Linear change comments: %w", err)
+		return nil, fmt.Errorf("post Linear change comments: %w", err)
 	}
 
-	for alias, result := range resp {
-		if !result.Success {
-			return fmt.Errorf("post Linear change comment failed without GraphQL error for %s", alias)
+	var failed []int
+	for j, job := range jobs {
+		alias := fmt.Sprintf("commentCreate%d", j)
+		if result, ok := resp[alias]; !ok || !result.Success {
+			failed = append(failed, job.updateIndex)
 		}
 	}
 
-	return nil
+	return failed, nil
 }
 
 func (c *Client) loadStates(ctx context.Context) error {
@@ -488,31 +527,44 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	if lookbackDays <= 0 {
 		lookbackDays = 35 // defensive; config.Validate() enforces > 0
 	}
-	archiveCutoff := time.Now().UTC().Add(-time.Duration(lookbackDays) * 24 * time.Hour).Format(time.RFC3339)
+	archiveCutoffTime := time.Now().UTC().Add(-time.Duration(lookbackDays) * 24 * time.Hour)
+	archiveCutoff := archiveCutoffTime.Format(time.RFC3339)
 	archiveCutoffDate := linearapi.DateTime(archiveCutoff)
-	notArchived := false
+	c.log.Info("Linear loadIssues archive lookback window",
+		slog.Int("lookback_days", lookbackDays),
+		slog.Time("archive_cutoff", archiveCutoffTime),
+	)
+	// archivedAtIsNull is passed as the Null comparator on AutoArchivedAt.
+	// Per Linear's NullableDateComparator: "Matches any non-null values if
+	// the given value is false, otherwise it matches null values." So
+	// null: true matches issues where autoArchivedAt IS NULL (i.e. NOT
+	// archived) -- which is what the first two OR clauses below intend.
+	archivedAtIsNull := true
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
 			Id: &linearapi.IDComparator{Eq: c.teamID()},
 		},
 		Or: []linearapi.IssueFilter{
 			{
+				// Not-archived issues matching the title prefix.
 				Title: &linearapi.StringComparator{
 					StartsWith: new(titlePrefix),
 				},
 				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Null: &notArchived,
+					Null: &archivedAtIsNull,
 				},
 			},
 			{
+				// Not-archived issues matching the metadata header.
 				Description: &linearapi.NullableStringComparator{
 					Contains: new(metadataHeader),
 				},
 				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Null: &notArchived,
+					Null: &archivedAtIsNull,
 				},
 			},
 			{
+				// Archived issues matching the title prefix, within the lookback window.
 				Title: &linearapi.StringComparator{
 					StartsWith: new(titlePrefix),
 				},
@@ -521,6 +573,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 				},
 			},
 			{
+				// Archived issues matching the metadata header, within the lookback window.
 				Description: &linearapi.NullableStringComparator{
 					Contains: new(metadataHeader),
 				},
@@ -804,20 +857,31 @@ func metadataBlockLines(description string) iter.Seq[string] {
 // prevents false matches where the marker string appears mid-sentence in
 // user-written text (e.g. "See <!-- snyk-linear-sync notes -->"), which
 // could spoof fingerprint/label extraction if treated as a metadata block.
+//
+// It returns the LAST line-anchored occurrence, not the first. Ticket
+// descriptions can embed free-form Snyk-controlled prose (e.g. issue
+// description/remediation text) ABOVE the real metadata block, since the
+// sync always appends the managed metadata block last. If that prose
+// happens to contain a line-anchored marker (e.g. quoted/copied from
+// elsewhere), returning the first occurrence would hijack
+// extractFingerprint/extractManagedLabels with bogus values and break
+// ticket matching, causing duplicate tickets. The real, sync-managed block
+// is always the last one in the description.
 func findMetadataBlockStart(description string) int {
 	header := metadataHeader
+	last := -1
 	for i := 0; i <= len(description)-len(header); {
 		idx := strings.Index(description[i:], header)
 		if idx < 0 {
-			return -1
+			break
 		}
 		absIdx := i + idx
 		if absIdx == 0 || description[absIdx-1] == '\n' {
-			return absIdx
+			last = absIdx
 		}
 		i = absIdx + 1
 	}
-	return -1
+	return last
 }
 
 func (c *Client) ensureStatesLoaded(ctx context.Context) error {
