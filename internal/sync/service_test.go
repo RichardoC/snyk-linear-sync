@@ -3592,3 +3592,140 @@ func TestRunDoesNotStealFineGrainedTicketViaCoarseFallback(t *testing.T) {
 		t.Fatalf("updated = %d, want 1 (no ticket stealing)", len(linear.updated))
 	}
 }
+
+// TestRunDoesNotReopenArchivedTicket verifies that an archived Linear ticket
+// is treated as terminal — the sync creates a new ticket instead of trying
+// to reopen or update the archived one. Without this, auto-archiving would
+// make closed tickets invisible and the sync would create duplicates.
+func TestRunDoesNotReopenArchivedTicket(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	findings := []model.Finding{
+		{
+			Fingerprint: "snyk:project-a:issue-1:src/file.py",
+			SnykIssueID: "issue-1",
+			ProjectID:   "project-a",
+			ProjectName: "Project A",
+			IssueTitle:  "Path traversal",
+			Severity:    "low",
+			Status:      model.FindingOpen,
+			CreatedAt:   time.Date(2026, time.March, 1, 14, 0, 0, 0, time.UTC),
+		},
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   findings,
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	archivedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "archived-1",
+				Identifier:  "SNYK-999",
+				Title:       "Snyk: [low] Path traversal",
+				Description: "old description",
+				StateName:   "Done",
+				Fingerprint: "snyk:project-a:issue-1:src/file.py",
+				ArchivedAt:  &archivedAt,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// The archived ticket must NOT be reopened or updated. A new ticket
+	// should be created instead.
+	if result.PlannedUpdates != 0 {
+		t.Fatalf("PlannedUpdates = %d, want 0 (archived ticket must not be updated)", result.PlannedUpdates)
+	}
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1 (new ticket for finding with archived match)", result.PlannedCreates)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0 (archived ticket untouched)", len(linear.updated))
+	}
+}
+
+// TestRunSkipsArchivedTicketInResolveLoop verifies that archived tickets are
+// not included in the resolve batch — Linear doesn't allow updating archived
+// issues, so trying to resolve them would produce API errors.
+func TestRunSkipsArchivedTicketInResolveLoop(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// No findings — the sync should try to resolve all existing tickets.
+	// The archived ticket must be skipped.
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   nil,
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	archivedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "open-1",
+				Identifier:  "SNYK-100",
+				Title:       "Snyk: [low] Some issue",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-2",
+			},
+			{
+				ID:          "archived-1",
+				Identifier:  "SNYK-101",
+				Title:       "Snyk: [low] Old issue",
+				StateName:   "Done",
+				Fingerprint: "snyk:project-a:issue-3",
+				ArchivedAt:  &archivedAt,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// The open ticket should be resolved (no matching finding). The archived
+	// ticket should be skipped — not resolved, not updated.
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1 (only the non-archived ticket)", result.PlannedResolves)
+	}
+}
+
+// TestIsTerminalLinearStateArchived verifies that isTerminalLinearState
+// returns true for archived tickets regardless of their workflow state name.
+func TestIsTerminalLinearStateArchived(t *testing.T) {
+	states := config.StateConfig{Done: "Done", Cancelled: "Cancelled"}
+	archivedAt := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+
+	// Archived + non-terminal state name → still terminal
+	archived := model.ExistingIssue{StateName: "Todo", ArchivedAt: &archivedAt}
+	if !isTerminalLinearState(archived, states) {
+		t.Fatal("archived ticket with Todo state should be terminal")
+	}
+
+	// Not archived + terminal state name → terminal
+	done := model.ExistingIssue{StateName: "Done"}
+	if !isTerminalLinearState(done, states) {
+		t.Fatal("non-archived Done ticket should be terminal")
+	}
+
+	// Not archived + non-terminal state name → not terminal
+	open := model.ExistingIssue{StateName: "Todo"}
+	if isTerminalLinearState(open, states) {
+		t.Fatal("non-archived Todo ticket should not be terminal")
+	}
+}

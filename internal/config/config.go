@@ -29,6 +29,12 @@ const (
 	defaultLinearConcurrency    = 8
 	defaultErrorLogFile         = "logs/snyk-linear-sync-errors.log"
 	defaultCacheDBFile          = "data/snyk-linear-sync-cache.db"
+	// defaultArchiveLookbackDays is the lookback window for including
+	// auto-archived Linear tickets in the sync snapshot. Linear's auto-archive
+	// runs after the configured inactivity period (commonly 1 month); the
+	// default 35 days (5 weeks) gives a one-week margin so the reopen guard
+	// can still see recently-closed tickets.
+	defaultArchiveLookbackDays = 35
 )
 
 type Config struct {
@@ -64,13 +70,14 @@ type SourceConfig struct {
 }
 
 type LinearConfig struct {
-	APIKey           string
-	TeamID           string
-	UnsubscribeActor bool
-	CommentsEnabled  bool
-	States           StateConfig
-	Labels           LabelConfig
-	Due              DueDateConfig
+	APIKey              string
+	TeamID              string
+	UnsubscribeActor    bool
+	CommentsEnabled     bool
+	States              StateConfig
+	Labels              LabelConfig
+	Due                 DueDateConfig
+	ArchiveLookbackDays int
 }
 
 type StateConfig struct {
@@ -173,6 +180,7 @@ func Load(args []string) (Config, error) {
 				MediumDays:   getEnvInt("LINEAR_DUE_DAYS_MEDIUM", defaultMediumDueDays),
 				LowDays:      getEnvInt("LINEAR_DUE_DAYS_LOW", defaultLowDueDays),
 			},
+			ArchiveLookbackDays: getEnvInt("LINEAR_ARCHIVE_LOOKBACK_DAYS", defaultArchiveLookbackDays),
 		},
 		Sync: SyncConfig{
 			Workers:           getEnvInt("SYNC_WORKERS", defaultWorkerCount),
@@ -237,6 +245,9 @@ func (c Config) Validate() error {
 	}
 	if c.Linear.Due.LowDays <= 0 {
 		errs = append(errs, fmt.Errorf("LINEAR_DUE_DAYS_LOW must be > 0, got %d", c.Linear.Due.LowDays))
+	}
+	if c.Linear.ArchiveLookbackDays <= 0 {
+		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be > 0, got %d", c.Linear.ArchiveLookbackDays))
 	}
 
 	if len(errs) > 0 {

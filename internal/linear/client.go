@@ -48,6 +48,7 @@ type linearIssueNode struct {
 	URL         string  `json:"url"`
 	Priority    int     `json:"priority"`
 	DueDate     *string `json:"dueDate"`
+	ArchivedAt  *string `json:"archivedAt"`
 	State       struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
@@ -110,7 +111,7 @@ func (c *Client) LoadIssueByIdentifier(ctx context.Context, identifier string) (
 
 	op := gqlclient.NewOperation(`
 query issueByIdentifier($filter: IssueFilter!) {
-  issues(filter: $filter, first: 1) {
+  issues(filter: $filter, first: 1, includeArchived: true) {
     nodes {
       id
       identifier
@@ -119,6 +120,7 @@ query issueByIdentifier($filter: IssueFilter!) {
       url
       priority
       dueDate
+      archivedAt
       state {
         id
         name
@@ -184,6 +186,12 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 			Name: label.Name,
 		})
 	}
+	var archivedAt *time.Time
+	if issue.ArchivedAt != nil && *issue.ArchivedAt != "" {
+		if t, err := time.Parse(time.RFC3339, *issue.ArchivedAt); err == nil {
+			archivedAt = &t
+		}
+	}
 	return model.ExistingIssue{
 		ID:            issue.ID,
 		Identifier:    issue.Identifier,
@@ -197,6 +205,7 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 		Fingerprint:   extractFingerprint(description),
 		ManagedLabels: extractManagedLabels(description),
 		Labels:        labels,
+		ArchivedAt:    archivedAt,
 	}
 }
 
@@ -466,6 +475,22 @@ query teamStates($id: String!, $after: String) {
 }
 
 func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) {
+	// Include archived issues so the sync can still see recently-closed
+	// tickets (the reopen guard needs them). Without this, auto-archiving
+	// would make closed tickets invisible after the archive period, and the
+	// sync would create duplicates if Snyk re-reports the same issue.
+	//
+	// The OR filter limits archived tickets to those auto-archived within
+	// the configured lookback window (LINEAR_ARCHIVE_LOOKBACK_DAYS, default
+	// 35 days / 5 weeks). This keeps the snapshot from growing unbounded
+	// while still covering the auto-archive period with a margin.
+	lookbackDays := c.cfg.ArchiveLookbackDays
+	if lookbackDays <= 0 {
+		lookbackDays = 35 // defensive; config.Validate() enforces > 0
+	}
+	archiveCutoff := time.Now().UTC().Add(-time.Duration(lookbackDays) * 24 * time.Hour).Format(time.RFC3339)
+	archiveCutoffDate := linearapi.DateTime(archiveCutoff)
+	notArchived := false
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
 			Id: &linearapi.IDComparator{Eq: c.teamID()},
@@ -475,10 +500,32 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 				Title: &linearapi.StringComparator{
 					StartsWith: new(titlePrefix),
 				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Null: &notArchived,
+				},
 			},
 			{
 				Description: &linearapi.NullableStringComparator{
 					Contains: new(metadataHeader),
+				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Null: &notArchived,
+				},
+			},
+			{
+				Title: &linearapi.StringComparator{
+					StartsWith: new(titlePrefix),
+				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Gte: &archiveCutoffDate,
+				},
+			},
+			{
+				Description: &linearapi.NullableStringComparator{
+					Contains: new(metadataHeader),
+				},
+				AutoArchivedAt: &linearapi.NullableDateComparator{
+					Gte: &archiveCutoffDate,
 				},
 			},
 		},
@@ -490,7 +537,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	for {
 		op := gqlclient.NewOperation(`
 query existingIssues($filter: IssueFilter!, $after: String) {
-  issues(first: 100, after: $after, filter: $filter) {
+  issues(first: 100, after: $after, filter: $filter, includeArchived: true) {
     nodes {
       id
       identifier
@@ -499,6 +546,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
       url
       priority
       dueDate
+      archivedAt
       state {
         id
         name

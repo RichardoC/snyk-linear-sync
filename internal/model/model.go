@@ -106,6 +106,12 @@ type ExistingIssue struct {
 	ManagedLabels []string
 	Labels        []IssueLabel
 	Priority      int
+	// ArchivedAt is non-nil when the issue has been auto-archived by Linear.
+	// Archived issues are excluded from the default Linear API response; the
+	// sync includes them (via includeArchived: true) filtered to those
+	// archived within a recent window so the reopen guard can still see
+	// recently-closed tickets. An archived ticket is always terminal.
+	ArchivedAt *time.Time
 }
 
 type DesiredIssue struct {
